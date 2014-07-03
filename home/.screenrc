@@ -1,0 +1,40 @@
+shell "/bin/bash" # Set default shell
+
+# Lets me explain the trick here, the default escape (C-A)
+# is used at outer session to allow selection of inner session.
+# The key C-X is used as escape at inner session, at just
+# translate to default meta.
+bindkey -t "^X" meta
+
+bind h focus left   # Move to next left region
+bind j focus down   # Move to next down region
+bind k focus up     # Move to next up region
+bind l focus right  # Move to next right region
+bind t focus top    # Move to first top region
+bind b focus bottom # Move to last bottom region
+
+# Remove lockscreen default binding
+bind ^x
+bind x
+
+# Rebind kill to C-K
+bind ^k
+bind K kill
+
+defscrollback 10000 # Change default scrollback to 10000 lines
+
+startup_message off # Disable startup message window
+
+defbce on # Erase with background color
+
+defmonitor off # Disable window monitoring
+
+defutf8 on # Default encoding to utf-8
+
+altscreen on # Enable alternate screen to fix residual on editors
+
+# Setup hardstatus line
+hardstatus alwayslastline "%-w%{= Bw}%n %t%{-}%+w"
+
+# Hardstatus to use at remote servers
+# hardstatus alwayslastline "%{= YK}%-w%{= yk}%n %t%{-}%+w %-= %{= YK} %=${USER}@%H%="
