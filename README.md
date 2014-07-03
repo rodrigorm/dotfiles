@@ -6,7 +6,7 @@ In Unix, configuration files are king. This is my castle.
 
 ```bash
 $ git clone git://github.com/andsens/homeshick.git $HOME/.homesick/repos/homeshick
-$ $HOME/.homesick/repos/homeshick/bin/homeshick clone username/dotfiles
+$ $HOME/.homesick/repos/homeshick/bin/homeshick clone rodrigorm/dotfiles
 $ source $HOME/.bashrc
 ```
 
