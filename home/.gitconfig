@@ -1,0 +1,16 @@
+[user]
+    name = Rodrigo Moyle
+    email = rodrigorm@gmail.com
+[core]
+    editor = vim
+    whitespace = fix,-indent-with-non-tab,trailing-space,cr-at-eol
+	mergeoptions = --no-edit
+[color]
+    ui = true
+[color "diff"]
+    whitespace = red reverse
+[alias]
+    ctags = !.git/hooks/ctags
+    uptags = !sh -c \"git tag | xargs git tag -d && git fetch origin\"
+    hist = log --pretty=format:\"%h %ad | %s%d [%an]\" --graph --date=short
+    fix = "!f() { vim -p `git diff --name-only`; }; f"
