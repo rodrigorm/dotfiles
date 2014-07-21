@@ -33,8 +33,12 @@ defutf8 on # Default encoding to utf-8
 
 altscreen on # Enable alternate screen to fix residual on editors
 
-# Setup hardstatus line
-hardstatus alwayslastline "%-w%{= Bw}%n %t%{-}%+w"
+backtick 1 0 1 screen-git-clean-branch
+backtick 2 0 1 screen-git-working-branch
 
-# Hardstatus to use at remote servers
+# Setup hardstatus line and caption
+caption splitonly "%{= ..}%?%F%{+r}%? %n %t "
+hardstatus alwayslastline "%{= .K} %-w%{+b w}%n %t%{-}%+w %=%?%{+ .g} (%1`)%{-}%?%?%{+ .r} {%2`}%{-}%? "
+
+# Use this hardstatus at a remote servers
 # hardstatus alwayslastline "%{= YK}%-w%{= yk}%n %t%{-}%+w %-= %{= YK} %=${USER}@%H%="
