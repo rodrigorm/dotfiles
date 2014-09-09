@@ -1,6 +1,4 @@
-export TERM="xterm-256color"
 export PATH="$PATH:$HOME/bin/"
-export LC_ALL=C
 source ~/.git-ps1
 
 alias mainscreen='cd $HOME && screen -Rad -S Main'
