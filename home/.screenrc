@@ -36,9 +36,12 @@ altscreen on # Enable alternate screen to fix residual on editors
 backtick 1 0 10 screen-git-clean-branch
 backtick 2 0 10 screen-git-working-branch
 
-# Setup hardstatus line and caption
-caption splitonly "%?%F%{+b}%? %n %t "
-hardstatus alwayslastline "%{=r} %-w%{+b}%n %t%{-}%+w %=%?%{+ g} (%1`)%{-}%?%?%{+ r} {%2`}%{-}%? "
+# UI Setup
+## Split color
+rendition so "= Wk"
+
+## Setup hardstatus line and caption
+caption always "%?%F%{= Wk}%:%{= Kw}%? %-w%?%F%{+b dW}%:%{ KW}%? %n %t %{-}%+w %=%?%{+ gW} (%1`) %{-}%?%?%{+ rW} {%2`} %{-}%?"
 
 # Use this hardstatus at a remote servers
 # hardstatus alwayslastline "%{= YK}%-w%{= yk}%n %t%{-}%+w %-= %{= YK} %=${USER}@%H%="
