@@ -121,3 +121,8 @@ PATH=$PATH:$HOME/.rvm/bin # Add RVM to PATH for scripting
 
 source "$HOME/.homesick/repos/homeshick/homeshick.sh"
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
+
+if [ ! -f "$HOME/.homesick/repos/pure/pure.bash" ]; then
+	homeshick clone rodrigorm/pure
+fi
+source "$HOME/.homesick/repos/pure/pure.bash"
