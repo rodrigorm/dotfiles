@@ -1,5 +1,4 @@
 export PATH="$PATH:$HOME/bin/"
-source ~/.git-ps1
 
 alias mainscreen='cd $HOME && screen -Rad -S Main'
 alias subscreen='printf "\033k$(basename $(pwd))\033\\" && screen -Rad -S $(basename $(pwd))'
