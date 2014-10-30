@@ -43,4 +43,7 @@ rendition so "= Wk"
 caption always "%?%F%{= Wk}%:%{= Kw}%? %-w%?%F%{+b dW}%:%{ KW}%? %n %t %{-}%+w %=%1`"
 
 # Use this hardstatus at a remote servers
-# hardstatus alwayslastline "%{= YK}%-w%{= yk}%n %t%{-}%+w %-= %{= YK} %=${USER}@%H%="
+# Red
+# hardstatus alwayslastline "%{=b rW} %-w%{+b dW} %n %t %{-}%+w %-= %{= rY}${USER}@%H "
+# Yellow
+# hardstatus alwayslastline "%{=b YK} %-w%{+b dW} %n %t %{-}%+w %-= %{= YK}${USER}@%H "
