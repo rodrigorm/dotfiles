@@ -108,6 +108,8 @@ fi
 if ! shopt -oq posix; then
   if [ -f /usr/share/bash-completion/bash_completion ]; then
     . /usr/share/bash-completion/bash_completion
+  elif [ -f /usr/local/Cellar/bash-completion/1.3/etc/bash_completion ]; then
+    . /usr/local/Cellar/bash-completion/1.3/etc/bash_completion
   elif [ -f /etc/bash_completion ]; then
     . /etc/bash_completion
   fi
@@ -124,5 +126,9 @@ source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
 
 if [ ! -f "$HOME/.homesick/repos/pure/pure.bash" ]; then
 	homeshick clone rodrigorm/pure
+fi
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+	export PURE_GIT_PULL=0
 fi
 source "$HOME/.homesick/repos/pure/pure.bash"
