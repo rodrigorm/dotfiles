@@ -131,4 +131,8 @@ fi
 if [[ "$OSTYPE" == "darwin"* ]]; then
 	export PURE_GIT_PULL=0
 fi
+
+if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
+  . /usr/local/git/contrib/completion/git-prompt.sh
+fi
 source "$HOME/.homesick/repos/pure/pure.bash"
