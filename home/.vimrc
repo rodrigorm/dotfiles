@@ -1,0 +1,1 @@
+../../../../.homesick/repos/vim/vimrc

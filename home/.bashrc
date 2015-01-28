@@ -133,6 +133,14 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 fi
 
 if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
-  . /usr/local/git/contrib/completion/git-prompt.sh
+	source /usr/local/git/contrib/completion/git-prompt.sh
+fi
+if [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
+ 	source /usr/share/git-core/contrib/completion/git-prompt.sh
 fi
 source "$HOME/.homesick/repos/pure/pure.bash"
+
+if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
+	homeshick clone rodrigorm/vim
+	$(homeshick cd vim && git submodule update --init)
+fi
