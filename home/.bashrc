@@ -115,12 +115,6 @@ if ! shopt -oq posix; then
   fi
 fi
 
-### Added by the Heroku Toolbelt
-export PATH="/usr/local/heroku/bin:$PATH"
-
-
-PATH=$PATH:$HOME/.rvm/bin # Add RVM to PATH for scripting
-
 source "$HOME/.homesick/repos/homeshick/homeshick.sh"
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
 
@@ -134,9 +128,8 @@ fi
 
 if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
 	source /usr/local/git/contrib/completion/git-prompt.sh
-fi
-if [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
- 	source /usr/share/git-core/contrib/completion/git-prompt.sh
+elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
+	source /usr/share/git-core/contrib/completion/git-prompt.sh
 fi
 source "$HOME/.homesick/repos/pure/pure.bash"
 
@@ -144,3 +137,9 @@ if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
 	homeshick clone rodrigorm/vim
 	$(homeshick cd vim && git submodule update --init)
 fi
+
+if [ -f "$HOME/.rvm/scripts/rvm" ]; then
+	source "$HOME/.rvm/scripts/rvm"
+fi
+
+export PATH="$PATH:$HOME/.rvm/bin" # Add RVM to PATH for scripting
