@@ -61,13 +61,8 @@ bindsym $mod+f fullscreen
 
 # change container layout (stacked, tabbed, default)
 # bindsym $mod+s layout stacking
-<<<<<<< HEAD
 bindsym $mod+w layout tabbed
 bindsym $mod+e layout default
-=======
-# bindsym $mod+w layout tabbed
-# bindsym $mod+e layout default
->>>>>>> Added i3wm config file
 
 # toggle tiling / floating
 bindsym $mod+Shift+space floating toggle
