@@ -118,20 +118,22 @@ fi
 source "$HOME/.homesick/repos/homeshick/homeshick.sh"
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
 
-if [ ! -f "$HOME/.homesick/repos/pure/pure.bash" ]; then
-	homeshick clone rodrigorm/pure
-fi
+if [ ! "$TERM" == "linux" ]; then
+	if [ ! -f "$HOME/.homesick/repos/pure/pure.bash" ]; then
+		homeshick clone rodrigorm/pure
+	fi
 
-if [[ "$OSTYPE" == "darwin"* ]]; then
-	export PURE_GIT_PULL=0
-fi
+	if [[ "$OSTYPE" == "darwin"* ]]; then
+		export PURE_GIT_PULL=0
+	fi
 
-if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
-	source /usr/local/git/contrib/completion/git-prompt.sh
-elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
-	source /usr/share/git-core/contrib/completion/git-prompt.sh
+	if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
+		source /usr/local/git/contrib/completion/git-prompt.sh
+	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
+		source /usr/share/git-core/contrib/completion/git-prompt.sh
+	fi
+	source "$HOME/.homesick/repos/pure/pure.bash"
 fi
-source "$HOME/.homesick/repos/pure/pure.bash"
 
 if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
 	homeshick clone rodrigorm/vim
