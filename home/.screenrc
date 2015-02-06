@@ -33,14 +33,12 @@ defutf8 on # Default encoding to utf-8
 
 altscreen on # Enable alternate screen to fix residual on editors
 
-backtick 1 0 10 screen-git-working-branch
-
 # UI Setup
 ## Split color
 rendition so "= Wk"
 
 ## Setup hardstatus line and caption
-caption always "%?%F%{= Wk}%:%{= Kw}%? %-w%?%F%{+b dW}%:%{ KW}%? %n %t %{-}%+w %=%1`"
+caption always "%?%F%{= Wk}%:%{= Kw}%? %-w%?%F%{+b dW}%:%{ KW}%? %n %t %{-}%+w"
 
 # Use this hardstatus at a remote servers
 # Red
