@@ -144,4 +144,6 @@ if [ -f "$HOME/.rvm/scripts/rvm" ]; then
 	source "$HOME/.rvm/scripts/rvm"
 fi
 
-export PATH="$PATH:$HOME/.rvm/bin" # Add RVM to PATH for scripting
+if [ -d "$HOME/.rvm/bin" ] ; then
+	export PATH="$PATH:$HOME/.rvm/bin" # Add RVM to PATH for scripting
+fi
