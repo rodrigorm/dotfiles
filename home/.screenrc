@@ -1,5 +1,3 @@
-shell "/bin/bash" # Set default shell
-
 # Lets me explain the trick here, the default escape (C-A)
 # is used at outer session to allow selection of inner session.
 # The key C-X is used as escape at inner session, at just
