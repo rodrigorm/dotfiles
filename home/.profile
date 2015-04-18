@@ -8,6 +8,9 @@
 # for ssh logins, install and configure the libpam-umask package.
 #umask 022
 
+# Disable Caps Lock
+xmodmap -e "remove lock = Caps_Lock"
+
 # if running bash
 if [ -n "$BASH_VERSION" ]; then
     # include .bashrc if it exists
@@ -21,6 +24,6 @@ if [ -d "$HOME/bin" ] ; then
     PATH="$HOME/bin:$PATH"
 fi
 
-if [ "$0" = "/etc/gdm3/Xsession" ]; then
+if [ "$0" = "/etc/gdm/Xsession" ]; then
 	export $(gnome-keyring-daemon -s)
 fi
