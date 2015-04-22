@@ -24,6 +24,6 @@ if [ -d "$HOME/bin" ] ; then
     PATH="$HOME/bin:$PATH"
 fi
 
-if [ "$0" = "/etc/gdm3/Xsession" ]; then
+if [ "$0" = "/etc/gdm/Xsession" ]; then
 	export $(gnome-keyring-daemon -s)
 fi
