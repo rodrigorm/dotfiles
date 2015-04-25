@@ -28,3 +28,7 @@ fi
 if [ "$0" = "/etc/gdm/Xsession" ]; then
 	export $(gnome-keyring-daemon -s)
 fi
+
+if [ "$0" = "/etc/gdm3/Xsession" ]; then
+	export $(gnome-keyring-daemon -s)
+fi
