@@ -147,3 +147,8 @@ fi
 if [ -d "$HOME/.rvm/bin" ] ; then
 	export PATH="$PATH:$HOME/.rvm/bin" # Add RVM to PATH for scripting
 fi
+
+if [ -d "$HOME/.phpenv/bin" ] ; then
+	export PATH="/home/rmoyle/.phpenv/bin:$PATH"
+	eval "$(phpenv init -)"
+fi
