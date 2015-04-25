@@ -10,6 +10,7 @@
 
 # Disable Caps Lock
 xmodmap -e "remove lock = Caps_Lock"
+nohup "$HOME/bin/caps_lock_off" > /dev/null 2>&1 &
 
 # if running bash
 if [ -n "$BASH_VERSION" ]; then
