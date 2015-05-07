@@ -150,5 +150,6 @@ fi
 
 if [ -d "$HOME/.phpenv/bin" ] ; then
 	export PATH="/home/rmoyle/.phpenv/bin:$PATH"
+	export PATH="/home/rmoyle/.phpenv/shims:$PATH"
 	eval "$(phpenv init -)"
 fi
