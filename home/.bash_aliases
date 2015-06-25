@@ -1,7 +1,12 @@
 export PATH="$PATH:$HOME/bin:/opt/chefdk/bin"
 
-alias mainscreen='cd $HOME && screen -Rad -S Main'
-alias subscreen='printf "\033k$(basename $(pwd))\033\\" && screen -Rad -S $(basename $(pwd))'
+namescreen() {
+	printf "\033k$1\033\\"
+	screen -Rad -S "$1"
+}
+
+alias mainscreen='cd "$HOME" && namescreen Main'
+alias subscreen='namescreen $(basename $(pwd))'
 alias gitscreen='git status && cd $(git rev-parse --show-toplevel) && subscreen'
 
 export PATH="/opt/adt-bundle-linux/sdk/platform-tools:$PATH"
