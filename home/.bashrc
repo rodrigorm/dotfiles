@@ -108,8 +108,8 @@ fi
 if ! shopt -oq posix; then
   if [ -f /usr/share/bash-completion/bash_completion ]; then
     . /usr/share/bash-completion/bash_completion
-  elif [ -f /usr/local/Cellar/bash-completion/1.3/etc/bash_completion ]; then
-    . /usr/local/Cellar/bash-completion/1.3/etc/bash_completion
+  elif [ -f `brew --prefix`/etc/bash_completion ]; then
+    . `brew --prefix`/etc/bash_completion
   elif [ -f /etc/bash_completion ]; then
     . /etc/bash_completion
   fi
