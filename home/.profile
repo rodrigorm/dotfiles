@@ -9,11 +9,15 @@
 #umask 022
 
 # Disable Caps Lock
-xmodmap -e "remove lock = Caps_Lock"
-nohup "$HOME/bin/caps_lock_off" > /dev/null 2>&1 &
+if [ -x xmodmap ]; then
+    xmodmap -e "remove lock = Caps_Lock"
+    nohup "$HOME/bin/caps_lock_off" > /dev/null 2>&1 &
+fi
 
 # Disable Beep
-xset -b
+if [ -x xset ]; then
+    xset -b
+fi
 
 # if running bash
 if [ -n "$BASH_VERSION" ]; then
