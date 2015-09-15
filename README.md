@@ -10,6 +10,10 @@ $ $HOME/.homesick/repos/homeshick/bin/homeshick clone rodrigorm/dotfiles
 $ source $HOME/.bashrc
 ```
 
+OS X 10.7 Lion: Double click to install or import Solarized Dark.terminal into Terminal.app preferences.
+
+OS X 10.8 Mountain Lion: Import Solarized Dark.terminal into Terminal.app preferences.
+
 ## License
 
 Copyright (C) 2014 Rodrigo Moyle <rodrigorm@gmail.com>
