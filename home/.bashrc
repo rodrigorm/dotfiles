@@ -163,14 +163,8 @@ fi
 # setup ssh-agent
 #
 
-# set environment variables if user's agent already exists
-SSH_AUTH_SOCK=$(ls -l /tmp/ssh-*/agent.* 2> /dev/null | grep $(whoami) | awk '{print $9}')
-SSH_AGENT_PID=$(echo $SSH_AUTH_SOCK | cut -d. -f2)
-[ -n "$SSH_AUTH_SOCK" ] && export SSH_AUTH_SOCK
-[ -n "$SSH_AGENT_PID" ] && export SSH_AGENT_PID
-
 # start agent if necessary
-if [ -z $SSH_AGENT_PID ] && [ -z $SSH_TTY ]; then  # if no agent & not in ssh
+if [ -z $SSH_AUTH_SOCK ] && [ -z $SSH_TTY ]; then  # if no agent & not in ssh
 	eval `ssh-agent -s` > /dev/null
 fi
 
@@ -184,3 +178,9 @@ if [ -z "$SSH_TTY" ] ; then                     # if not using ssh
 		fi
 	fi
 fi
+
+PERL_MB_OPT="--install_base \"/Users/rmoyle/perl5\""; export PERL_MB_OPT;
+PERL_MM_OPT="INSTALL_BASE=/Users/rmoyle/perl5"; export PERL_MM_OPT;
+export DEVKITPRO=$HOME/workspace/devkitARM-downloader
+export DEVKITARM=$DEVKITPRO/devkitARM
+export GTEST_DIR=$HOME/workspace/github/google/googletest/googletest
