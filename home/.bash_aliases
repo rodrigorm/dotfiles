@@ -2,7 +2,7 @@ export PATH="$PATH:$HOME/bin:/opt/chefdk/bin"
 
 namescreen() {
 	printf "\033k$1\033\\"
-	screen -Rad -S "$1"
+	screen -U -Rad -S "$1"
 }
 
 alias mainscreen='cd "$HOME" && namescreen Main'

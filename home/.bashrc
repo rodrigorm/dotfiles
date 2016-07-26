@@ -159,6 +159,10 @@ if [ -d "$HOME/.phpenv/bin" ] ; then
 	eval "$(phpenv init -)"
 fi
 
+if [ -d "/usr/local/sbin" ] ; then
+    export PATH="/usr/local/sbin:$PATH"
+fi
+
 if [ -d "/usr/local/opt/android-sdk" ] ; then
     export ANDROID_HOME="/usr/local/opt/android-sdk"
 fi
