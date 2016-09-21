@@ -10,6 +10,7 @@ bind k focus up     # Move to next up region
 bind l focus right  # Move to next right region
 bind t focus top    # Move to first top region
 bind b focus bottom # Move to last bottom region
+bind ; colon        # Use ; as :
 
 # Remove lockscreen default binding
 bind ^x
