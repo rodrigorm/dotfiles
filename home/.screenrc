@@ -49,7 +49,7 @@ rendition so "= KW"
 ## Setup hardstatus line and caption
 backtick 1 0 10 screen-git-branch
 caption splitonly "%{= KW}%?%F%{+ Wk}%? %n %t %{-}%? %h%?"
-hardstatus firstline "%{= KW}%? %-w%?%{+ Wk} %n %t %{-}%+w %= %S %?(%1`)%?"
+hardstatus firstline "%{= KW}%? %-w%?%{+ Wk} %n %t %{-}%+w %=%S%? (%1`)%? "
 
 # Use this hardstatus at a remote servers
 # Red
