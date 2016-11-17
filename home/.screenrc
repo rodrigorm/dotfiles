@@ -15,8 +15,12 @@ bind t focus top    # Move to first top region
 bind b focus bottom # Move to last bottom region
 bind ; colon        # Use ; as :
 
-bind ^D eval "screen sc -d"
-bind d  eval "screen sc -d"
+# Bind sc command
+bind ^D screen sc -d
+bind d  screen sc -d
+bind (  screen sc -p
+bind )  screen sc -n
+bind s  screen sc -l
 
 # Remove lockscreen default binding
 bind x
@@ -40,10 +44,12 @@ altscreen on # Enable alternate screen to fix residual on editors
 
 # UI Setup
 ## Split color
-rendition so "= Wk"
+rendition so "= KW"
 
 ## Setup hardstatus line and caption
-caption always "%?%F%{= Wk}%:%{= Kw}%? %-w%?%F%{+b dW}%:%{ KW}%? %n %t %{-}%+w"
+backtick 1 0 10 screen-git-branch
+caption splitonly "%{= KW}%?%F%{+ Wk}%? %n %t %{-}%? %h%?"
+hardstatus firstline "%{= KW}%? %-w%?%{+ Wk} %n %t %{-}%+w %= %S %?(%1`)%?"
 
 # Use this hardstatus at a remote servers
 # Red

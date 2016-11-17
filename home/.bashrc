@@ -123,10 +123,6 @@ if [ ! "$TERM" == "linux" ]; then
 		homeshick clone rodrigorm/pure
 	fi
 
-	if [[ "$OSTYPE" == "darwin"* ]]; then
-		export PURE_GIT_PULL=0
-	fi
-
 	if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
 		source /usr/local/git/contrib/completion/git-prompt.sh
 	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
@@ -199,7 +195,7 @@ function __sc_exit() {
         sc -d
     fi
 }
-trap __sc_exit EXIT
+# trap __sc_exit EXIT
 
 PERL_MB_OPT="--install_base \"/Users/rmoyle/perl5\""; export PERL_MB_OPT;
 PERL_MM_OPT="INSTALL_BASE=/Users/rmoyle/perl5"; export PERL_MM_OPT;

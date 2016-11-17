@@ -1,36 +1,68 @@
 #!/usr/bin/env bash
 
-[ -z ${__usage+x} ] && read -r -d '' __usage <<-'EOF' || true # exits non-zero when EOF encountered
-  -l --list        Present a list to select wich session to switch
-  -d --detach      Detach from current session
-  -g --git         Switch to a session from current git root directory
-  -v               Enable verbose mode, print script as it is executed
-  -D --debug       Enables debug mode
-  -h --help        This page
-  -n --no-color    Disable color output
+function __b() {
+    echo "\x1b[1m${@}\x1b[0m"
+}
+
+function __u() {
+    echo "\x1b[4m${@}\x1b[0m"
+}
+
+[ -z ${__usage+x} ] && read -r -d '' __usage <<-EOF || true # exits non-zero when EOF encountered
+  -l --list               Present a selection menu to switch session
+  -d --detach             Detach from current session
+  -g --git                Switch to a session from current git root directory
+  -p --prev               Switch to the session with the next lower pid
+  -n --next               Switch to the next session
+  -o --other              Switch to the session displayed previously
+  -v                      Enable verbose mode, print script as it is executed
+  -D --debug              Enables debug mode
+  -h --help               This page
+  -N --no-color           Disable color output
 EOF
-[ -z ${__helptext+x} ] && read -r -d '' __helptext <<-'EOF' || true # exits non-zero when EOF encountered
- \e[4mSc\e[0m is a screen session manager, which add support to switching to a new
- session from inside a existing session.
+[ -z ${__helptext+x} ] && read -r -d '' __helptext <<-EOF || true # exits non-zero when EOF encountered
+ Usage: sc [$(__u "SessionID")]
 
- Usage: sc [name]
+ Switch to the session identified by $(__u "SessionID"). This can be a prefix of a session name or a session pid. If a session does not exists with the specified identifier a new one will be created.
 
- \e[1mExamples:\e[0m
+ $(__u "Sc") is a screen session manager, which add support to switching to a new session from inside a existing session.
+
+ $(__b "The following options are available:")
+
+ $(__b "-l"), $(__b "--list")
+      Display all sessions in a men for visual selection.
+
+ $(__b "-d"), $(__b "--detach")
+      Detach the current screen session (disconnect it from the terminal and put it into the background). This returns you to the shell where you invoked  $(__u "sc"). A detached screen can be resumed by invoking $(__u "sc") with the $(__b "-s") option.
+
+ $(__b "-g"), $(__b "--git")
+      Switch to a session from current git root directory.
+
+ $(__b "-p"), $(__b "--prev")
+      Switch to the session with the next lower pid. This command can be used repeatedly to cycle through the list of sessions.
+
+ $(__b "-n"), $(__b "--next")
+      Switch to the next session. This command can be used repeatedly to cycle through the list of sessions.
+
+ $(__b "-o"), $(__b "--other")
+      Switch to the session displayed previously. If this session does no longer exist, other has the same effect as next.
+
+ $(__b "Examples:")
 
  Creating and switching to existing session:
 
-       $ sc monitor # Start a new session screen named monitor
-       $ sc work # Start a new session screen named work
-       $ sc monitor # Switch back to session screen named monitor
+       \$ sc monitor # Start a new session screen named monitor
+       \$ sc work # Start a new session screen named work
+       \$ sc monitor # Switch back to session screen named monitor
 
  Starting a new sesion named from current directory:
 
-       $ cd $HOME/workspace
-       $ sc # Same as `sc workspace`
+       \$ cd \$HOME/workspace
+       \$ sc # Same as \`sc workspace\`
 
  Present a menu to select wich session to switch:
 
-       $ sc --list # or -l
+       \$ sc --list # or -l
 EOF
 
 source "${HOME}/bin/lib/bash3boilerplate.sh"
@@ -50,7 +82,7 @@ if [ "${arg_v}" = "1" ]; then
 fi
 
 # no color mode
-if [ "${arg_n}" = "1" ]; then
+if [ "${arg_N}" = "1" ]; then
   NO_COLOR="true"
 fi
 
@@ -64,7 +96,6 @@ fi
 ##############################################################################
 
 [ -z "${LOG_LEVEL:-}" ] && emergency "Cannot continue without LOG_LEVEL. "
-
 
 ### Runtime
 ##############################################################################
@@ -82,10 +113,12 @@ info "OSTYPE: ${OSTYPE}"
 info "arg_l: ${arg_l}"
 info "arg_d: ${arg_d}"
 info "arg_g: ${arg_g}"
+info "arg_p: ${arg_p}"
+info "arg_n: ${arg_n}"
 info "arg_D: ${arg_D}"
 info "arg_v: ${arg_v}"
 info "arg_h: ${arg_h}"
-info "arg_n: ${arg_n}"
+info "arg_N: ${arg_N}"
 
 PIPEFILE="${PIPEFILE:-/tmp/scpipe}"
 
@@ -110,27 +143,32 @@ function sc_listen() {
         fi
 
         debug "Switching to session name "${line}""
-        screen -r "${line}" 2>/dev/null || screen -S "${line}"
+        screen -dr "${line}"
     done
 }
 
-function sc_start() {
-    local name="${1:-$(basename $(pwd))}"
+function sc_select() {
+    local name="${1}"
 
     if [ "${STY:-}" != "" ] ; then
-        screen -d "${STY}" # Detach from current session
-        screen -ls "${name}" 2>/dev/null || screen -d -m -S "${name}" # Create new session if does not exists
-        echo "${name}" >&3 # Tell sc to switch to session
+        screen -d "${STY}"
+        screen -ls "${name}" 2>/dev/null || screen -dmS "${name}"
+        echo "${name}" >&3
         exit
     fi
 
-    screen -r "${name}" 2>/dev/null || screen -S "${name}" # Reatach or create a new named session
+    screen -dr "${name}" 2>/dev/null || screen -S "${name}"
     sc_listen
 }
 
 function sc_list() {
     local options=$(screen -ls | cut -sf 2 | tr "\n" " ")
     local option
+
+    if [ -z "${options}" ]; then
+        echo "No available sessions found"
+        exit 1
+    fi
 
     echo "Select a session to switch"
     PS3="Pick a number or type a name for new session: "
@@ -149,7 +187,7 @@ function sc_list() {
         break
     done
 
-    sc_start "${option}"
+    sc_select "${option}"
     exit
 }
 
@@ -167,7 +205,73 @@ function sc_detach() {
 function sc_git() {
     git status
     cd $(git rev-parse --show-toplevel)
-    sc_start
+    sc_select "$(basename $(pwd))"
+    exit
+}
+
+function sc_prev() {
+    if [ "${STY:-}" = "" ] ; then
+        help "Use -p from inside a sc session"
+        exit
+    fi
+
+    local options=$(screen -ls | cut -sf 2 | tr "\n" " ")
+    IFS=' ' read -r -a options <<< "$options"
+    local current="${STY}"
+    local i
+
+    for i in "${!options[@]}"; do
+        if [ "${options[$i]}" = "${current}" ]; then
+            break
+        fi
+    done
+
+    local select=$(($i-1))
+
+    if [ -z "${options[$select]:-}" ]; then
+        select=$((${#options[@]}-1))
+    fi
+
+    debug "options: ${options}"
+    debug "current: ${current}"
+    debug "index: ${i}"
+    debug "select: ${select}"
+    debug "sc_select: ${options[$select]}"
+
+    sc_select "${options[$select]}"
+    exit
+}
+
+function sc_next() {
+    if [ "${STY:-}" = "" ] ; then
+        help "Use -n from inside a sc session"
+        exit
+    fi
+
+    local options=$(screen -ls | cut -sf 2 | tr "\n" " ")
+    IFS=' ' read -r -a options <<< "$options"
+    local current="${STY}"
+    local i
+
+    for i in "${!options[@]}"; do
+        if [ "${options[$i]}" = "${current}" ]; then
+            break
+        fi
+    done
+
+    local select=$(($i+1))
+
+    if [ -z "${options[$select]:-}" ]; then
+        select=0
+    fi
+
+    debug "options: ${options}"
+    debug "current: ${current}"
+    debug "index: ${i}"
+    debug "select: ${select}"
+    debug "sc_select: ${options[$select]}"
+
+    sc_select "${options[$select]}"
     exit
 }
 
@@ -183,4 +287,12 @@ if [ "${arg_g}" = "1" ]; then
     sc_git
 fi
 
-sc_start "${1:-}"
+if [ "${arg_p}" = "1" ]; then
+    sc_prev
+fi
+
+if [ "${arg_n}" = "1" ]; then
+    sc_next
+fi
+
+sc_select "${1:-$(basename $(pwd))}"
