@@ -2,7 +2,10 @@
 # is used at outer session to allow selection of inner session.
 # The key C-X is used as escape at inner session, at just
 # translate to default meta.
-bindkey -t "^X" meta
+# bindkey "^X" meta
+
+# Remap C-A to C-X
+escape ^Xx
 
 bind h focus left   # Move to next left region
 bind j focus down   # Move to next down region
@@ -12,8 +15,10 @@ bind t focus top    # Move to first top region
 bind b focus bottom # Move to last bottom region
 bind ; colon        # Use ; as :
 
+bind ^D eval "screen sc -d"
+bind d  eval "screen sc -d"
+
 # Remove lockscreen default binding
-bind ^x
 bind x
 
 # Rebind kill to C-K
@@ -22,6 +27,7 @@ bind K kill
 
 defscrollback 10000 # Change default scrollback to 10000 lines
 
+msgwait 0
 startup_message off # Disable startup message window
 
 defbce on # Erase with background color

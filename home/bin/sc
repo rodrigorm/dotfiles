@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+[ -z ${__usage+x} ] && read -r -d '' __usage <<-'EOF' || true # exits non-zero when EOF encountered
+  -l --list        Present a list to select wich session to switch
+  -d --detach      Detach from current session
+  -g --git         Switch to a session from current git root directory
+  -v               Enable verbose mode, print script as it is executed
+  -D --debug       Enables debug mode
+  -h --help        This page
+  -n --no-color    Disable color output
+EOF
+[ -z ${__helptext+x} ] && read -r -d '' __helptext <<-'EOF' || true # exits non-zero when EOF encountered
+ \e[4mSc\e[0m is a screen session manager, which add support to switching to a new
+ session from inside a existing session.
+
+ Usage: sc [name]
+
+ \e[1mExamples:\e[0m
+
+ Creating and switching to existing session:
+
+       $ sc monitor # Start a new session screen named monitor
+       $ sc work # Start a new session screen named work
+       $ sc monitor # Switch back to session screen named monitor
+
+ Starting a new sesion named from current directory:
+
+       $ cd $HOME/workspace
+       $ sc # Same as `sc workspace`
+
+ Present a menu to select wich session to switch:
+
+       $ sc --list # or -l
+EOF
+
+source "${HOME}/bin/lib/bash3boilerplate.sh"
+
+### Command-line argument switches (like -d for debugmode, -h for showing helppage)
+##############################################################################
+
+# debug mode
+if [ "${arg_D}" = "1" ]; then
+  set -o xtrace
+  LOG_LEVEL="7"
+fi
+
+# verbose mode
+if [ "${arg_v}" = "1" ]; then
+  set -o verbose
+fi
+
+# no color mode
+if [ "${arg_n}" = "1" ]; then
+  NO_COLOR="true"
+fi
+
+# help mode
+if [ "${arg_h}" = "1" ]; then
+  # Help exists with code 1
+  help "${__base} - manage screen session"
+fi
+
+### Validation. Error out if the things required for your script are not present
+##############################################################################
+
+[ -z "${LOG_LEVEL:-}" ] && emergency "Cannot continue without LOG_LEVEL. "
+
+
+### Runtime
+##############################################################################
+
+function sc_cleanup_before_exit () {
+  info "Cleaning up. Done"
+}
+trap sc_cleanup_before_exit EXIT
+
+info "__file: ${__file}"
+info "__dir: ${__dir}"
+info "__base: ${__base}"
+info "OSTYPE: ${OSTYPE}"
+
+info "arg_l: ${arg_l}"
+info "arg_d: ${arg_d}"
+info "arg_g: ${arg_g}"
+info "arg_D: ${arg_D}"
+info "arg_v: ${arg_v}"
+info "arg_h: ${arg_h}"
+info "arg_n: ${arg_n}"
+
+PIPEFILE="${PIPEFILE:-/tmp/scpipe}"
+
+[ -z "${PIPEFILE:-}" ]  && help      "Setting a pipe with PIPEFILE is required"
+
+info "PIPEFILE: ${PIPEFILE}"
+
+if [ ! -p "${PIPEFILE}" ]; then
+    mkfifo "${PIPEFILE}"
+fi
+exec 3<> "${PIPEFILE}"
+
+function sc_listen() {
+    echo "Ctrl-C to exit"
+
+    while true ; do
+        read line <&3
+        info "line: ${line}"
+        if [ "${line}" = "__sc_quit_listen" ]; then
+            debug "Quit"
+            exit
+        fi
+
+        debug "Switching to session name "${line}""
+        screen -r "${line}" 2>/dev/null || screen -S "${line}"
+    done
+}
+
+function sc_start() {
+    local name="${1:-$(basename $(pwd))}"
+
+    if [ "${STY:-}" != "" ] ; then
+        screen -d "${STY}" # Detach from current session
+        screen -ls "${name}" 2>/dev/null || screen -d -m -S "${name}" # Create new session if does not exists
+        echo "${name}" >&3 # Tell sc to switch to session
+        exit
+    fi
+
+    screen -r "${name}" 2>/dev/null || screen -S "${name}" # Reatach or create a new named session
+    sc_listen
+}
+
+function sc_list() {
+    local options=$(screen -ls | cut -sf 2 | tr "\n" " ")
+    local option
+
+    echo "Select a session to switch"
+    PS3="Pick a number or type a name for new session: "
+
+    select option in ${options} "Cancel"; do
+        debug "You picked ${option} which is option ${REPLY}"
+
+        if [ "${option}" = "Cancel" ]; then
+            exit
+        fi
+
+        if [ -z "${option}" ]; then
+            option="${REPLY}"
+        fi
+
+        break
+    done
+
+    sc_start "${option}"
+    exit
+}
+
+function sc_detach() {
+    if [ "${STY:-}" = "" ] ; then
+        help "Use -d from inside a sc session"
+    else
+        debug "Quiting..."
+        screen -d "${STY}" # Detach from current session
+        echo "__sc_quit_listen" >&3
+    fi
+    exit
+}
+
+function sc_git() {
+    git status
+    cd $(git rev-parse --show-toplevel)
+    sc_start
+    exit
+}
+
+if [ "${arg_l}" = "1" ]; then
+    sc_list
+fi
+
+if [ "${arg_d}" = "1" ]; then
+    sc_detach
+fi
+
+if [ "${arg_g}" = "1" ]; then
+    sc_git
+fi
+
+sc_start "${1:-}"

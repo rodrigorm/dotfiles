@@ -163,6 +163,10 @@ if [ -d "/usr/local/sbin" ] ; then
     export PATH="/usr/local/sbin:$PATH"
 fi
 
+if [ -d "$HOME/bin:/opt/chefdk/bin" ] ; then
+    export PATH="$PATH:$HOME/bin:/opt/chefdk/bin"
+fi
+
 if [ -d "/usr/local/opt/android-sdk" ] ; then
     export ANDROID_HOME="/usr/local/opt/android-sdk"
 fi
@@ -186,6 +190,16 @@ if [ -z "$SSH_TTY" ] ; then                     # if not using ssh
 		fi
 	fi
 fi
+
+#
+# Exit from sc when exiting from shell
+#
+function __sc_exit() {
+    if [ "${STY:-}" != "" ]; then
+        sc -d
+    fi
+}
+trap __sc_exit EXIT
 
 PERL_MB_OPT="--install_base \"/Users/rmoyle/perl5\""; export PERL_MB_OPT;
 PERL_MM_OPT="INSTALL_BASE=/Users/rmoyle/perl5"; export PERL_MM_OPT;
