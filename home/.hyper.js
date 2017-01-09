@@ -77,7 +77,7 @@ module.exports = {
     bell: false,
 
     // if true, selected text will automatically be copied to the clipboard
-    copyOnSelect: false
+    copyOnSelect: false,
 
     // URL to custom bell
     // bellSoundURL: 'http://example.com/bell.mp3',
@@ -96,6 +96,8 @@ module.exports = {
     'hyperlinks',
     'hyper-statusline',
     'hyper-solarized-dark',
+    'hyper-autohide-tabs',
+    'hyperminimal',
   ],
 
   // in development, you can create a directory under
