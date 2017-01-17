@@ -95,7 +95,7 @@ module.exports = {
     'hypercwd',
     'hyperlinks',
     'hyper-statusline',
-    'hyper-solarized-dark',
+    'hyper-sierra',
   ],
 
   // in development, you can create a directory under
