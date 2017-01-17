@@ -163,6 +163,10 @@ if [ -d "$HOME/bin:/opt/chefdk/bin" ] ; then
     export PATH="$PATH:$HOME/bin:/opt/chefdk/bin"
 fi
 
+if [ -d "$HOME/.composer/vendor/bin" ] ; then
+	export PATH="$PATH:$HOME/.composer/vendor/bin" # Add RVM to PATH for scripting
+fi
+
 if [ -d "/usr/local/opt/android-sdk" ] ; then
     export ANDROID_HOME="/usr/local/opt/android-sdk"
 fi
