@@ -214,3 +214,6 @@ PERL_MM_OPT="INSTALL_BASE=/Users/rmoyle/perl5"; export PERL_MM_OPT;
 export DEVKITPRO=$HOME/workspace/devkitARM-downloader
 export DEVKITARM=$DEVKITPRO/devkitARM
 export GTEST_DIR=$HOME/workspace/github/google/googletest/googletest
+
+export NVM_DIR="/home/rodrigomoyle/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
