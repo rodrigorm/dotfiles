@@ -179,6 +179,10 @@ if [ -d "$HOME/Android/Sdk" ] ; then
     export PATH="$PATH:$ANDROID_HOME/platform-tools"
 fi
 
+if [ -d "$HOME/.virtualenv/bin" ] ; then
+    export PATH="$HOME/.virtualenv/bin:$PATH"
+fi
+
 #
 # setup ssh-agent
 #
@@ -215,5 +219,8 @@ export DEVKITPRO=$HOME/workspace/devkitARM-downloader
 export DEVKITARM=$DEVKITPRO/devkitARM
 export GTEST_DIR=$HOME/workspace/github/google/googletest/googletest
 
-export NVM_DIR="/home/rodrigomoyle/.nvm"
+export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+
+export GOPATH="$HOME/workspace/go"
+export PATH="$PATH:$GOPATH/bin"
