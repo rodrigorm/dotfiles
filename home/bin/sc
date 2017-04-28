@@ -150,6 +150,11 @@ function sc_listen() {
 function sc_select() {
     local name="${1}"
 
+    if [ -d "${name}" ] ; then
+        cd "${name}"
+        name=$(basename $(pwd))
+    fi
+
     if [ "${STY:-}" != "" ] ; then
         screen -d "${STY}"
         screen -ls "${name}" 2>/dev/null || screen -dmS "${name}"
