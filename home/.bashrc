@@ -150,8 +150,8 @@ if [ -d "$HOME/.rvm/bin" ] ; then
 fi
 
 if [ -d "$HOME/.phpenv/bin" ] ; then
-	export PATH="/home/rmoyle/.phpenv/bin:$PATH"
-	export PATH="/home/rmoyle/.phpenv/shims:$PATH"
+	export PATH="$HOME/.phpenv/bin:$PATH"
+	export PATH="$HOME/.phpenv/shims:$PATH"
 	eval "$(phpenv init -)"
 fi
 
@@ -181,6 +181,15 @@ fi
 
 if [ -d "$HOME/.virtualenv/bin" ] ; then
     export PATH="$HOME/.virtualenv/bin:$PATH"
+fi
+
+if [ -d "/usr/local/go/bin" ] ; then
+    export PATH="$PATH:/usr/local/go/bin"
+fi
+
+if [ -d "$HOME/workspace/go" ] ; then
+    export GOPATH="$HOME/workspace/go"
+    export PATH="$PATH:$GOPATH/bin"
 fi
 
 #
@@ -221,6 +230,3 @@ export GTEST_DIR=$HOME/workspace/github/google/googletest/googletest
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
-
-export GOPATH="$HOME/workspace/go"
-export PATH="$PATH:$GOPATH/bin"
