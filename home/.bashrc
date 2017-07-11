@@ -222,11 +222,14 @@ function __sc_exit() {
 }
 # trap __sc_exit EXIT
 
-PERL_MB_OPT="--install_base \"/Users/rmoyle/perl5\""; export PERL_MB_OPT;
-PERL_MM_OPT="INSTALL_BASE=/Users/rmoyle/perl5"; export PERL_MM_OPT;
+PERL_MB_OPT="--install_base \"$HOME/perl5\""; export PERL_MB_OPT;
+PERL_MM_OPT="INSTALL_BASE=$HOME/perl5"; export PERL_MM_OPT;
 export DEVKITPRO=$HOME/workspace/devkitARM-downloader
 export DEVKITARM=$DEVKITPRO/devkitARM
 export GTEST_DIR=$HOME/workspace/github/google/googletest/googletest
 
 export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+
+# added by travis gem
+[ -f $HOME/.travis/travis.sh ] && source $HOME/.travis/travis.sh

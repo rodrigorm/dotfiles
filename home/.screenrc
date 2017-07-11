@@ -47,9 +47,8 @@ altscreen on # Enable alternate screen to fix residual on editors
 rendition so "= KW"
 
 ## Setup hardstatus line and caption
-backtick 1 0 10 screen-git-branch
 caption splitonly "%{= KW}%?%F%{+ Wk}%? %n %t %{-}%? %h%?"
-hardstatus alwayslastline "%{= KW}%? %-w%?%{+ Wk} %n %t %{-}%+w %=%S%? (%1`)%? "
+hardstatus alwayslastline "%{= KW}%? %-w%?%{+ Wk} %n %t %{-}%+w %=%S%?"
 
 # Use this hardstatus at a remote servers
 # Red
