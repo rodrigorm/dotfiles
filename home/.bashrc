@@ -179,8 +179,8 @@ if [ -d "/usr/local/opt/android-sdk" ] ; then
     export PATH="$PATH:$ANDROID_HOME/platform-tools"
 fi
 
-if [ -d "$HOME/Android/Sdk" ] ; then
-    export ANDROID_HOME="$HOME/Android/Sdk"
+if [ -d "$HOME/Library/Android/Sdk" ] ; then
+    export ANDROID_HOME="$HOME/Library/Android/Sdk"
     export PATH="$PATH:$ANDROID_HOME/tools"
     export PATH="$PATH:$ANDROID_HOME/platform-tools"
 fi

@@ -39,6 +39,8 @@ defbce on # Erase with background color
 defmonitor off # Disable window monitoring
 
 defutf8 on # Default encoding to utf-8
+encoding utf8 utf8
+defencoding utf8
 
 altscreen on # Enable alternate screen to fix residual on editors
 
