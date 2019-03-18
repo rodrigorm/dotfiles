@@ -46,11 +46,11 @@ altscreen on # Enable alternate screen to fix residual on editors
 
 # UI Setup
 ## Split color
-rendition so "= BK"
+rendition so "= wk"
 
 ## Setup hardstatus line and caption
-caption always "%?%F%{+b W}%? %n %t %{-}%?"
-hardstatus alwayslastline "%{= CK}%? %-w%: %?%{+b W}%n %t%{-}%+w%=%S "
+caption splitonly "%?%F%{+b .w}%? %n %t %{-}%?"
+hardstatus alwayslastline "%{= dw}%? %-w%: %?%{+b}%n %t%{-}%+w%=%{+b}%S%{-}"
 
 # Use this hardstatus at a remote servers
 # Red
