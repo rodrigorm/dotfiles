@@ -177,14 +177,8 @@ if [ -d "$HOME/.composer/vendor/bin" ] ; then
 	export PATH="$PATH:$HOME/.composer/vendor/bin" # Add RVM to PATH for scripting
 fi
 
-if [ -d "/usr/local/opt/android-sdk" ] ; then
-    export ANDROID_HOME="/usr/local/opt/android-sdk"
-    export PATH="$PATH:$ANDROID_HOME/tools"
-    export PATH="$PATH:$ANDROID_HOME/platform-tools"
-fi
-
-if [ -d "$HOME/Library/Android/Sdk" ] ; then
-    export ANDROID_HOME="$HOME/Library/Android/Sdk"
+if [ -d "$HOME/Library/Android/sdk" ] ; then
+    export ANDROID_HOME="$HOME/Library/Android/sdk"
     export PATH="$PATH:$ANDROID_HOME/tools"
     export PATH="$PATH:$ANDROID_HOME/platform-tools"
 fi
@@ -239,7 +233,11 @@ function __sc_exit() {
 # trap __sc_exit EXIT
 
 export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "/usr/local/opt/nvm/nvm.sh" ] && . "/usr/local/opt/nvm/nvm.sh"  # This loads nvm
+[ -s "/usr/local/opt/nvm/etc/bash_completion" ] && . "/usr/local/opt/nvm/etc/bash_completion"  # This loads nvm bash_completion
+
+[ -s "/usr/local/lib/node_modules/full-icu" ] && export NODE_ICU_DATA="/usr/local/lib/node_modules/full-icu"
 
 # added by travis gem
 [ -f $HOME/.travis/travis.sh ] && source $HOME/.travis/travis.sh
+if [ -e $HOME/.nix-profile/etc/profile.d/nix.sh ]; then . $HOME/.nix-profile/etc/profile.d/nix.sh; fi # added by Nix installer

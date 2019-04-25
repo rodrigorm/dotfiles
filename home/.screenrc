@@ -34,15 +34,15 @@ defscrollback 10000 # Change default scrollback to 10000 lines
 msgwait 0
 startup_message off # Disable startup message window
 
-defbce on # Erase with background color
+# defbce on # Erase with background color
 
-defmonitor off # Disable window monitoring
+# defmonitor off # Disable window monitoring
 
-defutf8 on # Default encoding to utf-8
-encoding utf8 utf8
-defencoding utf8
+# defutf8 on # Default encoding to utf-8
+# encoding utf8 utf8
+# defencoding utf8
 
-altscreen on # Enable alternate screen to fix residual on editors
+# altscreen on # Enable alternate screen to fix residual on editors
 
 # UI Setup
 ## Split color
