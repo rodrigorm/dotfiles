@@ -139,6 +139,8 @@ if [ ! "$TERM" == "linux" ]; then
 		source /usr/share/git-core/contrib/completion/git-prompt.sh
 	fi
 	source "$HOME/.homesick/repos/pure/pure.bash"
+    export TOLASTLINE=$(tput cup "$LINES")
+    export PS1="\[$TOLASTLINE\]$PS1"
 fi
 
 if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
@@ -179,7 +181,9 @@ fi
 
 if [ -d "$HOME/Library/Android/sdk" ] ; then
     export ANDROID_HOME="$HOME/Library/Android/sdk"
+    export PATH="$PATH:$ANDROID_HOME/emulator"
     export PATH="$PATH:$ANDROID_HOME/tools"
+    export PATH="$PATH:$ANDROID_HOME/tools/bin"
     export PATH="$PATH:$ANDROID_HOME/platform-tools"
 fi
 
