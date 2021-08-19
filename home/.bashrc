@@ -139,8 +139,9 @@ if [ ! "$TERM" == "linux" ]; then
 		source /usr/share/git-core/contrib/completion/git-prompt.sh
 	fi
 	source "$HOME/.homesick/repos/pure/pure.bash"
-    export TOLASTLINE=$(tput cup "$LINES")
-    export PS1="\[$TOLASTLINE\]$PS1"
+    # export TOLASTLINE=$(tput cup "$LINES")
+    # export PS1="\[$TOLASTLINE\]$PS1"
+    export PS1='\[$(tput cup "$LINES")\]'$PS1
 fi
 
 if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
