@@ -1,0 +1,25 @@
+depends:
+  - dev.neovim
+
+actions:
+  - action: package.install
+    list:
+    - "git"
+    - "make"
+    - "unzip"
+    - "build-essential"
+    - "ripgrep"
+    - "xclip"
+
+  - action: command.run
+    command: rm
+    args:
+     - "-rf"
+     - "{{ user.home_dir }}/.config/nvim"
+
+  - action: command.run
+    command: git
+    args:
+    - "clone"
+    - "https://github.com/rodrigorm/nvim.git"
+    - "{{ user.home_dir }}/.config/nvim"

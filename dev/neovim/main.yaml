@@ -1,0 +1,38 @@
+actions: 
+  - action: file.download
+    from: "https://github.com/neovim/neovim/releases/latest/download/nvim-linux64.tar.gz"
+    to: "/tmp/nvim-linux64.tar.gz"
+
+  - action: command.run
+    privileged: true
+    command: rm
+    args:
+    - "-rf"
+    - "/opt/nvim"
+
+  - action: command.run
+    privileged: true
+    command: tar
+    args:
+    - "-C"
+    - "/opt"
+    - "-xzf"
+    - "/tmp/nvim-linux64.tar.gz"
+
+  - action: command.run
+    privileged: true
+    command: mv
+    args:
+    - "/opt/nvim-linux64/"
+    - "/opt/nvim"
+
+  - action: file.remove
+    target: "/tmp/nvim-linux64.tar.gz"
+
+  - action: command.run
+    privileged: true
+    command: ln
+    args:
+    - "-s"
+    - "/opt/nvim/bin/nvim"
+    - "/usr/local/bin/nvim"
