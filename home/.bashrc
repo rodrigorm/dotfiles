@@ -144,11 +144,6 @@ if [ ! "$TERM" == "linux" ]; then
     export PS1='\[$(tput cup "$LINES")\]'$PS1
 fi
 
-if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
-	homeshick clone rodrigorm/vim
-	$(homeshick cd vim && git submodule update --init)
-fi
-
 if [ -f "$HOME/.rvm/scripts/rvm" ]; then
 	source "$HOME/.rvm/scripts/rvm"
 fi

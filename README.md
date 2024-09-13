@@ -1,13 +1,20 @@
-# Dotfiles
+# dotfiles
 
 In Unix, configuration files are king. This is my castle.
 
-## Project Setup
+## Installation
+
+### Install External Dependencies
+
+- Basic utils: `curl` and `cc`.
+  > `apt install curl build-essential`
+
+### Install dotfiles
 
 ```bash
-$ git clone git://github.com/andsens/homeshick.git $HOME/.homesick/repos/homeshick
-$ $HOME/.homesick/repos/homeshick/bin/homeshick clone rodrigorm/dotfiles
-$ source $HOME/.bashrc
+$ git clone https://github.com/rodrigorm/dotfiles.git $HOME/.dotfiles
+$ cd $HOME/.dotfiles
+$ ./bootstrap.sh
 ```
 
 OS X 10.7 Lion: Double click to install or import Solarized Dark.terminal into Terminal.app preferences.
