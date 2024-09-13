@@ -1,0 +1,20 @@
+depends:
+  - dev.homeshick
+
+actions:
+  - action: command.run
+    command: rm
+    args:
+      - "-f"
+      - "{{ user.home_dir }}/.homesick/repos/dotfiles"
+
+  - action: file.link
+    from: "{{ env.PWD }}"
+    to: "{{ user.home_dir }}/.homesick/repos/dotfiles"
+
+  - action: command.run
+    command: "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick"
+    args:
+     - "link"
+     - "dotfiles"
+     - "--force"
