@@ -1,0 +1,6 @@
+actions:
+  - action: command.run
+    privileged: true
+    command: apt
+    args:
+     - "update"

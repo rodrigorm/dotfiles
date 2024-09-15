@@ -1,0 +1,10 @@
+depends:
+  - dev.homeshick
+
+actions:
+  - action: command.run
+    command: "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick"
+    args:
+      - "clone"
+      - "rodrigorm/pure"
+      - "--batch"

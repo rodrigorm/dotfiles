@@ -1,0 +1,16 @@
+depends:
+  - dev.git
+
+actions:
+  - action: command.run
+    command: rm
+    args:
+     - "-rf"
+     - "{{ user.home_dir }}/.homesick/repos/homeshick"
+
+  - action: command.run
+    command: git
+    args:
+     - "clone"
+     - "https://github.com/andsens/homeshick.git"
+     - "{{ user.home_dir }}/.homesick/repos/homeshick"

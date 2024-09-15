@@ -1,0 +1,7 @@
+depends:
+  - dev.aptitude
+
+actions:
+  - action: package.install
+    list:
+     - "screen"

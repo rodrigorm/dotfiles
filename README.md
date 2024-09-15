@@ -1,13 +1,24 @@
-# Dotfiles
+# dotfiles
 
 In Unix, configuration files are king. This is my castle.
 
-## Project Setup
+## Installation
+
+### Install External Dependencies
+
+- [https://brew.sh/](Homebrew)
+  ```
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  ```
+- [https://comtrya.dev/](comtrya)
+
+### Install dotfiles
 
 ```bash
-$ git clone git://github.com/andsens/homeshick.git $HOME/.homesick/repos/homeshick
-$ $HOME/.homesick/repos/homeshick/bin/homeshick clone rodrigorm/dotfiles
-$ source $HOME/.bashrc
+$ git clone https://github.com/rodrigorm/dotfiles.git $HOME/.dotfiles
+$ cd $HOME/.dotfiles
+$ comtrya apply
+$ vim +BundleInstall +qall
 ```
 
 OS X 10.7 Lion: Double click to install or import Solarized Dark.terminal into Terminal.app preferences.

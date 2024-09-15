@@ -1,0 +1,6 @@
+actions:
+  - action: command.run
+    command: mkdir
+    args:
+     - "-p"
+     - "{{ user.home_dir }}/.ssh"
