@@ -116,8 +116,10 @@ if ! shopt -oq posix; then
     . /usr/share/bash-completion/bash_completion
   fi
 
-  if [ -f `brew --prefix`/etc/bash_completion ]; then
-    . `brew --prefix`/etc/bash_completion
+  if [ command -v comtrya >/dev/null 2>&1 ]; then
+    if [ -f `brew --prefix`/etc/bash_completion ]; then
+      . `brew --prefix`/etc/bash_completion
+    fi
   fi
 
   if [ -f /etc/bash_completion ]; then
@@ -129,10 +131,6 @@ source "$HOME/.homesick/repos/homeshick/homeshick.sh"
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
 
 if [ ! "$TERM" == "linux" ]; then
-	if [ ! -f "$HOME/.homesick/repos/pure/pure.bash" ]; then
-		homeshick clone rodrigorm/pure
-	fi
-
 	if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
 		source /usr/local/git/contrib/completion/git-prompt.sh
 	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
@@ -142,11 +140,6 @@ if [ ! "$TERM" == "linux" ]; then
     # export TOLASTLINE=$(tput cup "$LINES")
     # export PS1="\[$TOLASTLINE\]$PS1"
     export PS1='\[$(tput cup "$LINES")\]'$PS1
-fi
-
-if [ ! -f "$HOME/.homesick/repos/vim/vimrc" ]; then
-	homeshick clone rodrigorm/vim
-	$(homeshick cd vim && git submodule update --init)
 fi
 
 if [ -f "$HOME/.rvm/scripts/rvm" ]; then

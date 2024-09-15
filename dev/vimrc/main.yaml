@@ -1,0 +1,32 @@
+depends:
+  - dev.aptitude
+  - dev.git
+  - dev.homeshick
+
+actions:
+  - action: package.install
+    list:
+     - "exuberant-ctags"
+
+  - action: command.run
+    command: "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick"
+    args:
+     - "clone"
+     - "rodrigorm/vim"
+     - "--batch"
+
+  - action: command.run
+    dir: "{{ user.home_dir }}/.homesick/repos/vim"
+    command: git
+    args:
+     - "submodule"
+     - "update"
+     - "--init"
+
+  - action: file.link
+    from: "{{ user.home_dir }}/.homesick/repos/vim"
+    to: "{{ user.home_dir }}/.vim"
+
+  - action: file.link
+    from: "{{ user.home_dir }}/.homesick/repos/vim/vimrc"
+    to: "{{ user.home_dir }}/.vimrc"
