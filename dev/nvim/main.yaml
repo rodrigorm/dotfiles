@@ -1,10 +1,18 @@
 depends:
+  - dev.git
   - dev.neovim
 
 actions:
   - action: command.run
+    command: "sh"
+    args:
+     - "-c"
+     - "git clone https://github.com/rodrigorm/nvim.git \"{{ user.home_dir }}/.config/nvim\" || true"
+
+  - action: command.run
+    dir: "{{ user.home_dir }}/.config/nvim"
     command: git
     args:
-     - "clone"
-     - "https://github.com/rodrigorm/nvim.git"
-     - "{{ user.home_dir }}/.config/nvim"
+     - "pull"
+     - "origin"
+     - "main"

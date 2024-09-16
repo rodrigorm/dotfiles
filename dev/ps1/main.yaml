@@ -3,8 +3,13 @@ depends:
 
 actions:
   - action: command.run
+    command: "sh"
+    args:
+      - "-c"
+      - "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick clone \"rodrigorm/pure\" --batch || true"
+
+  - action: command.run
     command: "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick"
     args:
-      - "clone"
-      - "rodrigorm/pure"
-      - "--batch"
+     - "pull"
+     - "pure"
