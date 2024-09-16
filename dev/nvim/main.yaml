@@ -6,6 +6,9 @@ actions:
   - action: package.install
     list:
      - "build-essential"
+     - "unzip"
+     - "python3-venv"
+     - "npm"
 
   - action: command.run
     command: "sh"
