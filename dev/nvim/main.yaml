@@ -3,6 +3,10 @@ depends:
   - dev.neovim
 
 actions:
+  - action: package.install
+    list:
+     - "build-essential"
+
   - action: command.run
     command: "sh"
     args:

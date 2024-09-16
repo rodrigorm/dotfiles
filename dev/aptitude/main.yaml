@@ -4,3 +4,7 @@ actions:
     command: apt
     args:
      - "update"
+
+  - action: package.install
+    list:
+     - "software-properties-common"

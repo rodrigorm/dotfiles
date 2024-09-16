@@ -2,7 +2,21 @@ depends:
   - dev.aptitude
 
 actions:
+  - action: command.run
+    privileged: true
+    command: add-apt-repository
+    args:
+     - "-y"
+     - "ppa:neovim-ppa/unstable"
+
+  - action: command.run
+    privileged: true
+    command: apt
+    args:
+     - "update"
+
+
   - action: package.install
     list:
-     - "build-essential"
      - "neovim"
+
