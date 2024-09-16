@@ -9,6 +9,9 @@ actions:
      - "unzip"
      - "python3-venv"
      - "npm"
+     - "fish-common"
+     - "ripgrep"
+     - "fd-find"
 
   - action: command.run
     command: "sh"
