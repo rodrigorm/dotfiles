@@ -1,0 +1,8 @@
+depends:
+  - dev.aptitude
+
+actions:
+  - action: package.install
+    list:
+     - "build-essential"
+     - "neovim"

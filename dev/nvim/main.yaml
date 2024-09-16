@@ -1,0 +1,10 @@
+depends:
+  - dev.neovim
+
+actions:
+  - action: command.run
+    command: git
+    args:
+     - "clone"
+     - "https://github.com/rodrigorm/nvim.git"
+     - "{{ user.home_dir }}/.config/nvim"
