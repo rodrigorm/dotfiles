@@ -1,6 +1,7 @@
 depends:
   - dev.git
   - dev.neovim
+  - dev.lazygit
 
 actions:
   - action: package.install
