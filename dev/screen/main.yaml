@@ -1,7 +1,49 @@
 depends:
   - dev.aptitude
+  - dev.git
 
 actions:
-  - action: package.install
-    list:
+  - action: command.run
+    privileged: true
+    command: sed
+    args:
+     - "-i"
+     - "-e"
+     - "s/^# deb-src/deb-src/g"
+     - "/etc/apt/sources.list"
+
+  - action: command.run
+    privileged: true
+    command: apt
+    args:
+     - "update"
+
+  - action: command.run
+    privileged: true
+    command: apt-get
+    args: 
+     - "-y"
+     - "build-dep"
      - "screen"
+
+  - action: command.run
+    command: "sh"
+    args:
+     - "-c"
+     - "git clone https://git.savannah.gnu.org/git/screen.git \"/tmp/screen-5.0.0\" || true"
+
+  - action: command.run
+    dir: "/tmp/screen-5.0.0"
+    command: git
+    args:
+     - "reset"
+     - "--hard"
+     - "v.5.0.0"
+
+  - action: command.run
+    dir: "/tmp/screen-5.0.0/src"
+    privileged: true
+    command: "sh"
+    args:
+     - "-c"
+     - "./autogen.sh && ./configure && make && make install"

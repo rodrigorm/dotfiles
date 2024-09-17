@@ -57,3 +57,5 @@ hardstatus alwayslastline "%{= dw}%? %-w%: %?%{+b}%n %t%{-}%+w%=%{+b}%S%{-}"
 # hardstatus alwayslastline "%{=b rW} %-w%{+b dW} %n %t %{-}%+w %-= %{= rY}${USER}@%H "
 # Yellow
 # hardstatus alwayslastline "%{=b YK} %-w%{+b dW} %n %t %{-}%+w %-= %{= YK}${USER}@%H "
+
+truecolor on
