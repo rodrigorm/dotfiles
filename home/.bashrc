@@ -116,7 +116,7 @@ if ! shopt -oq posix; then
     . /usr/share/bash-completion/bash_completion
   fi
 
-  if [ command -v comtrya >/dev/null 2>&1 ]; then
+  if [ command -v brew >/dev/null 2>&1 ]; then
     if [ -f `brew --prefix`/etc/bash_completion ]; then
       . `brew --prefix`/etc/bash_completion
     fi
