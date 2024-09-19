@@ -1,5 +1,6 @@
 depends:
   - dev.homeshick
+  - dev.ps1
 
 actions:
   - action: file.link
@@ -12,3 +13,9 @@ actions:
      - "link"
      - "dotfiles"
      - "--force"
+
+  - action: command.run
+    command: mkdir
+    args:
+     - "-p"
+     - "{{ user.home_dir }}/.ssh/"

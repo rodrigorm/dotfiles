@@ -135,6 +135,8 @@ if [ ! "$TERM" == "linux" ]; then
 		source /usr/local/git/contrib/completion/git-prompt.sh
 	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
 		source /usr/share/git-core/contrib/completion/git-prompt.sh
+    elif [ -f /usr/lib/git-core/git-sh-prompt ]; then
+        source /usr/lib/git-core/git-sh-prompt
 	fi
 	source "$HOME/.homesick/repos/pure/pure.bash"
     # export TOLASTLINE=$(tput cup "$LINES")

@@ -1,5 +1,6 @@
 depends:
   - dev.homeshick
+  - dev.git
 
 actions:
   - action: command.run
