@@ -2,6 +2,7 @@ depends:
   - dev.git
   - dev.neovim
   - dev.lazygit
+  - dev.nodejs
 
 actions:
   - action: package.install
@@ -9,7 +10,6 @@ actions:
      - "build-essential"
      - "unzip"
      - "python3-venv"
-     - "npm"
      - "fish-common"
      - "ripgrep"
      - "fd-find"

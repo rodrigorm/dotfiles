@@ -1,0 +1,15 @@
+depends:
+  - dev.aptitude
+  - dev.bash
+  - dev.dotfiles
+
+actions:
+  - action: package.install
+    list:
+     - "curl"
+
+  - action: command.run
+    command: sh
+    args:
+      - "-c"
+      - "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash"
