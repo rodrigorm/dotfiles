@@ -261,3 +261,6 @@ export NVM_DIR="$HOME/.nvm"
 
 # shellcheck source=/dev/null
 if [ -e "$HOME/.nix-profile/etc/profile.d/nix.sh" ]; then source "$HOME/.nix-profile/etc/profile.d/nix.sh"; fi # added by Nix installer
+
+# Initialize `~/.bashrc.d`
+[[ -s "${HOME}/.bashrc.d/.init.sh" ]] && source "${HOME}/.bashrc.d/.init.sh"
