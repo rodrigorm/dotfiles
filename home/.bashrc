@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 # ~/.bashrc: executed by bash(1) for non-login shells.
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
@@ -80,7 +82,12 @@ esac
 
 # enable color support of ls and also add handy aliases
 if [ -x /usr/bin/dircolors ]; then
-    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    if test -r "$HOME/.dircolors"; then
+      eval "$(dircolors -b "$HOME/.dircolors")"
+    else
+      commandeval "$(dircolors -b)"
+    fi
+
     alias ls='ls --color=auto'
     #alias dir='dir --color=auto'
     #alias vdir='vdir --color=auto'
@@ -104,8 +111,8 @@ alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo
 # ~/.bash_aliases, instead of adding them here directly.
 # See /usr/share/doc/bash-doc/examples in the bash-doc package.
 
-if [ -f ~/.bash_aliases ]; then
-    . ~/.bash_aliases
+if [ -f "$HOME/.bash_aliases" ]; then
+    source "$HOME/.bash_aliases"
 fi
 
 # enable programmable completion features (you don't need to enable
@@ -113,29 +120,37 @@ fi
 # sources /etc/bash.bashrc).
 if ! shopt -oq posix; then
   if [ -f /usr/share/bash-completion/bash_completion ]; then
-    . /usr/share/bash-completion/bash_completion
+    # shellcheck source=/dev/null
+    source /usr/share/bash-completion/bash_completion
   fi
 
-  if [ command -v brew >/dev/null 2>&1 ]; then
-    if [ -f `brew --prefix`/etc/bash_completion ]; then
-      . `brew --prefix`/etc/bash_completion
+  if command -v brew >/dev/null 2>&1 ; then
+    if [ -f "$(brew --prefix)/etc/bash_completion" ]; then
+      # shellcheck source=/dev/null
+      source "$(brew --prefix)/etc/bash_completion"
     fi
   fi
 
   if [ -f /etc/bash_completion ]; then
-    . /etc/bash_completion
+    # shellcheck source=/dev/null
+    source /etc/bash_completion
   fi
 fi
 
+# shellcheck source=/dev/null
 source "$HOME/.homesick/repos/homeshick/homeshick.sh"
+# shellcheck source=/dev/null
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
 
 if [ ! "$TERM" == "linux" ]; then
 	if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
+        # shellcheck source=/dev/null
 		source /usr/local/git/contrib/completion/git-prompt.sh
 	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
+        # shellcheck source=/dev/null
 		source /usr/share/git-core/contrib/completion/git-prompt.sh
     elif [ -f /usr/lib/git-core/git-sh-prompt ]; then
+        # shellcheck source=/dev/null
         source /usr/lib/git-core/git-sh-prompt
 	fi
 	# source "$HOME/.homesick/repos/pure/pure.bash"
@@ -145,6 +160,7 @@ if [ ! "$TERM" == "linux" ]; then
 fi
 
 if [ -f "$HOME/.rvm/scripts/rvm" ]; then
+    # shellcheck source=/dev/null
 	source "$HOME/.rvm/scripts/rvm"
 fi
 
@@ -201,20 +217,19 @@ export PATH="$PATH:$GOPATH/bin"
 #
 
 # start agent if necessary
-if [ -z $SSH_AUTH_SOCK ] && [ -z $SSH_TTY ]; then  # if no agent & not in ssh
-	eval `ssh-agent -s` > /dev/null
+if [ -z "$SSH_AUTH_SOCK" ] && [ -z "$SSH_TTY" ]; then  # if no agent & not in ssh
+    eval "$(ssh-agent -s)" > /dev/null
 fi
 
 # redirect $SSH_AUTH_SOCK from connection to keep screen sessions connected with agent
 if [[ -S "$SSH_AUTH_SOCK" && ! -h "$SSH_AUTH_SOCK" ]]; then
-    ln -sf "$SSH_AUTH_SOCK" ~/.ssh/ssh_auth_sock;
-    export SSH_AUTH_SOCK=~/.ssh/ssh_auth_sock;
+    ln -sf "$SSH_AUTH_SOCK" "$HOME/.ssh/ssh_auth_sock"
+    export SSH_AUTH_SOCK=$HOME/.ssh/ssh_auth_sock;
 fi
 
 # setup addition of keys when needed
 if [ -z "$SSH_TTY" ] ; then                     # if not using ssh
-	ssh-add -l > /dev/null                        # check for keys
-	if [ $? -ne 0 ] ; then
+	if ! ssh-add -l > /dev/null; then                        # check for keys
 		alias ssh='ssh-add -l > /dev/null || ssh-add && unalias ssh ; ssh'
 		if [ -f "/usr/lib/ssh/x11-ssh-askpass" ] ; then
 			SSH_ASKPASS="/usr/lib/ssh/x11-ssh-askpass" ; export SSH_ASKPASS
@@ -233,11 +248,16 @@ function __sc_exit() {
 # trap __sc_exit EXIT
 
 export NVM_DIR="$HOME/.nvm"
-[ -s "${NVM_DIR}/nvm.sh" ] && . "${NVM_DIR}/nvm.sh"  # This loads nvm
-[ -s "${NVM_DIR}/bash_completion" ] && . "${NVM_DIR}/bash_completion"  # This loads nvm bash_completion
+# shellcheck source=/dev/null
+[ -s "${NVM_DIR}/nvm.sh" ] && source "${NVM_DIR}/nvm.sh"  # This loads nvm
+# shellcheck source=/dev/null
+[ -s "${NVM_DIR}/bash_completion" ] && source "${NVM_DIR}/bash_completion"  # This loads nvm bash_completion
 
 [ -s "/usr/local/lib/node_modules/full-icu" ] && export NODE_ICU_DATA="/usr/local/lib/node_modules/full-icu"
 
 # added by travis gem
-[ -f $HOME/.travis/travis.sh ] && source $HOME/.travis/travis.sh
-if [ -e $HOME/.nix-profile/etc/profile.d/nix.sh ]; then . $HOME/.nix-profile/etc/profile.d/nix.sh; fi # added by Nix installer
+# shellcheck source=/dev/null
+[ -f "$HOME/.travis/travis.sh" ] && source "$HOME/.travis/travis.sh"
+
+# shellcheck source=/dev/null
+if [ -e "$HOME/.nix-profile/etc/profile.d/nix.sh" ]; then source "$HOME/.nix-profile/etc/profile.d/nix.sh"; fi # added by Nix installer
