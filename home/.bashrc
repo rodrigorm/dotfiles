@@ -4,34 +4,6 @@
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
 
-# set a fancy prompt (non-color, unless we know we "want" color)
-case "$TERM" in
-    xterm-color) color_prompt=yes;;
-esac
-
-# uncomment for a colored prompt, if the terminal has the capability; turned
-# off by default to not distract the user: the focus in a terminal window
-# should be on the output of commands, not on the prompt
-#force_color_prompt=yes
-
-if [ -n "$force_color_prompt" ]; then
-    if [ -x /usr/bin/tput ] && tput setaf 1 >&/dev/null; then
-	# We have color support; assume it's compliant with Ecma-48
-	# (ISO/IEC-6429). (Lack of such support is extremely rare, and such
-	# a case would tend to support setf rather than setaf.)
-	color_prompt=yes
-    else
-	color_prompt=
-    fi
-fi
-
-if [ "$color_prompt" = yes ]; then
-    PS1='${debian_chroot:+($debian_chroot)}\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
-else
-    PS1='${debian_chroot:+($debian_chroot)}\u@\h:\w\$ '
-fi
-unset color_prompt force_color_prompt
-
 # enable color support of ls and also add handy aliases
 if [ -x /usr/bin/dircolors ]; then
     if test -r "$HOME/.dircolors"; then
@@ -71,23 +43,6 @@ fi
 source "$HOME/.homesick/repos/homeshick/homeshick.sh"
 # shellcheck source=/dev/null
 source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
-
-if [ ! "$TERM" == "linux" ]; then
-	if [ -f /usr/local/git/contrib/completion/git-prompt.sh ]; then
-        # shellcheck source=/dev/null
-		source /usr/local/git/contrib/completion/git-prompt.sh
-	elif [ -f /usr/share/git-core/contrib/completion/git-prompt.sh ]; then
-        # shellcheck source=/dev/null
-		source /usr/share/git-core/contrib/completion/git-prompt.sh
-    elif [ -f /usr/lib/git-core/git-sh-prompt ]; then
-        # shellcheck source=/dev/null
-        source /usr/lib/git-core/git-sh-prompt
-	fi
-	# source "$HOME/.homesick/repos/pure/pure.bash"
-    # export TOLASTLINE=$(tput cup "$LINES")
-    # export PS1="\[$TOLASTLINE\]$PS1"
-    export PS1='\[$(tput cup "$LINES")\]'$PS1
-fi
 
 if [ -f "$HOME/.rvm/scripts/rvm" ]; then
     # shellcheck source=/dev/null
