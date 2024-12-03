@@ -138,7 +138,7 @@ if [ ! "$TERM" == "linux" ]; then
     elif [ -f /usr/lib/git-core/git-sh-prompt ]; then
         source /usr/lib/git-core/git-sh-prompt
 	fi
-	source "$HOME/.homesick/repos/pure/pure.bash"
+	# source "$HOME/.homesick/repos/pure/pure.bash"
     # export TOLASTLINE=$(tput cup "$LINES")
     # export PS1="\[$TOLASTLINE\]$PS1"
     export PS1='\[$(tput cup "$LINES")\]'$PS1
