@@ -4,11 +4,6 @@
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
 
-# shellcheck source=/dev/null
-source "$HOME/.homesick/repos/homeshick/homeshick.sh"
-# shellcheck source=/dev/null
-source "$HOME/.homesick/repos/homeshick/completions/homeshick-completion.bash"
-
 if [ -f "$HOME/.rvm/scripts/rvm" ]; then
     # shellcheck source=/dev/null
 	source "$HOME/.rvm/scripts/rvm"
