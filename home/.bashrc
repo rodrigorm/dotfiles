@@ -9,47 +9,10 @@ if [ -f "$HOME/.rvm/scripts/rvm" ]; then
 	source "$HOME/.rvm/scripts/rvm"
 fi
 
-# set PATH so it includes user's private bin if it exists
-if [ -d "$HOME/bin" ] ; then
-    PATH="$HOME/bin:$PATH"
-fi
-
-if [ -d "$HOME/.rvm/bin" ] ; then
-	export PATH="$PATH:$HOME/.rvm/bin" # Add RVM to PATH for scripting
-fi
-
 if [ -d "$HOME/.phpenv/bin" ] ; then
 	export PATH="$HOME/.phpenv/bin:$PATH"
 	export PATH="$HOME/.phpenv/shims:$PATH"
 	eval "$(phpenv init -)"
-fi
-
-if [ -d "/usr/local/sbin" ] ; then
-    export PATH="/usr/local/sbin:$PATH"
-fi
-
-if [ -d "$HOME/bin:/opt/chefdk/bin" ] ; then
-    export PATH="$PATH:$HOME/bin:/opt/chefdk/bin"
-fi
-
-if [ -d "$HOME/.composer/vendor/bin" ] ; then
-	export PATH="$PATH:$HOME/.composer/vendor/bin" # Add RVM to PATH for scripting
-fi
-
-if [ -d "$HOME/Library/Android/sdk" ] ; then
-    export ANDROID_HOME="$HOME/Library/Android/sdk"
-    export PATH="$PATH:$ANDROID_HOME/emulator"
-    export PATH="$PATH:$ANDROID_HOME/tools"
-    export PATH="$PATH:$ANDROID_HOME/tools/bin"
-    export PATH="$PATH:$ANDROID_HOME/platform-tools"
-fi
-
-if [ -d "$HOME/.virtualenv/bin" ] ; then
-    export PATH="$HOME/.virtualenv/bin:$PATH"
-fi
-
-if [ -d "/usr/local/go/bin" ] ; then
-    export PATH="$PATH:/usr/local/go/bin"
 fi
 
 # Setup workspace directory
