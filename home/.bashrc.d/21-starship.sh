@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
 # Starship: https://starship.rs/
-if [[ -x "$(brew --prefix)/bin/starship" ]]; then
-	eval "$(starship init bash)"
+if command -v starship >/dev/null 2>&1; then
+    eval "$(starship init bash)"
 fi
