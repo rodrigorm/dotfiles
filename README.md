@@ -6,11 +6,11 @@ In Unix, configuration files are king. This is my castle.
 
 ### Install External Dependencies
 
-- [https://brew.sh/](Homebrew)
+- [Homebrew](https://brew.sh/)
   ```
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   ```
-- [https://comtrya.dev/](comtrya)
+- [Comtrya](https://comtrya.dev/)
 
 ### Install dotfiles
 

@@ -5,7 +5,7 @@ if [ -x /usr/bin/dircolors ]; then
     if test -r "$HOME/.dircolors"; then
       eval "$(dircolors -b "$HOME/.dircolors")"
     else
-      commandeval "$(dircolors -b)"
+      eval "$(dircolors -b)"
     fi
 
     alias ls='ls --color=auto'
