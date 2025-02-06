@@ -1,32 +1,27 @@
 depends:
-  - dev.aptitude
-  - dev.git
+  - git
 
 actions:
-  - action: package.install
-    list:
-     - "curl"
+  - action: file.download
+    from: "https://github.com/jesseduffield/lazygit/releases/download/v0.44.1/lazygit_0.44.1_Linux_x86_64.tar.gz"
+    to: "/tmp/lazygit_0.44.1_Linux_x86_64.tar.gz"
 
-  - action: command.run
-    dir: "/tmp"
-    command: curl
-    args:
-     - "-Lo"
-     - "lazygit.tar.gz"
-     - "https://github.com/jesseduffield/lazygit/releases/download/v0.44.1/lazygit_0.44.1_Linux_x86_64.tar.gz"
-
-  - action: command.run
-    dir: "/tmp"
-    command: tar
-    args:
-     - "xf"
-     - "lazygit.tar.gz"
-     - "lazygit"
+  - action: file.unarchive
+    from: "/tmp/lazygit_0.44.1_Linux_x86_64.tar.gz"
+    to: "/tmp"
 
   - action: command.run
     privileged: true
     dir: "/tmp"
     command: install
     args:
-     - "lazygit"
-     - "/usr/local/bin"
+      - "lazygit"
+      - "/usr/local/bin"
+
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/lazygit_0.44.1_Linux_x86_64.tar.gz"
+      - "/tmp/lazygit"

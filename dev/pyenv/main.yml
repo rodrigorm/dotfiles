@@ -1,14 +1,22 @@
-depends:
-  - dev.aptitude
-  - dev.bash
-
 actions:
-  - action: package.install
-    list:
-     - "curl"
+  - action: file.download
+    from: "https://pyenv.run"
+    to: "/tmp/pyenv.sh"
+
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "{{ user.home_dir }}/.pyenv"
 
   - action: command.run
     command: sh
     args:
-      - "-c"
-      - "curl -fsSL https://pyenv.run | bash"
+      - "/tmp/pyenv.sh"
+
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/pyenv.sh"

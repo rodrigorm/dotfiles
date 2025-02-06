@@ -1,29 +1,37 @@
 depends:
-  - dev.git
-  - dev.neovim
-  - dev.lazygit
-  - dev.nodejs
+  - aptitude
+  - git
+  - neovim
+  - lazygit
+  - nodejs
 
 actions:
   - action: package.install
     list:
-     - "build-essential"
-     - "unzip"
-     - "python3-venv"
-     - "fish-common"
-     - "ripgrep"
-     - "fd-find"
+      - "build-essential"
+      - "unzip"
+      - "python3-venv"
+      - "fish-common"
+      - "ripgrep"
+      - "fd-find"
 
   - action: command.run
-    command: "sh"
+    command: rm
     args:
-     - "-c"
-     - "git clone https://github.com/rodrigorm/nvim.git \"{{ user.home_dir }}/.config/nvim\" || true"
+      - "-rf"
+      - "{{ user.home_dir }}/.config/nvim"
+
+  - action: command.run
+    command: git
+    args:
+      - "clone"
+      - "https://github.com/rodrigorm/nvim.git"
+      - "{{ user.home_dir }}/.config/nvim"
 
   - action: command.run
     dir: "{{ user.home_dir }}/.config/nvim"
     command: git
     args:
-     - "pull"
-     - "origin"
-     - "main"
+      - "pull"
+      - "origin"
+      - "main"

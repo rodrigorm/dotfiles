@@ -1,49 +1,57 @@
 depends:
-  - dev.aptitude
-  - dev.git
+  - aptitude
 
 actions:
-  - action: command.run
-    privileged: true
-    command: sed
-    args:
-     - "-i"
-     - "-e"
-     - "s/^# deb-src/deb-src/g"
-     - "/etc/apt/sources.list"
+  - action: package.install
+    list:
+      - "libncurses5-dev"
+
+  - action: file.download
+    from: "https://ftp.gnu.org/gnu/screen/screen-5.0.0.tar.gz"
+    to: "/tmp/screen-5.0.0.tar.gz"
+
+  - action: file.unarchive
+    from: "/tmp/screen-5.0.0.tar.gz"
+    to: "/tmp"
 
   - action: command.run
-    privileged: true
-    command: apt
-    args:
-     - "update"
-
-  - action: command.run
-    privileged: true
-    command: apt-get
-    args: 
-     - "-y"
-     - "build-dep"
-     - "screen"
-
-  - action: command.run
+    dir: /tmp/screen-5.0.0
     command: "sh"
     args:
-     - "-c"
-     - "git clone https://git.savannah.gnu.org/git/screen.git \"/tmp/screen-5.0.0\" || true"
+      - "-c"
+      - >
+        ./configure --prefix=/usr/local                  \
+                    --infodir=/usr/share/info            \
+                    --mandir=/usr/share/man              \
+                    --disable-pam                        \
+                    --enable-socket-dir=/run/screen      \
+                    --with-pty-group=5
 
   - action: command.run
-    dir: "/tmp/screen-5.0.0"
-    command: git
-    args:
-     - "reset"
-     - "--hard"
-     - "v.5.0.0"
+    dir: /tmp/screen-5.0.0
+    command: make
 
   - action: command.run
-    dir: "/tmp/screen-5.0.0/src"
+    dir: /tmp/screen-5.0.0
     privileged: true
-    command: "sh"
+    command: make
     args:
-     - "-c"
-     - "./autogen.sh && ./configure && make && make install"
+      - "install"
+
+  - action: command.run
+    dir: /tmp/screen-5.0.0
+    privileged: true
+    command: install
+    args:
+      - "-m"
+      - "644"
+      - "etc/etcscreenrc"
+      - "/etc/screenrc"
+
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/screen-5.0.0.tar.gz"
+      - "/tmp/screen-5.0.0"
