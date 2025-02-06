@@ -1,22 +1,31 @@
-depends:
-  - dev.aptitude
-
 actions:
-  - action: command.run
-    privileged: true
-    command: add-apt-repository
-    args:
-     - "-y"
-     - "ppa:neovim-ppa/unstable"
+  - action: file.download
+    from: "https://github.com/neovim/neovim/releases/download/{{ variables.neovim_version }}/nvim-{{ os.name }}-x86_64.tar.gz"
+    to: "/tmp/nvim.tar.gz"
+
+  - action: file.unarchive
+    from: "/tmp/nvim.tar.gz"
+    to: "/tmp"
 
   - action: command.run
     privileged: true
-    command: apt
+    command: rm
     args:
-     - "update"
+      - "-rf"
+      - "/opt/nvim"
 
+  - action: command.run
+    privileged: true
+    command: cp
+    args:
+      - "-R"
+      - "/tmp/nvim-{{ os.name }}-x86_64"
+      - "/opt/nvim"
 
-  - action: package.install
-    list:
-     - "neovim"
-
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/nvim.tar.gz"
+      - "/tmp/nvim-{{ os.name }}-x86_64"

@@ -1,5 +1,5 @@
 depends:
-  - dev.aptitude
+  - aptitude
 
 actions:
   - action: package.install

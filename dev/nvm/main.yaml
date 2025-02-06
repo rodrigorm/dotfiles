@@ -1,17 +1,16 @@
-depends:
-  - dev.aptitude
-  - dev.bash
-  - dev.dotfiles
-
 actions:
-  - action: package.install
-    list:
-     - "curl"
+  - action: file.download
+    from: "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh"
+    to: "/tmp/nvm.sh"
 
   - action: command.run
-    command: sh
+    command: bash
     args:
-      - "-c"
-      - "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash"
-    env:
-      PROFILE: /dev/null
+      - "/tmp/nvm.sh"
+
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/nvm.sh"

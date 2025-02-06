@@ -1,13 +1,17 @@
-depends:
-  - dev.aptitude
-
 actions:
-  - action: package.install
-    list:
-     - "curl"
+  - action: file.download
+    from: "https://starship.rs/install.sh"
+    to: "/tmp/starship.sh"
 
   - action: command.run
     command: sh
     args:
-      - "-c"
-      - "curl -fsSL https://starship.rs/install.sh | sh -s -- --yes"
+      - "/tmp/starship.sh"
+      - "--yes"
+
+  # Teardown
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "/tmp/starship.sh"

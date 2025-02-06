@@ -1,7 +1,7 @@
 depends:
-  - dev.aptitude
-  - dev.git
-  - dev.homeshick
+  - aptitude
+  - git
+  - homeshick
 
 actions:
   - action: package.install

@@ -1,8 +1,13 @@
 depends:
-  - dev.homeshick
-  - dev.ps1
+  - homeshick
 
 actions:
+  - action: command.run
+    command: rm
+    args:
+      - "-rf"
+      - "{{ user.home_dir }}/.homesick/repos/dotfiles"
+
   - action: file.link
     from: "{{ env.PWD }}"
     to: "{{ user.home_dir }}/.homesick/repos/dotfiles"
@@ -10,12 +15,12 @@ actions:
   - action: command.run
     command: "{{ user.home_dir }}/.homesick/repos/homeshick/bin/homeshick"
     args:
-     - "link"
-     - "dotfiles"
-     - "--force"
+      - "link"
+      - "dotfiles"
+      - "--force"
 
   - action: command.run
     command: mkdir
     args:
-     - "-p"
-     - "{{ user.home_dir }}/.ssh/"
+      - "-p"
+      - "{{ user.home_dir }}/.ssh/"
