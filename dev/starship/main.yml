@@ -1,0 +1,13 @@
+depends:
+  - dev.aptitude
+
+actions:
+  - action: package.install
+    list:
+     - "curl"
+
+  - action: command.run
+    command: sh
+    args:
+      - "-c"
+      - "curl -fsSL https://starship.rs/install.sh | sh -s -- --yes"

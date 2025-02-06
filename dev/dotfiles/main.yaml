@@ -4,7 +4,7 @@ depends:
 
 actions:
   - action: file.link
-    from: "{{ user.home_dir }}/.dotfiles"
+    from: "{{ env.PWD }}"
     to: "{{ user.home_dir }}/.homesick/repos/dotfiles"
 
   - action: command.run

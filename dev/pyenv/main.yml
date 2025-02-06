@@ -1,7 +1,6 @@
 depends:
   - dev.aptitude
   - dev.bash
-  - dev.dotfiles
 
 actions:
   - action: package.install
@@ -12,6 +11,4 @@ actions:
     command: sh
     args:
       - "-c"
-      - "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash"
-    env:
-      PROFILE: /dev/null
+      - "curl -fsSL https://pyenv.run | bash"
