@@ -11,4 +11,4 @@ set -o pipefail
 __dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 curl -fsSL https://get.comtrya.dev | sudo bash
-comtrya apply
+comtrya -vvv apply
