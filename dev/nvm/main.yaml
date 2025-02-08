@@ -7,6 +7,8 @@ actions:
     command: bash
     args:
       - "/tmp/nvm.sh"
+    env:
+      NVM_DIR: "{{ user.home_dir }}/.nvm"
 
   # Teardown
   - action: command.run
