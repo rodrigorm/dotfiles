@@ -13,7 +13,7 @@ actions:
       - "python3-venv"
       - "fish-common"
       - "ripgrep"
-      - "fd-find"
+      - "fzf"
 
   - action: command.run
     command: rm
