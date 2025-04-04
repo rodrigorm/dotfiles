@@ -14,8 +14,14 @@ esac
 
 # Source all the 'bashrc.d' files
 for BASHRC_D_FILE in "${THIS_DIR}"/*.sh; do
-    # shellcheck source=/dev/null
-    source "${BASHRC_D_FILE}"
+    if [[ $__bashrc_bench ]]; then
+        TIMEFORMAT="${BASHRC_D_FILE}: %R"
+        time source "${BASHRC_D_FILE}"
+        unset TIMEFORMAT
+    else
+        # shellcheck source=/dev/null
+        source "${BASHRC_D_FILE}"
+    fi
 done
 
 # Colorful logging helper: INFO (green) level
