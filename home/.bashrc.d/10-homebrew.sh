@@ -2,7 +2,7 @@
 
 # Setup shell for Homebrew
 if command -v brew >/dev/null 2>&1; then
-    eval $(brew shellenv)
+    eval "$(brew shellenv)"
 
     if [ -f "$HOMEBREW_PREFIX/etc/profile.d/bash_completion.sh" ]; then
         # shellcheck source=/dev/null

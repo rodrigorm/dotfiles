@@ -1,6 +1,8 @@
 SHELL := /bin/bash
 
-.PHONY : image test prune
+SHELLCHECK_FILES := $(shell find home/.bashrc.d -type f -name "*.sh")
+
+.PHONY : image test prune shellcheck
 
 image:
 	docker build -t dotfiles:latest .
@@ -10,3 +12,9 @@ test: image
 
 prune:
 	docker system prune -f
+
+benchmark:
+	__bashrc_bench=1 bash -i
+
+shellcheck:
+	shellcheck $(SHELLCHECK_FILES) bootstrap.sh
