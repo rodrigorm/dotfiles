@@ -3,9 +3,9 @@
 # enable color support of ls and also add handy aliases
 if [ -x /usr/bin/dircolors ]; then
     if test -r "$HOME/.dircolors"; then
-      eval "$(dircolors -b "$HOME/.dircolors")"
+        eval "$(dircolors -b "$HOME/.dircolors")"
     else
-      eval "$(dircolors -b)"
+        eval "$(dircolors -b)"
     fi
 
     alias ls='ls --color=auto'
