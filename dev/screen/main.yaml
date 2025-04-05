@@ -6,9 +6,13 @@ actions:
     list:
       - "libncurses5-dev"
 
-  - action: file.download
-    from: "https://ftp.gnu.org/gnu/screen/screen-5.0.0.tar.gz"
-    to: "/tmp/screen-5.0.0.tar.gz"
+  - action: command.run
+    command: curl
+    args:
+      - "-fsSL"
+      - "https://ftp.gnu.org/gnu/screen/screen-5.0.0.tar.gz"
+      - "--output"
+      - "/tmp/screen-5.0.0.tar.gz"
 
   - action: file.unarchive
     from: "/tmp/screen-5.0.0.tar.gz"
