@@ -2,11 +2,20 @@ depends:
   - aptitude
 
 actions:
+  # macos
   - action: package.install
+    where: os.name == "macos"
+    list:
+      - "screen"
+
+  # linux
+  - action: package.install
+    where: os.name == "linux"
     list:
       - "libncurses5-dev"
 
   - action: command.run
+    where: os.name == "linux"
     command: curl
     args:
       - "-fsSL"
@@ -15,10 +24,12 @@ actions:
       - "/tmp/screen-5.0.0.tar.gz"
 
   - action: file.unarchive
+    where: os.name == "linux"
     from: "/tmp/screen-5.0.0.tar.gz"
     to: "/tmp"
 
   - action: command.run
+    where: os.name == "linux"
     dir: /tmp/screen-5.0.0
     command: "sh"
     args:
@@ -32,10 +43,12 @@ actions:
                     --with-pty-group=5
 
   - action: command.run
+    where: os.name == "linux"
     dir: /tmp/screen-5.0.0
     command: make
 
   - action: command.run
+    where: os.name == "linux"
     dir: /tmp/screen-5.0.0
     privileged: true
     command: make
@@ -43,6 +56,7 @@ actions:
       - "install"
 
   - action: command.run
+    where: os.name == "linux"
     dir: /tmp/screen-5.0.0
     privileged: true
     command: install
@@ -54,6 +68,7 @@ actions:
 
   # Teardown
   - action: command.run
+    where: os.name == "linux"
     command: rm
     args:
       - "-rf"

@@ -1,13 +1,23 @@
 actions:
+  # macos
+  - action: package.install
+    where: os.name == "macos"
+    list:
+      - "neovim"
+
+  # linux
   - action: file.download
+    where: os.name == "linux"
     from: "https://github.com/neovim/neovim/releases/download/{{ variables.neovim_version }}/nvim-{{ os.name }}-x86_64.tar.gz"
     to: "/tmp/nvim.tar.gz"
 
   - action: file.unarchive
+    where: os.name == "linux"
     from: "/tmp/nvim.tar.gz"
     to: "/tmp"
 
   - action: command.run
+    where: os.name == "linux"
     privileged: true
     command: rm
     args:
@@ -15,6 +25,7 @@ actions:
       - "/opt/nvim"
 
   - action: command.run
+    where: os.name == "linux"
     privileged: true
     command: cp
     args:
@@ -24,6 +35,7 @@ actions:
 
   # Teardown
   - action: command.run
+    where: os.name == "linux"
     command: rm
     args:
       - "-rf"

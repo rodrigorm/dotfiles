@@ -14,6 +14,12 @@ actions:
       - "fish-common"
       - "ripgrep"
       - "fzf"
+    variants:
+      - where: os.name == "macos"
+        list:
+          - "unzip"
+          - "ripgrep"
+          - "fzf"
 
   - action: command.run
     command: rm

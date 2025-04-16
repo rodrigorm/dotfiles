@@ -1,10 +1,12 @@
 actions:
   - action: command.run
+    where: os.name == "linux"
     privileged: true
     command: apt
     args:
      - "update"
 
   - action: package.install
+    where: os.name == "linux"
     list:
      - "software-properties-common"

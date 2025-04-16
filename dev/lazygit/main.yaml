@@ -2,15 +2,25 @@ depends:
   - git
 
 actions:
+  # macos
+  - action: package.install
+    where: os.name == "macos"
+    list:
+      - "lazygit"
+
+  # linux
   - action: file.download
+    where: os.name == "linux"
     from: "https://github.com/jesseduffield/lazygit/releases/download/v0.44.1/lazygit_0.44.1_Linux_x86_64.tar.gz"
     to: "/tmp/lazygit_0.44.1_Linux_x86_64.tar.gz"
 
   - action: file.unarchive
+    where: os.name == "linux"
     from: "/tmp/lazygit_0.44.1_Linux_x86_64.tar.gz"
     to: "/tmp"
 
   - action: command.run
+    where: os.name == "linux"
     privileged: true
     dir: "/tmp"
     command: install
@@ -20,6 +30,7 @@ actions:
 
   # Teardown
   - action: command.run
+    where: os.name == "linux"
     command: rm
     args:
       - "-rf"

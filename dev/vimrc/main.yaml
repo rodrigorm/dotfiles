@@ -6,7 +6,11 @@ depends:
 actions:
   - action: package.install
     list:
-     - "exuberant-ctags"
+      - "exuberant-ctags"
+    variants:
+      - where: os.name == "macos"
+        list:
+          - "ctags"
 
   - action: command.run
     command: "sh"
