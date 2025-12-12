@@ -156,7 +156,7 @@ make prune
 ### Testing
 - All changes must pass `make test` (Docker validation)
 - All shell scripts must pass `make shellcheck`
-- Test in Ubuntu 22.04 container environment
+- Test in Ubuntu 24.04 container environment
 
 ### Error Handling
 - Use proper exit codes in shell scripts
