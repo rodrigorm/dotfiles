@@ -8,10 +8,10 @@ image:
 	docker build -t dotfiles:latest .
 
 test: image
-	docker run --rm -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && comtrya apply && ./test.sh"
+	docker run --rm -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && ./bootstrap.sh && ./test.sh"
 
 shell: image
-	docker run --rm -it -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && comtrya apply && bash -l"
+	docker run --rm -it -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && ./bootstrap.sh && bash -l"
 
 prune:
 	docker system prune -f

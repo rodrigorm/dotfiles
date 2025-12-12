@@ -10,15 +10,13 @@ In Unix, configuration files are king. This is my castle.
   ```
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
   ```
-- [Comtrya](https://comtrya.dev/)
 
 ### Install dotfiles
 
 ```bash
 $ git clone https://github.com/rodrigorm/dotfiles.git $HOME/.dotfiles
 $ cd $HOME/.dotfiles
-$ comtrya apply
-$ vim +BundleInstall +qall
+$ ./bootstrap.sh
 ```
 
 OS X 10.7 Lion: Double click to install or import Solarized Dark.terminal into Terminal.app preferences.

@@ -1,9 +1,0 @@
-depends:
-  - homebrew
-
-actions:
-  - action: command.run
-    command: brew
-    args:
-      - "install"
-      - "git"
