@@ -16,6 +16,7 @@ esac
 for BASHRC_D_FILE in "${THIS_DIR}"/*.sh; do
     if [[ $__bashrc_bench ]]; then
         TIMEFORMAT="${BASHRC_D_FILE}: %R"
+        # shellcheck source=/dev/null
         time source "${BASHRC_D_FILE}"
         unset TIMEFORMAT
     else
