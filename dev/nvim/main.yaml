@@ -3,7 +3,6 @@ depends:
   - git
   - neovim
   - lazygit
-  - nodejs
 
 actions:
   - action: package.install

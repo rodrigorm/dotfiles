@@ -1,9 +1,0 @@
-depends:
-  - nvm
-
-actions:
-  - action: command.run
-    command: bash
-    args:
-      - "-c"
-      - ". \"{{ user.home_dir }}/.nvm/nvm.sh\" && nvm install --default 20"

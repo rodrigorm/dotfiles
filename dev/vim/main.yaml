@@ -1,7 +1,0 @@
-depends:
-  - aptitude
-
-actions:
-  - action: package.install
-    list:
-     - "vim"
