@@ -1,23 +1,18 @@
 depends:
-  - aptitude
   - git
-  - neovim
+  - homebrew
   - lazygit
+  - neovim
 
 actions:
-  - action: package.install
-    list:
+  - action: command.run
+    command: brew
+    args:
+      - "install"
       - "fzf"
       - "luarocks"
       - "ripgrep"
       - "unzip"
-    variants:
-      - where: os.name == "macos"
-        list:
-          - "fzf"
-          - "luarocks"
-          - "ripgrep"
-          - "unzip"
 
   - action: command.run
     command: rm

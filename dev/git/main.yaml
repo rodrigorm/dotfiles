@@ -1,6 +1,9 @@
 depends:
-  - aptitude
+  - homebrew
 
 actions:
-  - action: package.install
-    name: git
+  - action: command.run
+    command: brew
+    args:
+      - "install"
+      - "git"

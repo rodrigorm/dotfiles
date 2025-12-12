@@ -15,17 +15,13 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN cargo install comtrya --root /usr/local
 
-RUN curl -L https://github.com/neovim/neovim/releases/download/v0.10.4/nvim-linux-arm64.tar.gz -o /tmp/nvim.tar.gz && \
-    tar -xzf /tmp/nvim.tar.gz -C /tmp && \
-    cp /tmp/nvim-linux-arm64/bin/nvim /usr/local/bin/ && \
-    chmod +x /usr/local/bin/nvim && \
-    rm -rf /tmp/nvim*
-
-RUN useradd ubuntu --no-create-home --shell /bin/bash || true && echo "ubuntu:ubuntu" | chpasswd && usermod -aG sudo ubuntu || true
-
+RUN echo "ubuntu:ubuntu" | chpasswd && adduser ubuntu sudo
 RUN echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
 
 USER ubuntu
+
+RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 
 WORKDIR /home/ubuntu/
 

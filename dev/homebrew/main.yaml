@@ -1,16 +1,11 @@
-depends:
-  - homebrew
-
 actions:
   - action: command.run
     command: brew
     args:
-      - "unlink"
-      - "util-linux"
+      - "update"
 
   - action: command.run
     command: brew
     args:
       - "install"
-      - "bash"
-      - "bash-completion"
+      - "gcc"

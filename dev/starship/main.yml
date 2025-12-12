@@ -1,18 +1,9 @@
+depends:
+  - homebrew
+
 actions:
-  - action: file.download
-    from: "https://starship.rs/install.sh"
-    to: "/tmp/starship.sh"
-
   - action: command.run
-    command: sh
+    command: brew
     args:
-      - "/tmp/starship.sh"
-      - "--yes"
-    privileged: true
-
-  # Teardown
-  - action: command.run
-    command: rm
-    args:
-      - "-rf"
-      - "/tmp/starship.sh"
+      - "install"
+      - "starship"

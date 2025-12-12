@@ -1,43 +1,9 @@
+depends:
+  - homebrew
+
 actions:
-  # macos
-  - action: package.install
-    where: os.name == "macos"
-    list:
+  - action: command.run
+    command: brew
+    args:
+      - "install"
       - "neovim"
-
-  # linux
-  - action: file.download
-    where: os.name == "linux"
-    from: "https://github.com/neovim/neovim/releases/download/{{ variables.neovim_version }}/nvim-linux-arm64.tar.gz"
-    to: "/tmp/nvim.tar.gz"
-
-  - action: file.unarchive
-    where: os.name == "linux"
-    from: "/tmp/nvim.tar.gz"
-    to: "/tmp"
-
-  - action: command.run
-    where: os.name == "linux"
-    privileged: true
-    command: rm
-    args:
-      - "-rf"
-      - "/opt/nvim"
-
-  - action: command.run
-    where: os.name == "linux"
-    privileged: true
-    command: cp
-    args:
-      - "-R"
-      - "/tmp/nvim-linux-arm64"
-      - "/opt/nvim"
-
-  # Teardown
-  - action: command.run
-    where: os.name == "linux"
-    command: rm
-    args:
-      - "-rf"
-      - "/tmp/nvim.tar.gz"
-      - "/tmp/nvim-linux-arm64"
