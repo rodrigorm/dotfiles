@@ -8,18 +8,17 @@ depends:
 actions:
   - action: package.install
     list:
-      - "build-essential"
-      - "unzip"
-      - "python3-venv"
-      - "fish-common"
-      - "ripgrep"
       - "fzf"
+      - "luarocks"
+      - "ripgrep"
+      - "unzip"
     variants:
       - where: os.name == "macos"
         list:
-          - "unzip"
-          - "ripgrep"
           - "fzf"
+          - "luarocks"
+          - "ripgrep"
+          - "unzip"
 
   - action: command.run
     command: rm

@@ -8,6 +8,7 @@ actions:
     args:
       - "/tmp/starship.sh"
       - "--yes"
+    privileged: true
 
   # Teardown
   - action: command.run

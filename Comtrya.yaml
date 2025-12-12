@@ -2,4 +2,4 @@ manifest_paths:
   - dev
 
 variables:
-  neovim_version: "v0.10.4"
+  neovim_version: "v0.11.2"

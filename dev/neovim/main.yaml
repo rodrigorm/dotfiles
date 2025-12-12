@@ -8,7 +8,7 @@ actions:
   # linux
   - action: file.download
     where: os.name == "linux"
-    from: "https://github.com/neovim/neovim/releases/download/{{ variables.neovim_version }}/nvim-{{ os.name }}-x86_64.tar.gz"
+    from: "https://github.com/neovim/neovim/releases/download/{{ variables.neovim_version }}/nvim-linux-arm64.tar.gz"
     to: "/tmp/nvim.tar.gz"
 
   - action: file.unarchive
@@ -30,7 +30,7 @@ actions:
     command: cp
     args:
       - "-R"
-      - "/tmp/nvim-{{ os.name }}-x86_64"
+      - "/tmp/nvim-linux-arm64"
       - "/opt/nvim"
 
   # Teardown
@@ -40,4 +40,4 @@ actions:
     args:
       - "-rf"
       - "/tmp/nvim.tar.gz"
-      - "/tmp/nvim-{{ os.name }}-x86_64"
+      - "/tmp/nvim-linux-arm64"

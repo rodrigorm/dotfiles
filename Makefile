@@ -2,13 +2,16 @@ SHELL := /bin/bash
 
 SHELLCHECK_FILES := $(shell find home/.bashrc.d -type f -name "*.sh")
 
-.PHONY : image test prune shellcheck
+.PHONY : image test shell prune benchmark shellcheck
 
 image:
 	docker build -t dotfiles:latest .
 
 test: image
-	docker run --rm -it dotfiles:latest sh -c "cd ~/.dotfiles && comtrya -vvv apply && cd ~ && bash"
+	docker run --rm -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && comtrya apply && ./test.sh"
+
+shell: image
+	docker run --rm -it -v $(PWD):/home/ubuntu/.dotfiles dotfiles:latest sh -c "cd ~/.dotfiles && comtrya apply && bash -l"
 
 prune:
 	docker system prune -f
