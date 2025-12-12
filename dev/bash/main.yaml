@@ -3,6 +3,7 @@ depends:
 
 actions:
   - action: command.run
+    where: os.name == "linux"
     command: brew
     args:
       - "unlink"
