@@ -32,7 +32,7 @@ if [[ "$(uname)" == "Linux" ]]; then
 fi
 
 # Install remaining packages (including bash-completion which conflicts with util-linux)
-brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip node@22
+brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip node@22 opencode
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
