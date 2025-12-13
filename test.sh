@@ -59,7 +59,7 @@ test_package_installations() {
 
     # Test bash-completion (Linux only)
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        run_test "bash-completion available" "true"  # Temporarily skip this test
+        run_test "bash-completion available" "true" # Temporarily skip this test
     fi
 
     # Test neovim
@@ -125,7 +125,7 @@ test_cross_platform() {
 
     # Test platform-specific paths
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        run_test "Linux-specific setup" "true"  # PATH setup is tested elsewhere
+        run_test "Linux-specific setup" "true" # PATH setup is tested elsewhere
     elif [[ "$OSTYPE" == "darwin"* ]]; then
         run_test "macOS-specific setup" "bash -c 'source ~/.bashrc && echo \$PATH | grep -q /usr/local'"
     fi
@@ -137,7 +137,7 @@ main() {
     log_info "Running tests on $(uname -a)"
 
     # Change to dotfiles directory
-    cd ~/.dotfiles
+    cd /workspaces/dotfiles
 
     # Run all test suites
     test_package_installations
