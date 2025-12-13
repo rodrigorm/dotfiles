@@ -10,8 +10,5 @@ RUN apt update && apt install -y \
 
 USER vscode
 
-RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
-
 ENV SHELL=/bin/bash TERM=xterm-256color
 SHELL [ "bash" ]

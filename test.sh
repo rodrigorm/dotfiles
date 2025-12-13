@@ -62,8 +62,8 @@ test_package_installations() {
         run_test "bash-completion available" "true" # Temporarily skip this test
     fi
 
-    # Test neovim
-    run_test "neovim installation" "command -v nvim && nvim --version"
+    # Test neovim (needs Homebrew PATH)
+    run_test "neovim installation" "bash -c 'source ~/.bashrc && command -v nvim && nvim --version'"
 }
 
 # Test dotfile symlinks
@@ -112,8 +112,8 @@ test_tool_functionality() {
     run_test "git config user.name" "git config --global user.name | grep -q ."
     run_test "git config user.email" "git config --global user.email | grep -q ."
 
-    # Test nvim can start (briefly)
-    run_test "neovim starts" "nvim --version | head -1 | grep -q 'NVIM'"
+    # Test nvim can start (briefly, needs Homebrew PATH)
+    run_test "neovim starts" "bash -c 'source ~/.bashrc && nvim --version | head -1 | grep -q NVIM'"
 }
 
 # Test cross-platform compatibility

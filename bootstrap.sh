@@ -11,6 +11,13 @@ set -o pipefail
 __dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Install/upgrade packages via Homebrew
+NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+if command -v /opt/homebrew/bin/brew >/dev/null 2>&1; then
+    export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
+elif command -v /home/linuxbrew/.linuxbrew/bin/brew >/dev/null 2>&1; then
+    export PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
+fi
+eval "$(brew shellenv)"
 brew update
 
 # Install packages that may pull in util-linux first
