@@ -10,8 +10,11 @@ set -o pipefail
 # Set magic variables for current file & dir
 __dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Install/upgrade packages via Homebrew
-NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+# Install Homebrew if not already installed
+if ! command -v brew >/dev/null 2>&1; then
+    NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+fi
+
 if command -v /opt/homebrew/bin/brew >/dev/null 2>&1; then
     export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
 elif command -v /home/linuxbrew/.linuxbrew/bin/brew >/dev/null 2>&1; then
@@ -29,7 +32,7 @@ if [[ "$(uname)" == "Linux" ]]; then
 fi
 
 # Install remaining packages (including bash-completion which conflicts with util-linux)
-brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip
+brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip node@22
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
