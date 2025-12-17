@@ -6,6 +6,7 @@ RUN apt update && apt install -y \
   curl \
   build-essential \
   sudo \
+  shellcheck \
   && rm -rf /var/lib/apt/lists/*
 
 USER vscode

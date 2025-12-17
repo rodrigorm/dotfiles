@@ -34,6 +34,9 @@ fi
 # Tap additional repositories
 brew tap steveyegge/beads
 
+# Install Bun via Homebrew
+brew install oven-sh/bun/bun
+
 # Install remaining packages (including bash-completion which conflicts with util-linux)
 brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip node@22 opencode bd
 
