@@ -6,7 +6,6 @@
 
 This is a **personal dotfiles repository** for Unix configuration files, using:
 
-- **Comtrya** - Declarative provisioning tool for installing/configuring tools
 - **Homeshick** - Dotfile management via git + symlinks
 - **Homebrew** - Package management (macOS/Linux)
 
@@ -18,7 +17,6 @@ This is a **personal dotfiles repository** for Unix configuration files, using:
 | `home/.bashrc.d/` | Modular bash config (numbered scripts: `00-reset.sh`, `10-*.sh`, etc.) |
 | `home/.config/` | XDG config files (starship, etc.) |
 | `home/bin/` | Custom scripts and utilities |
-| `dev/` | Comtrya manifests (`dev/{tool}/main.yaml`) |
 
 **Installation:** See `README.md` for setup instructions.
 
@@ -39,11 +37,6 @@ make prune      # Clean up Docker resources
 - Follow modular approach with numbered scripts in `.bashrc.d/`
 - Use 4-space indentation
 - Cross-platform detection required (see `.bashrc.d/.init.sh`)
-
-**YAML Configuration (Comtrya manifests):**
-- Use `main.yaml` for tool manifests in `dev/` directories
-- Follow existing naming conventions for package managers
-- Include cross-platform package installation logic
 
 **Testing:**
 - All changes must pass `make test` (Docker validation)
