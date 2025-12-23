@@ -38,7 +38,7 @@ brew tap steveyegge/beads
 brew install oven-sh/bun/bun
 
 # Install remaining packages (including bash-completion which conflicts with util-linux)
-brew install bash bash-completion neovim lazygit screen starship fzf luarocks ripgrep unzip node@22 opencode bd libnotify
+brew install bash bash-completion neovim lazygit screen tmux starship fzf luarocks ripgrep unzip node@22 opencode bd libnotify
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
