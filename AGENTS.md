@@ -1,6 +1,6 @@
 # Instructions for AI Agents
 
-> For detailed bd (beads) documentation, run `bd onboard` or `bd prime`.
+> Run `tk help` when you need to use the ticket system.
 
 ## Project Overview
 
@@ -48,34 +48,32 @@ make prune      # Clean up Docker resources
 - Validate dependencies before installation
 - Handle missing packages gracefully across platforms
 
-## Issue Tracking with bd (beads)
+## Issue Tracking with tk
 
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
+**IMPORTANT**: This project uses **tk (ticket)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
 
-**Why bd?**
+**Why tk?**
+- Git-native: Tickets are markdown files in `.tickets/`, version controlled with git
 - Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Auto-syncs to JSONL for version control
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
+- Agent-optimized: Easily searchable markdown files, partial ID matching
+- Zero setup: Single bash script, no database or background daemon
 
 **Quick Start:**
 
 ```bash
 # Check for ready work
-bd ready --json
+tk ready
 
-# Create new issues
-bd create "Issue title" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" -p 1 --deps discovered-from:df-123 --json
+# Create new tickets
+tk create "Issue title" -t bug|feature|task|epic|chore
+tk create "Issue title" -p 1 --parent df-123
 
 # Claim and update
-bd update df-42 --status in_progress --json
-
-# Complete work
-bd close df-42 --reason "Completed" --json
+tk start df-42
+tk close df-42
 ```
 
-**Issue Types:**
+**Ticket Types:**
 - `bug` - Something broken
 - `feature` - New functionality
 - `task` - Work item (tests, docs, refactoring)
@@ -90,18 +88,17 @@ bd close df-42 --reason "Completed" --json
 - `4` - Backlog (future ideas)
 
 **Workflow for AI Agents:**
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task**: `bd update <id> --status in_progress`
+1. **Check ready work**: `tk ready` shows unblocked issues
+2. **Claim your task**: `tk start <id>`
 3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - `bd create "Found bug" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
-6. **Commit together**: Always commit `.beads/issues.jsonl` with code changes
+4. **Discover new work?** Create linked ticket:
+   - `tk create "Found bug" -p 1 --parent <parent-id>`
+5. **Complete**: `tk close <id>`
+6. **Commit together**: Always commit `.tickets/` with code changes
 
 **Learn More:**
-- Run `bd onboard` for comprehensive setup and workflow documentation
-- Run `bd prime` for a compact workflow reference
-- Run `bd <command> --help` for command-specific help
+- Run `tk help` for command reference
+- Run `tk <command> --help` for command-specific help
 
 **Managing AI-Generated Planning Documents:**
 
@@ -113,10 +110,9 @@ AI assistants often create planning docs (PLAN.md, IMPLEMENTATION.md, etc.).
 - Only access `history/` when explicitly asked to review past planning
 
 **Important Rules:**
-- ✅ Use bd for ALL task tracking
-- ✅ Always use `--json` flag for programmatic use
-- ✅ Link discovered work with `discovered-from` dependencies
-- ✅ Check `bd ready` before asking "what should I work on?"
+- ✅ Use tk for ALL task tracking
+- ✅ Link discovered work with `--parent` dependencies
+- ✅ Check `tk ready` before asking "what should I work on?"
 - ✅ Store AI planning docs in `history/` directory
 - ❌ Do NOT create markdown TODO lists
 - ❌ Do NOT use external issue trackers
@@ -129,7 +125,7 @@ AI assistants often create planning docs (PLAN.md, IMPLEMENTATION.md, etc.).
 
 **MANDATORY WORKFLOW - COMPLETE ALL STEPS:**
 
-1. **File beads issues for any remaining work** that needs follow-up
+1. **File tk issues for any remaining work** that needs follow-up
 
 2. **Run quality gates** (only if code changes were made):
    ```bash
@@ -138,17 +134,11 @@ AI assistants often create planning docs (PLAN.md, IMPLEMENTATION.md, etc.).
    ```
    File P0 issues if broken.
 
-3. **Update beads issues** - close finished work, update status
+3. **Update tk issues** - close finished work, update status
 
 4. **PUSH TO REMOTE - NON-NEGOTIABLE** - Execute ALL commands:
    ```bash
    git pull --rebase
-
-   # If conflicts in .beads/issues.jsonl:
-   #   git checkout --theirs .beads/issues.jsonl
-   #   bd import -i .beads/issues.jsonl
-
-   bd sync
    git push
    git status  # MUST show "up to date with origin/main"
    ```
