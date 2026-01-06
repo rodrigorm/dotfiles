@@ -63,3 +63,15 @@ if [[ ! -d "$HOME/.config/nvim" ]]; then
 else
     git -C "$HOME/.config/nvim" pull origin main
 fi
+
+# Clone/update OpenCode superpowers plugin
+if [[ ! -d "$HOME/.config/opencode/superpowers" ]]; then
+    mkdir -p "$HOME/.config/opencode"
+    git clone https://github.com/obra/superpowers.git "$HOME/.config/opencode/superpowers"
+else
+    git -C "$HOME/.config/opencode/superpowers" pull
+fi
+
+# Register superpowers plugin with OpenCode
+mkdir -p "$HOME/.config/opencode/plugin"
+ln -sf "$HOME/.config/opencode/superpowers/.opencode/plugin/superpowers.js" "$HOME/.config/opencode/plugin/superpowers.js"
