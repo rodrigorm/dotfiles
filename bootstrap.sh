@@ -73,9 +73,9 @@ else
 fi
 
 # Skills.sh
-npx skills add obra/superpowers --agent opencode --global -y
-npx skills add sickn33/antigravity-awesome-skills --skill playwright-skill --global -y
-npx skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
-npx skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
-npx skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
-npx skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
+npx -y skills add obra/superpowers --agent opencode --global -y
+npx -y skills add sickn33/antigravity-awesome-skills --skill playwright-skill --global -y
+npx -y skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
+npx -y skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
+npx -y skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
+npx -y skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
