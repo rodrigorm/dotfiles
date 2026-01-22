@@ -6,15 +6,13 @@
     "opencode-openai-codex-auth@4.1.1",
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
+  "model": "opencode/minimax-m2.1-free",
   "agent": {
-    "build": {
-      "model": "opencode/glm-4.7-free"
-    },
     "plan": {
-      "model": "opencode/minimax-m2.1-free"
+      "model": "github-copilot/claude-opus-4.5"
     },
     "general": {
-      "model": "opencode/big-pickle"
+      "model": "opencode/glm-4.7-free"
     },
     "explore": {
       "model": "opencode/grok-code"
