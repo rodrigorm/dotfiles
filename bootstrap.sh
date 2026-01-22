@@ -72,6 +72,16 @@ else
     git -C "$HOME/.config/opencode/superpowers" pull
 fi
 
-# Register superpowers plugin with OpenCode
-mkdir -p "$HOME/.config/opencode/plugin"
-ln -sf "$HOME/.config/opencode/superpowers/.opencode/plugin/superpowers.js" "$HOME/.config/opencode/plugin/superpowers.js"
+# Skills.sh
+npx skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
+npx skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
+npx skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
+npx skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
+npx skills add obra/superpowers --skill brainstorming --agent opencode --global -y
+npx skills add obra/superpowers --skill subagent-driven-development --agent opencode --global -y
+npx skills add obra/superpowers --skill systematic-debugging --agent opencode --global -y
+npx skills add obra/superpowers --skill test-driven-development --agent opencode --global -y
+npx skills add obra/superpowers --skill using-superpowers --agent opencode --global -y
+npx skills add obra/superpowers --skill writing-plans --agent opencode --global -y
+npx skills add obra/superpowers --skill writing-skills --agent opencode --global -y
+npx skills add sickn33/antigravity-awesome-skills --skill playwright-skill --global -y
