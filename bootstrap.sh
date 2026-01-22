@@ -64,17 +64,13 @@ else
     git -C "$HOME/.config/nvim" pull origin main
 fi
 
-# Clone/update OpenCode superpowers plugin
-if [[ ! -d "$HOME/.config/opencode/superpowers" ]]; then
-    mkdir -p "$HOME/.config/opencode"
-    git clone https://github.com/obra/superpowers.git "$HOME/.config/opencode/superpowers"
-else
-    git -C "$HOME/.config/opencode/superpowers" pull
-fi
+# Agent Browser
+npm install -g agent-browser
+agent-browser install --with-deps
 
 # Skills.sh
 npx -y skills add obra/superpowers --agent opencode --global -y
-npx -y skills add sickn33/antigravity-awesome-skills --skill playwright-skill --global -y
+npx -y skills add vercel-labs/agent-browser --skill agent-browser --global -y
 npx -y skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
