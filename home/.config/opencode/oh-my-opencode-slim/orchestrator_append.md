@@ -1,0 +1,1 @@
+/Users/rodrigomoyle/.config/opencode/oh-my-opencode-slim/orchestrator_append.md
