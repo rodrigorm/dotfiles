@@ -3,18 +3,18 @@
   "presets": {
     "github-copilot": {
       "orchestrator": {
-        "model": "opencode/minimax-m2.1-free",
+        "model": "github-copilot/gpt-5.2",
         "skills": [
           "*"
         ]
       },
       "oracle": {
-        "model": "github-copilot/gpt-5.2",
+        "model": "github-copilot/gpt-5.2-codex",
         "variant": "high",
         "skills": []
       },
       "librarian": {
-        "model": "opencode/glm-4.7-free",
+        "model": "opencode/big-pickle",
         "variant": "low",
         "skills": []
       },

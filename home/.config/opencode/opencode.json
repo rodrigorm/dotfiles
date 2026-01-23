@@ -7,7 +7,7 @@
     "@franlol/opencode-md-table-formatter@0.0.3",
     "oh-my-opencode-slim"
   ],
-  "model": "opencode/minimax-m2.1-free",
+  "model": "github-copilot/gpt-5.2",
   "agent": {
     "plan": {
       "model": "github-copilot/claude-opus-4.5",
