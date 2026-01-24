@@ -20,5 +20,10 @@
     "explore": {
       "disable": true
     }
+  },
+  "permission": {
+    "background_task": "deny",
+    "background_output": "deny",
+    "background_cancel": "deny"
   }
 }

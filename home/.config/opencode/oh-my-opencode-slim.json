@@ -14,12 +14,12 @@
         "skills": []
       },
       "librarian": {
-        "model": "opencode/big-pickle",
+        "model": "github-copilot/gemini-3-flash-preview",
         "variant": "low",
         "skills": []
       },
       "explorer": {
-        "model": "opencode/grok-code",
+        "model": "github-copilot/gemini-3-flash-preview",
         "variant": "low",
         "skills": []
       },
