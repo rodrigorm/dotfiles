@@ -10,19 +10,15 @@
   "agent": {
     "plan": {
       "model": "github-copilot/claude-opus-4.5",
-      "variant": "high",
-      "mode": "all"
+      "variant": "high"
     },
     "general": {
-      "disable": true
+      "model": "github-copilot/claude-sonnet-4.5",
+      "variant": "high"
     },
     "explore": {
-      "disable": true
+      "model": "github-copilot/gemini-3-flash-preview",
+      "variant": "low"
     }
-  },
-  "permission": {
-    "background_task": "deny",
-    "background_output": "deny",
-    "background_cancel": "deny"
   }
 }
