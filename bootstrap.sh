@@ -71,6 +71,8 @@ agent-browser install --with-deps
 # Skills.sh
 npx -y skills add obra/superpowers --agent opencode --global -y
 npx -y skills add vercel-labs/agent-browser --skill agent-browser --global -y
+npx -y skills add https://github.com/brianlovin/claude-config --skill simplify --agent opencode --global -y
+npx -y skills add https://github.com/alvinunreal/oh-my-opencode-slim --skill cartography --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
