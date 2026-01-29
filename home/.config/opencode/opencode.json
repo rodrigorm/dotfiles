@@ -27,15 +27,40 @@
   "agent": {
     "plan": {
       "model": "github-copilot/claude-opus-4.5",
-      "variant": "high"
+      "variant": "high",
+      "description": "Planning, analysis, and research.",
+      "permission": {
+        "task": {
+          "*": "deny",
+          "explore": "allow"
+        }
+      }
     },
     "general": {
       "model": "github-copilot/claude-sonnet-4.5",
-      "variant": "high"
+      "variant": "high",
+      "description": "Implementation focused; no delegation.",
+      "permission": {
+        "task": {
+          "*": "deny"
+        }
+      },
+      "tools": {
+        "websearch_*": false,
+        "context7_*": false,
+        "grep_app_*": false,
+        "webfetch": false
+      }
     },
     "explore": {
       "model": "github-copilot/gemini-3-flash-preview",
-      "variant": "low"
+      "variant": "low",
+      "description": "Fast, read-only codebase exploration.",
+      "tools": {
+        "websearch_*": false,
+        "context7_*": false,
+        "grep_app_*": false
+      }
     }
   }
 }

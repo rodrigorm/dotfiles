@@ -27,6 +27,24 @@
 - Adding new dependencies
 - Major architectural changes or refactors
 
+## Agent Delegation
+
+Delegate work based on intent:
+
+| Task Type | Delegate To | Notes |
+| --- | --- | --- |
+| Planning and deep analysis | `@plan` | Prefer for research-heavy or ambiguous work |
+| External docs or API research | `@plan` | Keep research consolidated |
+| Codebase recon (find where X lives) | `@explore` | Fast, read-only |
+| Implementation | `@general` | Keep tasks scoped and concrete |
+| Quick lookups | (do it) | Main agent can use research tools |
+
+Rules:
+
+- Treat `@general` as an implementer; it should not delegate.
+- If a subagent needs work outside its scope, it should return to the main thread.
+- Avoid delegation chains; keep handoffs explicit.
+
 ## Verification Checklist
 
 Before claiming done on any task:
