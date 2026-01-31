@@ -28,6 +28,7 @@
     "plan": {
       "model": "github-copilot/claude-opus-4.5",
       "variant": "high",
+      "mode": "all",
       "description": "Planning, analysis, and research.",
       "permission": {
         "task": {

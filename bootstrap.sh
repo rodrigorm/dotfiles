@@ -34,11 +34,27 @@ fi
 # Tap additional repositories
 brew tap wedow/tools
 
+# Install OpenCode from the official Anomaly tap (more up to date than homebrew/core)
+# Fixes Copilot Claude model support regressions seen in older releases.
+brew tap anomalyco/tap
+
 # Install Bun via Homebrew
 brew install oven-sh/bun/bun
 
 # Install remaining packages (including bash-completion which conflicts with util-linux)
-brew install bash bash-completion neovim lazygit screen tmux starship fzf luarocks ripgrep unzip node@22 opencode libnotify ticket
+brew install bash bash-completion neovim lazygit screen tmux starship fzf luarocks ripgrep unzip node@22 libnotify ticket
+
+# Ensure npm/npx are available (node@22 can be keg-only)
+if ! command -v npm >/dev/null 2>&1; then
+    node_prefix="$(brew --prefix node@22 2>/dev/null || true)"
+    if [[ -n "${node_prefix}" ]] && [[ -d "${node_prefix}/bin" ]]; then
+        export PATH="${node_prefix}/bin:${PATH}"
+    fi
+fi
+
+# Ensure OpenCode is installed/upgraded from the Anomaly tap
+brew install anomalyco/tap/opencode
+brew upgrade anomalyco/tap/opencode
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
