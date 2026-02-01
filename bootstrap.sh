@@ -82,7 +82,7 @@ fi
 
 # Agent Browser
 npm install -g agent-browser
-agent-browser install --with-deps
+CI=1 npm_config_yes=true agent-browser install --with-deps
 
 # Skills.sh
 npx -y skills add obra/superpowers --agent opencode --global -y
