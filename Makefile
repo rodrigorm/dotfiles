@@ -8,10 +8,10 @@ image:
 	docker build -t dotfiles:latest .
 
 test: image
-	docker run --rm -v $(PWD):/workspaces/dotfiles dotfiles:latest sh -c "cd /workspaces/dotfiles && ./bootstrap.sh && ./test.sh"
+	docker run --rm -v .:/workspaces/dotfiles dotfiles:latest sh -c "cd /workspaces/dotfiles && ./bootstrap.sh && ./test.sh"
 
 shell: image
-	docker run --rm -it -v $(PWD):/workspaces/dotfiles dotfiles:latest sh -c "cd /workspaces/dotfiles && ./bootstrap.sh && bash -l"
+	docker run --rm -it -v .:/workspaces/dotfiles dotfiles:latest sh -c "cd /workspaces/dotfiles && ./bootstrap.sh && bash -l"
 
 prune:
 	docker system prune -f
