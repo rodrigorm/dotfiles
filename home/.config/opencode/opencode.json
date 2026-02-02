@@ -4,50 +4,23 @@
   "plugin": [
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
-  "model": "github-copilot/gpt-5.2",
+  "model": "opencode/gpt-5-nano",
   "small_model": "opencode/gpt-5-nano",
   "agent": {
+    "build": {
+      "model": "opencode/kimi-k2.5-free"
+    },
     "plan": {
-      "model": "github-copilot/claude-opus-4.5",
-      "description": "Planning, analysis, and research.",
-      "permission": {
-        "task": {
-          "*": "deny",
-          "explore": "allow"
-        }
-      }
+      "model": "github-copilot/gpt-5.2"
     },
     "general": {
-      "model": "github-copilot/claude-sonnet-4.5",
-      "description": "Implementation focused; no delegation.",
-      "permission": {
-        "task": {
-          "*": "deny"
-        }
-      },
-      "tools": {
-        "websearch_*": false,
-        "context7_*": false,
-        "grep_app_*": false,
-        "webfetch": false
-      }
+      "model": "github-copilot/claude-sonnet-4.5"
     },
     "explore": {
-      "model": "github-copilot/gemini-3-flash-preview",
-      "description": "Fast, read-only codebase exploration.",
-      "tools": {
-        "websearch_*": false,
-        "context7_*": false,
-        "grep_app_*": false
-      }
+      "model": "github-copilot/gemini-3-flash-preview"
     }
   },
   "mcp": {
-    "websearch": {
-      "type": "remote",
-      "url": "https://mcp.exa.ai/mcp",
-      "enabled": true
-    },
     "context7": {
       "type": "remote",
       "url": "https://mcp.context7.com/mcp",
