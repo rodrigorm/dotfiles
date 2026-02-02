@@ -14,7 +14,7 @@
       "model": "opencode/gpt-5-nano"
     },
     "general": {
-      "model": "zai/glm-4.7"
+      "model": "zai-coding-plan/glm-4.7"
     }
   },
   "mcp": {
