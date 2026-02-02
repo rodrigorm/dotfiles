@@ -4,20 +4,17 @@
   "plugin": [
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
-  "model": "opencode/gpt-5-nano",
+  "model": "opencode/kimi-k2.5-free",
   "small_model": "opencode/gpt-5-nano",
   "agent": {
-    "build": {
-      "model": "opencode/kimi-k2.5-free"
-    },
     "plan": {
-      "model": "github-copilot/gpt-5.2"
-    },
-    "general": {
-      "model": "github-copilot/claude-sonnet-4.5"
+      "model": "github-copilot/gpt-5.2",
     },
     "explore": {
-      "model": "github-copilot/gemini-3-flash-preview"
+      "model": "opencode/gpt-5-nano"
+    },
+    "general": {
+      "model": "zai/glm-4.7"
     }
   },
   "mcp": {
