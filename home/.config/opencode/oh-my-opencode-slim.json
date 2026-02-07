@@ -12,13 +12,13 @@
         ]
       },
       "oracle": {
-        "model": "openai/gpt-5.2-codex",
+        "model": "github-copilot/gpt-5.2-codex",
         "variant": "high",
         "skills": [],
         "mcps": []
       },
       "designer": {
-        "model": "google/antigravity-gemini-3-flash",
+        "model": "github-copilot/gemini-3-flash-preview",
         "variant": "medium",
         "skills": [
           "agent-browser"
@@ -32,7 +32,7 @@
         "mcps": []
       },
       "librarian": {
-        "model": "google/antigravity-gemini-3-flash",
+        "model": "github-copilot/gemini-3-flash-preview",
         "variant": "low",
         "skills": [],
         "mcps": [
@@ -42,7 +42,7 @@
         ]
       },
       "fixer": {
-        "model": "zai-coding-plan/glm-4.7",
+        "model": "github-copilot/claude-sonnet-4.5",
         "variant": "low",
         "skills": [],
         "mcps": []
