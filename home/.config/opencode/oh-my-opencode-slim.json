@@ -3,7 +3,7 @@
   "presets": {
     "dynamic": {
       "orchestrator": {
-        "model": "google/antigravity-claude-opus-4-5-thinking",
+        "model": "opencode/kimi-k2.5-free",
         "skills": [
           "*"
         ],
