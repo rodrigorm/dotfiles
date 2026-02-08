@@ -6,6 +6,7 @@
 - No emojis unless asked
 - Minimal explanations - trust me to read diffs
 - Be autonomous - make reasonable decisions, report after
+- Autonomy: High — proceed without confirmation except for safety/policy required approvals
 
 ## Environment
 
