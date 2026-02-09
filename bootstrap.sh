@@ -82,11 +82,25 @@ bun install -g agent-browser
 chmod +x "$HOME/.bun/install/global/node_modules/agent-browser/bin/"* 2>/dev/null || true
 
 # Skills.sh
-npx -y skills add obra/superpowers --agent opencode --global -y
-npx -y skills add vercel-labs/agent-browser --skill agent-browser --global -y
-npx -y skills add https://github.com/brianlovin/claude-config --skill simplify --agent opencode --global -y
-npx -y skills add https://github.com/alvinunreal/oh-my-opencode-slim --skill cartography --agent opencode --global -y
+rm -rf "$HOME/.config/opencode/skills/*"
+npx -y skills add alvinunreal/oh-my-opencode-slim --skill cartography --agent opencode --global -y
+npx -y skills add anthropics/skills --skill docx --agent opencode --global -y
+npx -y skills add anthropics/skills --skill pdf --agent opencode --global -y
+npx -y skills add anthropics/skills --skill pptx --agent opencode --global -y
+npx -y skills add anthropics/skills --skill skill-creator --agent opencode --global -y
+npx -y skills add anthropics/skills --skill xlsx --agent opencode --global -y
+npx -y skills add brianlovin/claude-config --skill simplify --agent opencode --global -y
+npx -y skills add obra/superpowers --skill brainstorming --agent opencode --global -y
+npx -y skills add obra/superpowers --skill dispatching-parallel-agents --agent opencode --global -y
+npx -y skills add obra/superpowers --skill receiving-code-review --agent opencode --global -y
+npx -y skills add obra/superpowers --skill requesting-code-review --agent opencode --global -y
+npx -y skills add obra/superpowers --skill systematic-debugging --agent opencode --global -y
+npx -y skills add obra/superpowers --skill test-driven-development --agent opencode --global -y
+npx -y skills add obra/superpowers --skill using-superpowers --agent opencode --global -y
+npx -y skills add obra/superpowers --skill writing-plans --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill agent-md-refactor --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill crafting-effective-readmes --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill skill-judge --agent opencode --global -y
 npx -y skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
+npx -y skills add vercel-labs/agent-browser --skill agent-browser --global -y
+npx -y skills add vercel-labs/skills --skill find-skills --agent opencode --global -y
