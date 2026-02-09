@@ -4,7 +4,7 @@
   "plugin": [
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
-  "model": "github-copilot/gpt-5.2-codex",
+  "model": "github-copilot/gpt-5.2",
   "small_model": "opencode/gpt-5-nano",
   "agent": {
     "plan": {
