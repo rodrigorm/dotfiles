@@ -7,7 +7,7 @@
   "small_model": "opencode/gpt-5-nano",
   "agent": {
     "explore": {
-      "model": "opencode/gpt-5-nano",
+      "model": "opencode/gpt-5.1-codex-mini",
       "variant": "low",
       "temperature": 0.1
     },
