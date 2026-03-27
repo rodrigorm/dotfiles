@@ -8,7 +8,8 @@
   "agent": {
     "explore": {
       "variant": "low",
-      "temperature": 0.1
+      "temperature": 0.1,
+      "model": "opencode/big-pickle"
     },
     "general": {
       "variant": "low",
