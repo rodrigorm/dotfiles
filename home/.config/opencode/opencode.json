@@ -13,7 +13,8 @@
     },
     "general": {
       "variant": "low",
-      "temperature": 0.2
+      "temperature": 0.2,
+      "model": "opencode/big-pickle"
     }
   },
   "mcp": {
