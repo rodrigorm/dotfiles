@@ -34,11 +34,11 @@ Delegate work based on intent:
 
 | Task Type | Delegate To | Notes |
 | --- | --- | --- |
-| Planning and deep analysis | `@plan` | Prefer for research-heavy or ambiguous work |
-| External docs or API research | `@plan` | Keep research consolidated |
-| Codebase recon (find where X lives) | `@explore` | Fast, read-only |
-| Implementation | `@general` | Keep tasks scoped and concrete |
-| Quick lookups | (do it) | Main agent can use research tools |
+| Planning and deep analysis | (do it) | Keep planning, synthesis, and trade-offs in the primary agent |
+| External docs or API research | (do it) | Keep expensive research consolidated in the primary agent |
+| Codebase recon (find where X lives) | `@explore` | Fast, read-only, and preferred by default |
+| Implementation | `@general` | Default path for execution, tests, and git work |
+| Quick lookups | `@explore` | Prefer cost-efficient delegation for read-only discovery |
 
 Rules:
 
