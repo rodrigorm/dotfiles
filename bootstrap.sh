@@ -37,6 +37,7 @@ brew install \
   bash \
   bash-completion \
   fzf \
+  gh \
   lazygit \
   libnotify \
   luarocks \
