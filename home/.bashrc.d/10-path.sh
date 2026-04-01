@@ -27,3 +27,5 @@ fi
 [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
 
 [ -d "/opt/nvim/bin" ] && PATH="/opt/nvim/bin:$PATH"
+
+[ -d "$HOME/.config/opencode/node_modules/@code-yeongyu/comment-checker/bin" ] && PATH="$HOME/.config/opencode/node_modules/@code-yeongyu/comment-checker/bin:$PATH"
