@@ -7,6 +7,16 @@ permission:
     "*": deny
     "general": allow
     "explore": allow
+  read: deny
+  glob: deny
+  grep: deny
+  list: deny
+  bash: deny
+  webfetch: deny
+  websearch: deny
+  codesearch: deny
+  context7_*: deny
+  grep_app_*: deny
 ---
 
 <Role>
