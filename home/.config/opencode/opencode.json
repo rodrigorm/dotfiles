@@ -2,27 +2,10 @@
   "$schema": "https://opencode.ai/config.json",
   "theme": "tokyonight",
   "plugin": [
-    "@franlol/opencode-md-table-formatter@0.0.3",
-    "oh-my-openagent@latest"
+    "@franlol/opencode-md-table-formatter@0.0.3"
   ],
   "small_model": "opencode/gpt-5-nano",
   "agent": {
-    "build": {
-      "mode": "primary",
-      "hidden": false
-    },
-    "plan": {
-      "mode": "primary",
-      "hidden": false
-    },
-    "code": {
-      "mode": "primary",
-      "hidden": false
-    },
-    "review": {
-      "mode": "primary",
-      "hidden": false
-    },
     "explore": {
       "variant": "low",
       "temperature": 0.1,
