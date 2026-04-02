@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "theme": "tokyonight",
   "plugin": [
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
@@ -9,12 +8,12 @@
     "explore": {
       "variant": "low",
       "temperature": 0.1,
-      "model": "opencode/big-pickle"
+      "model": "opencode-go/minimax-m2.7"
     },
     "general": {
       "variant": "low",
       "temperature": 0.2,
-      "model": "opencode/big-pickle"
+      "model": "opencode-go/kimi-k2.5"
     }
   },
   "mcp": {
@@ -28,5 +27,9 @@
       "url": "https://mcp.grep.app",
       "enabled": true
     }
+  },
+  "server": {
+    "port": 4096,
+    "hostname": "0.0.0.0"
   }
 }
