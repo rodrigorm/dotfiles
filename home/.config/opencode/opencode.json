@@ -27,9 +27,5 @@
       "url": "https://mcp.grep.app",
       "enabled": true
     }
-  },
-  "server": {
-    "port": 4096,
-    "hostname": "0.0.0.0"
   }
 }
