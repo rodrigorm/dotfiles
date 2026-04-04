@@ -36,6 +36,8 @@ brew install \
     anomalyco/tap/opencode \
     bash \
     bash-completion \
+    frpc \
+    frps \
     fzf \
     gh \
     lazygit \

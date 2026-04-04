@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FRPS_BIN="${AP_HOST_FRPS_BIN:-$(command -v frps 2>/dev/null || true)}"
+
+BIND_ADDR="${AP_HOST_BIND_ADDR:-0.0.0.0}"
+BIND_PORT="${AP_HOST_BIND_PORT:-${FRP_PORT:-7500}}"
+HTTP_PORT="${AP_HOST_HTTP_PORT:-8080}"
+TOKEN="${AP_HOST_TOKEN:-${AX_TOKEN:-agentpod}}"
+
+usage() {
+  cat <<'EOF'
+Usage: ap-host
+
+Starts a local frps instance in the foreground.
+
+Environment:
+  AP_HOST_FRPS_BIN   frps binary path (default: frps from PATH)
+  AP_HOST_BIND_ADDR  frps bind address (default: 0.0.0.0)
+  FRP_PORT           shared frps/frpc control port override (default: 7500)
+  AP_HOST_BIND_PORT  frps control port (default: FRP_PORT or 7500)
+  AP_HOST_HTTP_PORT  frps HTTP vhost port (default: 8080)
+  AP_HOST_TOKEN      frps auth token (default: agentpod)
+
+The frps process runs in the foreground. Press Ctrl-C to stop.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [[ -z "$FRPS_BIN" || ! -x "$FRPS_BIN" ]]; then
+  printf 'frps not found. Install it first and/or set AP_HOST_FRPS_BIN.\n' >&2
+  exit 1
+fi
+
+CONFIG_FILE="$(mktemp /tmp/ap-host-frps.XXXXXX.toml)"
+trap 'rm -f "$CONFIG_FILE"' EXIT
+
+cat > "$CONFIG_FILE" <<EOF
+bindAddr = "$BIND_ADDR"
+bindPort = $BIND_PORT
+vhostHTTPPort = $HTTP_PORT
+
+[auth]
+method = "token"
+token = "$TOKEN"
+EOF
+
+printf 'Starting frps on %s:%s (HTTP: %s)\n' "$BIND_ADDR" "$BIND_PORT" "$HTTP_PORT"
+
+exec "$FRPS_BIN" -c "$CONFIG_FILE"
