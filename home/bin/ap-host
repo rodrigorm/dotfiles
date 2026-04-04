@@ -38,7 +38,7 @@ if [[ -z "$FRPS_BIN" || ! -x "$FRPS_BIN" ]]; then
   exit 1
 fi
 
-CONFIG_FILE="$(mktemp /tmp/ap-host-frps.XXXXXX.toml)"
+CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/ap-host-frps.XXXXXX")"
 trap 'rm -f "$CONFIG_FILE"' EXIT
 
 cat > "$CONFIG_FILE" <<EOF
@@ -53,4 +53,4 @@ EOF
 
 printf 'Starting frps on %s:%s (HTTP: %s)\n' "$BIND_ADDR" "$BIND_PORT" "$HTTP_PORT"
 
-exec "$FRPS_BIN" -c "$CONFIG_FILE"
+"$FRPS_BIN" -c "$CONFIG_FILE"

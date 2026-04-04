@@ -180,7 +180,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-CONFIG_FILE="$(mktemp /tmp/ax-frpc.XXXXXX.toml)"
+CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/ax-frpc.XXXXXX")"
 
 # Build customDomains array for frpc config
 CUSTOM_DOMAINS=""
