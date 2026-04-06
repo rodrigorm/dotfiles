@@ -6,12 +6,10 @@
   "small_model": "opencode/gpt-5-nano",
   "agent": {
     "explore": {
-      "variant": "low",
       "temperature": 0.1,
-      "model": "opencode-go/minimax-m2.7"
+      "model": "opencode-go/kimi-k2.5"
     },
     "general": {
-      "variant": "low",
       "temperature": 0.2,
       "model": "opencode-go/kimi-k2.5"
     }
