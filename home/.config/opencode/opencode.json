@@ -7,11 +7,11 @@
   "agent": {
     "explore": {
       "temperature": 0.1,
-      "model": "opencode-go/kimi-k2.5"
+      "model": "opencode-go/minimax-m2.5"
     },
     "general": {
       "temperature": 0.2,
-      "model": "opencode-go/kimi-k2.5"
+      "model": "opencode-go/minimax-m2.5"
     }
   },
   "mcp": {
