@@ -101,7 +101,11 @@ shift
 [[ "$PORT" =~ ^[0-9]+$ ]] || { printf 'Port must be numeric: %s\n' "$PORT" >&2; exit 1; }
 
 if [[ -z "$NAME" ]]; then
-  NAME="$(basename "$PWD")"
+  if GIT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    NAME="$(basename "$GIT_ROOT")"
+  else
+    NAME="$(basename "$PWD")"
+  fi
 fi
 
 # Build hostname list from all domains
