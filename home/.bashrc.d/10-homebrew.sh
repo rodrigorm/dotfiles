@@ -11,3 +11,5 @@ if [ -f "$HOMEBREW_PREFIX/etc/profile.d/bash_completion.sh" ]; then
     # shellcheck source=/dev/null
     source "$HOMEBREW_PREFIX/etc/profile.d/bash_completion.sh"
 fi
+
+export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
