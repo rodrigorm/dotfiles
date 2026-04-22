@@ -11,13 +11,27 @@ detect_server_addr() {
   local candidate
 
   for candidate in host.docker.internal localhost; do
-    if command -v nc >/dev/null 2>&1 && nc -z -w 1 "$candidate" "$SERVER_PORT" >/dev/null 2>&1; then
+    if host_resolves "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
   done
 
   printf '%s\n' localhost
+}
+
+host_resolves() {
+  local host="$1"
+
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "$host" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v dscacheutil >/dev/null 2>&1; then
+    dscacheutil -q host -a name "$host" >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
 }
 
 SERVER_ADDR="${AX_FRPS_ADDR:-$(detect_server_addr)}"
