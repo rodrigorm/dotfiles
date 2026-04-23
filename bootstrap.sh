@@ -47,15 +47,11 @@ brew install \
     node \
     oven-sh/bun/bun \
     ripgrep \
-    rtk \
     screen \
     starship \
     tmux \
     unzip \
     vim
-
-# Install RTK global OpenCode hook/instructions
-rtk init -g --opencode --auto-patch
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
