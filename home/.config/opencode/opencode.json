@@ -7,11 +7,11 @@
   "agent": {
     "explore": {
       "temperature": 0.1,
-      "model": "kimi-for-coding/k2p5"
+      "model": "kimi-for-coding/k2p6"
     },
     "general": {
       "temperature": 0.2,
-      "model": "kimi-for-coding/k2p5"
+      "model": "kimi-for-coding/k2p6"
     }
   },
   "mcp": {
