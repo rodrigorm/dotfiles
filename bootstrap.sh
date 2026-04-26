@@ -40,6 +40,7 @@ brew install \
     frps \
     fzf \
     gh \
+    glab \
     lazygit \
     libnotify \
     luarocks \
