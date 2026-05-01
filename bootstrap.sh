@@ -86,7 +86,7 @@ chmod +x "$HOME/.bun/install/global/node_modules/agent-browser/bin/"* 2>/dev/nul
 bun install -g @fission-ai/openspec@latest
 
 # Skills.sh
-rm -rf "$HOME/.config/opencode/skills/*"
+rm -rf "$HOME/.agents/skills/*"
 bunx skills add brianlovin/claude-config --skill simplify --agent opencode --global -y
 bunx skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
 bunx skills add vercel-labs/agent-browser --skill agent-browser --global -y
