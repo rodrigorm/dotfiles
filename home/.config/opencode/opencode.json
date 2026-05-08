@@ -3,7 +3,7 @@
   "plugin": [
     "@franlol/opencode-md-table-formatter@0.0.3"
   ],
-  "small_model": "opencode/gpt-5-nano",
+  "small_model": "opencode/big-pickle",
   "agent": {
     "explore": {
       "temperature": 0.1,
