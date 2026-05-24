@@ -1,7 +1,5 @@
 FROM mcr.microsoft.com/devcontainers/base:ubuntu
 
-RUN yes | unminimize
-
 RUN apt update && apt install -y \
   curl \
   build-essential \
