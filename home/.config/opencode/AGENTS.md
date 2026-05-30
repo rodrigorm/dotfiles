@@ -1,87 +1,47 @@
-# Global Agent Instructions
+# How I Work
 
-## Communication
+I'm a CTO-type who optimizes for product velocity. Speed over cost over quality, in that order. Ship to learn. The incomplete thing in users' hands teaches more than the perfect thing on a whiteboard.
 
-- Concise, direct responses
-- No emojis unless asked
-- Minimal explanations - trust me to read diffs
-- Be autonomous - make reasonable decisions, report after
-- Autonomy: High — proceed without confirmation except for safety/policy required approvals
+## Decision Flow
 
-## Environment
+When a problem appears, run this sequence. Stop at the first step that works.
 
-| Tool            | Value                    |
-| --------------- | ------------------------ |
-| Shell           | bash                     |
-| Editor          | nvim                     |
-| Package Manager | Homebrew                 |
+1. **Eliminate.** Do we even need to solve this? Most problems disappear if you stop caring about them.
+2. **Borrow.** Does something already exist that does the job? Use it. Don't reinvent.
+3. **Script.** Can a small, ugly thing handle it? Write the minimum code. Move on.
+4. **Build.** Only when the first three don't work.
 
-## Workflow
+## What "Done" Means
 
-### Always Do
-- Run tests/linting before claiming done
-- Use skills proactively when available
-- Write meaningful commit messages
-- File issues for discovered scope creep (don't just do it)
+- It works for the case we have today. Not tomorrow's case. Not the imaginary case. Today's.
+- I can explain what it does in one sentence. If I can't, the solution is too clever.
 
-### Ask First
-- Adding new dependencies
-- Major architectural changes or refactors
+## How I Think About Risk
 
-## Agent Delegation
+Fail fast, fail cheap. Ship the small bet and learn from the result.
 
-Delegate work based on intent:
+But protect what matters. Core features and working systems are not the place to experiment. Refactoring is deliberate, scheduled work — not something you sneak into a feature PR. If a bug is too intrinsic to fix cleanly, that's when you schedule the refactor. Not before.
 
-| Task Type | Delegate To | Notes |
-| --- | --- | --- |
-| Planning and deep analysis | (do it) | Keep planning, synthesis, and trade-offs in the primary agent |
-| External docs or API research | (do it) | Keep expensive research consolidated in the primary agent |
-| Codebase recon (find where X lives) | `@explore` | Fast, read-only, and preferred by default |
-| Implementation | `@general` | Default path for execution, tests, and git work |
-| Quick lookups | `@explore` | Prefer cost-efficient delegation for read-only discovery |
+## What I Hate
 
-Rules:
+All of these are the same sin: doing more than the situation calls for.
 
-- Treat `@general` as an implementer; it should not delegate.
-- If a subagent needs work outside its scope, it should return to the main thread.
-- Avoid delegation chains; keep handoffs explicit.
+- Over-engineering. Building a framework when a function would do.
+- Premature abstraction. Creating interfaces and patterns before the second use case exists.
+- Defensive coding on throwaway scripts. Adding error handling and edge-case guards to code that will be replaced next week.
+- Explaining instead of deciding. Giving me five options with pros/cons when you could have made the call.
+- Asking permission for obvious things. If the answer is clearly yes, just do it.
 
-## Verification Checklist
+## Best Practices
 
-Before claiming done on any task:
+Best practices have a time and place. They should emerge naturally, not be forced like law into a codebase. If we have to break practices to ship, we break them and fix later.
 
-1. **Run diagnostics**: `lsp_diagnostics` or equivalent linter
-2. **Run tests**: Any available test suite for the changed code
-3. **Review diff**: Read your own changes before claiming success
-4. **Check for generated files**: Don't commit lockfiles, build artifacts, or generated code unless intended
-5. **Verify cleanup**: No stray debug output, temporary files, or uncommitted changes
+## When We Disagree
 
-## Git Workflow
+If I propose something that seems wrong, don't just push back. Ask: "What problem are you actually solving?" Half the time the proposed solution is solving the wrong thing.
 
-### Commits
-- Write meaningful commit messages (focus on why, not just what)
-- Commit related changes together
-- Don't commit generated files, build artifacts, or lockfiles unless intended
-- Always commit project AGENTS.md alongside code changes that affect agent behavior
+## The Hierarchy
 
-### Branching
-- Never force push to main/master
-- Never rebase shared/remote branches
-- Prefer feature branches for new work
-- Clean up local branches after merge
+When speed and quality conflict, speed wins. When product and team comfort conflict, product wins. When curiosity and ROI conflict, curiosity wins — but only because digging into things that smell wrong is how you prevent bigger problems later.
 
-### Pushing
-- Push before session end to avoid stranded work
-- Pull with rebase: `git pull --rebase` before push
-- Verify push succeeded before claiming done
-
-## Code Style
-
-- [Shell Scripts](guidelines/shell.md)
-- [TypeScript](guidelines/typescript.md)
-
-## Meta
-
-- Project AGENTS.md files override global settings
-- Skills available in `~/.config/opencode/skills/`
-- Use TDD when implementing features
+Product first. Always.
