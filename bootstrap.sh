@@ -88,7 +88,6 @@ bun install -g @fission-ai/openspec@latest
 # Skills.sh
 rm -rf "$HOME/.agents/skills/*"
 bunx skills add brianlovin/claude-config --skill simplify --agent opencode --global -y
-bunx skills add softaworks/agent-toolkit --skill writing-clearly-and-concisely --agent opencode --global -y
 bunx skills add vercel-labs/agent-browser --skill agent-browser --global -y
 bunx skills add vercel-labs/skills --skill find-skills --agent opencode --global -y
 bunx skills add mattpocock/skills --agent opencode --global -y
