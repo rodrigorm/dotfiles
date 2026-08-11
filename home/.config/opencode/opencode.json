@@ -7,15 +7,15 @@
   "agent": {
     "explore": {
       "temperature": 0.1,
-      "model": "openai/gpt-5.4-mini",
-      "variant": "low",
+      "model": "openai/gpt-5.6-luna",
+      "variant": "max",
       "options": {},
       "permission": {}
     },
     "general": {
       "temperature": 0.2,
-      "model": "openai/gpt-5.4-mini",
-      "variant": "low",
+      "model": "openai/gpt-5.6-luna",
+      "variant": "max",
       "options": {},
       "permission": {}
     }
