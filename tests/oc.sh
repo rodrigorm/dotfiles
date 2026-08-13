@@ -51,25 +51,35 @@ if [[ "${1:-}" == "serve" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; th
     exit 0
 fi
 
-if [[ "${1:-}" == "serve" && "$*" == *" --https=4096 off" ]]; then
+if [[ "${1:-}" == "serve" && "${2:-}" != "status" ]]; then
+    port=""
+    for argument in "$@"; do
+        case "$argument" in
+            --https=*) port="${argument#--https=}" ;;
+        esac
+    done
+    [[ -n "$port" ]] || {
+        printf 'tailscale serve invocation missing HTTPS port: %s\n' "$*" >&2
+        exit 1
+    }
+
+    endpoint="${MOCK_DNS_NAME}:${port}"
     printf '%s\n' "$*" >> "$MOCK_TAILSCALE_LOG"
-    "$MOCK_JQ_BIN" --arg endpoint "${MOCK_DNS_NAME}:4096" '
-        .TCP = ((.TCP // {}) | del(.["4096"])) |
+    if [[ "${!#}" == "off" ]]; then
+        "$MOCK_JQ_BIN" --arg port "$port" --arg endpoint "$endpoint" '
+        .TCP = ((.TCP // {}) | del(.[$port])) |
         .Web = ((.Web // {}) | del(.[$endpoint])) |
         .AllowFunnel = ((.AllowFunnel // {}) | del(.[$endpoint]))
-    ' "$MOCK_SERVE_STATUS_FILE" > "${MOCK_SERVE_STATUS_FILE}.tmp"
-    mv "${MOCK_SERVE_STATUS_FILE}.tmp" "$MOCK_SERVE_STATUS_FILE"
-    exit 0
-fi
-
-if [[ "${1:-}" == "serve" && "$*" == *" --https=4096 http://127.0.0.1:4096" ]]; then
-    printf '%s\n' "$*" >> "$MOCK_TAILSCALE_LOG"
-    "$MOCK_JQ_BIN" --arg endpoint "${MOCK_DNS_NAME}:4096" '
+        ' "$MOCK_SERVE_STATUS_FILE" > "${MOCK_SERVE_STATUS_FILE}.tmp"
+    else
+        target="${!#}"
+        "$MOCK_JQ_BIN" --arg port "$port" --arg endpoint "$endpoint" --arg target "$target" '
         .TCP = (.TCP // {}) |
         .Web = (.Web // {}) |
-        .TCP["4096"] = {"HTTPS": true} |
-        .Web[$endpoint] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:4096"}}}
-    ' "$MOCK_SERVE_STATUS_FILE" > "${MOCK_SERVE_STATUS_FILE}.tmp"
+        .TCP[$port] = {"HTTPS": true} |
+        .Web[$endpoint] = {"Handlers": {"/": {"Proxy": $target}}}
+        ' "$MOCK_SERVE_STATUS_FILE" > "${MOCK_SERVE_STATUS_FILE}.tmp"
+    fi
     mv "${MOCK_SERVE_STATUS_FILE}.tmp" "$MOCK_SERVE_STATUS_FILE"
     exit 0
 fi
@@ -84,6 +94,7 @@ set -euo pipefail
 
 printf '%s\n' "$*" > "$MOCK_OPENCODE_ARGS"
 pwd > "$MOCK_OPENCODE_CWD"
+printf '%s\n' "${XDG_DATA_HOME:-}" > "$MOCK_OPENCODE_DATA_HOME"
 printf '%s\n' "$$" > "$MOCK_LISTENER_PID_FILE"
 printf '%s\n' "$$" >> "$MOCK_OPENCODE_STARTS"
 touch "$MOCK_OPENCODE_RUNNING"
@@ -152,6 +163,7 @@ export MOCK_SERVE_STATUS_FILE="$STATE_DIR/serve.json"
 export MOCK_TAILSCALE_LOG="$STATE_DIR/tailscale.log"
 export MOCK_OPENCODE_ARGS="$STATE_DIR/opencode.args"
 export MOCK_OPENCODE_CWD="$STATE_DIR/opencode.cwd"
+export MOCK_OPENCODE_DATA_HOME="$STATE_DIR/opencode.data-home"
 export MOCK_OPENCODE_STARTS="$STATE_DIR/opencode.starts"
 export MOCK_OPENCODE_RUNNING="$STATE_DIR/opencode.running"
 export MOCK_LISTENER_PID_FILE="$STATE_DIR/listener.pid"
@@ -164,6 +176,7 @@ reset_state() {
         "$MOCK_TAILSCALE_LOG" \
         "$MOCK_OPENCODE_ARGS" \
         "$MOCK_OPENCODE_CWD" \
+        "$MOCK_OPENCODE_DATA_HOME" \
         "$MOCK_OPENCODE_STARTS" \
         "$MOCK_OPENCODE_RUNNING" \
         "$MOCK_LISTENER_PID_FILE"
@@ -339,6 +352,50 @@ test_rejects_directory_argument() {
     grep -Fq 'unknown argument' "$output"
 }
 
+test_uses_custom_port_and_data_home() {
+    local data_home="$TEST_TMPDIR/client-data"
+    local output="$STATE_DIR/custom-instance.out"
+
+    reset_state
+    write_free_serve_status
+
+    PORT=4097 XDG_DATA_HOME="$data_home" "$OC" > "$output" 2>&1
+
+    grep -Fxq 'serve --hostname 127.0.0.1 --port 4097' "$MOCK_OPENCODE_ARGS"
+    grep -Fxq "$data_home" "$MOCK_OPENCODE_DATA_HOME"
+    grep -Fxq 'serve --bg --yes --https=4097 http://127.0.0.1:4097' "$MOCK_TAILSCALE_LOG"
+    grep -Fq 'OpenCode: https://macmini.tailb55486.ts.net:4097' "$output"
+}
+
+test_isolates_default_operational_state_by_port() {
+    local instance_state="$TEST_TMPDIR/instance-state"
+    local output="$STATE_DIR/isolated-state.out"
+
+    reset_state
+    write_free_serve_status
+
+    env -u OC_STATE_DIR XDG_STATE_HOME="$instance_state" PORT=4097 \
+        "$OC" > "$output" 2>&1
+
+    [[ -s "$instance_state/oc/4097/opencode.pid" ]]
+    [[ -e "$instance_state/oc/4097/opencode.log" ]]
+    [[ ! -e "$instance_state/oc/opencode.pid" ]]
+}
+
+test_rejects_invalid_port() {
+    local output="$STATE_DIR/invalid-port.out"
+
+    reset_state
+
+    if PORT=invalid "$OC" > "$output" 2>&1; then
+        printf 'oc unexpectedly accepted an invalid port\n' >&2
+        return 1
+    fi
+
+    grep -Fq 'PORT must be an integer between 1 and 65535' "$output"
+    assert_file_missing "$MOCK_OPENCODE_STARTS"
+}
+
 test_starts_in_home_and_is_idempotent
 test_force_restarts_owned_resources
 test_preserves_other_serve_services
@@ -347,5 +404,8 @@ test_refuses_non_opencode_local_listener
 test_refuses_offline_tailscale
 test_requires_associated_macos_cli
 test_rejects_directory_argument
+test_uses_custom_port_and_data_home
+test_isolates_default_operational_state_by_port
+test_rejects_invalid_port
 
 printf 'oc tests passed\n'

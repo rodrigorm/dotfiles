@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PORT=4096
+PORT="${PORT:-4096}"
 LOCAL_HOST="127.0.0.1"
 LOCAL_URL="http://${LOCAL_HOST}:${PORT}"
 LISTEN_TIMEOUT="${OC_LISTEN_TIMEOUT:-30}"
@@ -25,20 +25,22 @@ usage() {
     cat <<'EOF'
 Usage: oc [--force]
 
-Starts or reuses a background OpenCode server on 127.0.0.1:4096 and publishes
-it at https://<machine>.<tailnet>.ts.net:4096 with Tailscale Serve.
+Starts or reuses a background OpenCode server on 127.0.0.1:<port> and publishes
+it at https://<machine>.<tailnet>.ts.net:<port> with Tailscale Serve.
 
 OpenCode starts in $HOME. The wrapper refuses to overwrite an unrelated local
 listener or Tailscale Serve configuration. --force restarts only a healthy
 OpenCode listener and an exactly compatible Serve route.
 
 Environment:
+  PORT                local and Tailscale HTTPS port (default: 4096)
+  XDG_DATA_HOME       OpenCode authentication, sessions, and application data
   OC_OPENCODE_BIN     opencode binary path
   OC_TAILSCALE_BIN    tailscale binary path
   OC_JQ_BIN           jq binary path
   OC_CURL_BIN         curl binary path
   OC_LSOF_BIN         lsof binary path
-  OC_STATE_DIR        PID and log directory (default: ~/.local/state/oc)
+  OC_STATE_DIR        PID and log directory (default: ~/.local/state/oc/<port>)
   OC_LISTEN_TIMEOUT   seconds to wait for OpenCode (default: 30)
   OC_STOP_TIMEOUT     seconds to wait for OpenCode to stop (default: 15)
   OC_REMOTE_TIMEOUT   seconds to wait for the Serve endpoint (default: 10)
@@ -49,6 +51,16 @@ EOF
 fail() {
     printf 'oc: %s\n' "$*" >&2
     exit 1
+}
+
+validate_port() {
+    if [[ ! "$PORT" =~ ^[0-9]{1,5}$ ]]; then
+        fail "PORT must be an integer between 1 and 65535"
+    fi
+
+    if (( 10#$PORT < 1 || 10#$PORT > 65535 )); then
+        fail "PORT must be an integer between 1 and 65535"
+    fi
 }
 
 find_tailscale() {
@@ -281,7 +293,8 @@ while (( $# > 0 )); do
 done
 
 [[ -n "${HOME:-}" && -d "$HOME" ]] || fail 'HOME is not a valid directory'
-OPENCODE_STATE_DIR="${OC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oc}"
+validate_port
+OPENCODE_STATE_DIR="${OC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oc/$PORT}"
 OPENCODE_PID_FILE="$OPENCODE_STATE_DIR/opencode.pid"
 OPENCODE_LOG_FILE="$OPENCODE_STATE_DIR/opencode.log"
 
