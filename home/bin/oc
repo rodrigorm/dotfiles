@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=4096
+LOCAL_HOST="127.0.0.1"
+LOCAL_URL="http://${LOCAL_HOST}:${PORT}"
+LISTEN_TIMEOUT="${OC_LISTEN_TIMEOUT:-30}"
+STOP_TIMEOUT="${OC_STOP_TIMEOUT:-15}"
+REMOTE_TIMEOUT="${OC_REMOTE_TIMEOUT:-10}"
+PROBE_TIMEOUT="${OC_PROBE_TIMEOUT:-2}"
+
+OPENCODE_BIN="${OC_OPENCODE_BIN:-$(command -v opencode 2>/dev/null || true)}"
+JQ_BIN="${OC_JQ_BIN:-$(command -v jq 2>/dev/null || true)}"
+CURL_BIN="${OC_CURL_BIN:-$(command -v curl 2>/dev/null || true)}"
+LSOF_BIN="${OC_LSOF_BIN:-$(command -v lsof 2>/dev/null || true)}"
+TAILSCALE_BIN=""
+PLATFORM="${OC_PLATFORM:-$(uname -s)}"
+
+FORCE=false
+SERVE_STATUS_JSON=""
+TAILSCALE_STATE=""
+MAGIC_DNS_NAME=""
+
+usage() {
+    cat <<'EOF'
+Usage: oc [--force]
+
+Starts or reuses a background OpenCode server on 127.0.0.1:4096 and publishes
+it at https://<machine>.<tailnet>.ts.net:4096 with Tailscale Serve.
+
+OpenCode starts in $HOME. The wrapper refuses to overwrite an unrelated local
+listener or Tailscale Serve configuration. --force restarts only a healthy
+OpenCode listener and an exactly compatible Serve route.
+
+Environment:
+  OC_OPENCODE_BIN     opencode binary path
+  OC_TAILSCALE_BIN    tailscale binary path
+  OC_JQ_BIN           jq binary path
+  OC_CURL_BIN         curl binary path
+  OC_LSOF_BIN         lsof binary path
+  OC_STATE_DIR        PID and log directory (default: ~/.local/state/oc)
+  OC_LISTEN_TIMEOUT   seconds to wait for OpenCode (default: 30)
+  OC_STOP_TIMEOUT     seconds to wait for OpenCode to stop (default: 15)
+  OC_REMOTE_TIMEOUT   seconds to wait for the Serve endpoint (default: 10)
+  OC_PROBE_TIMEOUT    curl timeout in seconds (default: 2)
+EOF
+}
+
+fail() {
+    printf 'oc: %s\n' "$*" >&2
+    exit 1
+}
+
+find_tailscale() {
+    local candidate
+
+    if [[ -n "${OC_TAILSCALE_BIN:-}" ]]; then
+        printf '%s\n' "$OC_TAILSCALE_BIN"
+        return
+    fi
+
+    candidate="$(command -v tailscale 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+    fi
+}
+
+tailscale_cli() {
+    TAILSCALE_BE_CLI=1 "$TAILSCALE_BIN" "$@"
+}
+
+require_tailscale() {
+    if [[ -n "$TAILSCALE_BIN" && -x "$TAILSCALE_BIN" ]]; then
+        return
+    fi
+
+    if [[ "$PLATFORM" == "Darwin" ]]; then
+        fail "tailscale CLI not found; install its command-line integration"
+    fi
+
+    fail "tailscale not found or not executable; run bootstrap.sh"
+}
+
+require_executable() {
+    local name="$1"
+    local executable="$2"
+
+    if [[ -z "$executable" || ! -x "$executable" ]]; then
+        fail "$name not found or not executable"
+    fi
+}
+
+is_opencode_healthy() {
+    local base_url="$1"
+
+    "$CURL_BIN" -fsS --max-time "$PROBE_TIMEOUT" \
+        "${base_url}/global/health" 2>/dev/null | \
+        "$JQ_BIN" -e '.healthy == true' >/dev/null 2>&1
+}
+
+listener_pids() {
+    "$LSOF_BIN" -n -P -t -a \
+        -iTCP@"${LOCAL_HOST}":"${PORT}" -sTCP:LISTEN 2>/dev/null | sort -u
+}
+
+is_port_listening() {
+    [[ -n "$(listener_pids || true)" ]]
+}
+
+read_tailscale_identity() {
+    local status_json
+    local parsed
+
+    if ! status_json="$(tailscale_cli status --json)"; then
+        fail "could not read Tailscale status"
+    fi
+
+    if ! parsed="$(printf '%s' "$status_json" | \
+        "$JQ_BIN" -er '[.BackendState // "", .Self.DNSName // ""] | @tsv')"; then
+        fail "Tailscale returned invalid status JSON"
+    fi
+
+    IFS=$'\t' read -r TAILSCALE_STATE MAGIC_DNS_NAME <<< "$parsed"
+    MAGIC_DNS_NAME="${MAGIC_DNS_NAME%.}"
+
+    [[ "$TAILSCALE_STATE" == "Running" ]] || fail "Tailscale is not running"
+    [[ -n "$MAGIC_DNS_NAME" ]] || fail "Tailscale has no MagicDNS name"
+}
+
+read_serve_status() {
+    if ! SERVE_STATUS_JSON="$(tailscale_cli serve status --json)"; then
+        fail "could not read Tailscale Serve status"
+    fi
+}
+
+classify_serve_status() {
+    local endpoint="${MAGIC_DNS_NAME}:${PORT}"
+    local classification
+
+    # The jq program is intentionally single-quoted.
+    # shellcheck disable=SC2016
+    if ! classification="$(printf '%s' "$SERVE_STATUS_JSON" | "$JQ_BIN" -er \
+        --arg port "$PORT" \
+        --arg endpoint "$endpoint" \
+        --arg target "$LOCAL_URL" '
+            (.TCP // {}) as $tcp |
+            (.Web // {}) as $web |
+            (.AllowFunnel // {}) as $funnel |
+            ($tcp[$port] // null) as $tcpEntry |
+            ([$web | to_entries[] | select(.key | endswith(":" + $port))]) as $webEntries |
+            ([$funnel | to_entries[] |
+                select((.key | endswith(":" + $port)) and .value == true)]) as $publicEntries |
+            if $tcpEntry == null and ($webEntries | length) == 0 and ($publicEntries | length) == 0 then
+                "free"
+            elif
+                ($tcpEntry | type) == "object" and
+                ($tcpEntry | keys) == ["HTTPS"] and
+                $tcpEntry.HTTPS == true and
+                ($webEntries | length) == 1 and
+                $webEntries[0].key == $endpoint and
+                (($web[$endpoint].Handlers // {}) | keys) == ["/"] and
+                $web[$endpoint].Handlers["/"].Proxy == $target and
+                ($publicEntries | length) == 0
+            then
+                "compatible"
+            else
+                "conflict"
+            end
+        ')"; then
+        fail "Tailscale Serve returned invalid status JSON"
+    fi
+
+    printf '%s\n' "$classification"
+}
+
+wait_for_local_opencode() {
+    local pid="$1"
+    local elapsed=0
+
+    while (( elapsed < LISTEN_TIMEOUT )); do
+        if is_opencode_healthy "$LOCAL_URL"; then
+            return
+        fi
+
+        if ! kill -0 "$pid" 2>/dev/null; then
+            fail "OpenCode exited before becoming healthy; see $OPENCODE_LOG_FILE"
+        fi
+
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    kill "$pid" >/dev/null 2>&1 || true
+    fail "timed out waiting for OpenCode on $LOCAL_URL; see $OPENCODE_LOG_FILE"
+}
+
+wait_for_remote_opencode() {
+    local remote_url="$1"
+    local elapsed=0
+
+    while (( elapsed < REMOTE_TIMEOUT )); do
+        if is_opencode_healthy "$remote_url"; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    return 1
+}
+
+stop_opencode() {
+    local pids
+    local pid
+    local elapsed=0
+
+    pids="$(listener_pids || true)"
+    [[ -n "$pids" ]] || fail "could not identify the OpenCode listener on $LOCAL_URL"
+
+    for pid in $pids; do
+        kill "$pid" || fail "could not stop OpenCode process $pid"
+    done
+
+    while (( elapsed < STOP_TIMEOUT )); do
+        if ! is_port_listening; then
+            rm -f "$OPENCODE_PID_FILE"
+            return
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    fail "timed out waiting for OpenCode to stop"
+}
+
+start_opencode() {
+    local pid
+
+    mkdir -p "$OPENCODE_STATE_DIR"
+    (
+        cd "$HOME"
+        nohup "$OPENCODE_BIN" serve --hostname "$LOCAL_HOST" --port "$PORT" \
+            >> "$OPENCODE_LOG_FILE" 2>&1 < /dev/null &
+        printf '%s\n' "$!" > "$OPENCODE_PID_FILE"
+    )
+
+    pid="$(cat "$OPENCODE_PID_FILE")"
+    wait_for_local_opencode "$pid"
+    printf 'Started OpenCode in %s (PID %s, log %s)\n' "$HOME" "$pid" "$OPENCODE_LOG_FILE"
+}
+
+configure_serve() {
+    tailscale_cli serve --bg --yes --https="$PORT" "$LOCAL_URL"
+    read_serve_status
+    [[ "$(classify_serve_status)" == "compatible" ]] || \
+        fail "Tailscale Serve did not install the expected route"
+    printf 'Configured Tailscale Serve HTTPS port %s\n' "$PORT"
+}
+
+disable_serve() {
+    tailscale_cli serve --yes --https="$PORT" off
+    read_serve_status
+    [[ "$(classify_serve_status)" == "free" ]] || \
+        fail "Tailscale Serve did not remove the expected route"
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --force)
+            FORCE=true
+            ;;
+        *)
+            fail "unknown argument: $1"
+            ;;
+    esac
+    shift
+done
+
+[[ -n "${HOME:-}" && -d "$HOME" ]] || fail 'HOME is not a valid directory'
+OPENCODE_STATE_DIR="${OC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oc}"
+OPENCODE_PID_FILE="$OPENCODE_STATE_DIR/opencode.pid"
+OPENCODE_LOG_FILE="$OPENCODE_STATE_DIR/opencode.log"
+
+TAILSCALE_BIN="$(find_tailscale)"
+require_executable opencode "$OPENCODE_BIN"
+require_tailscale
+require_executable jq "$JQ_BIN"
+require_executable curl "$CURL_BIN"
+require_executable lsof "$LSOF_BIN"
+require_executable nohup "$(command -v nohup 2>/dev/null || true)"
+
+read_tailscale_identity
+REMOTE_URL="https://${MAGIC_DNS_NAME}:${PORT}"
+
+read_serve_status
+SERVE_STATE="$(classify_serve_status)"
+if [[ "$SERVE_STATE" == "conflict" ]]; then
+    fail "Tailscale Serve HTTPS port $PORT is already in use; configuration was not changed"
+fi
+
+OPENCODE_HEALTHY=false
+if is_opencode_healthy "$LOCAL_URL"; then
+    OPENCODE_HEALTHY=true
+elif is_port_listening; then
+    fail "local port $PORT is occupied by something other than OpenCode"
+fi
+
+if [[ "$FORCE" == true ]]; then
+    if [[ "$SERVE_STATE" == "compatible" ]]; then
+        disable_serve
+        SERVE_STATE="free"
+    fi
+    if [[ "$OPENCODE_HEALTHY" == true ]]; then
+        stop_opencode
+        OPENCODE_HEALTHY=false
+    fi
+fi
+
+if [[ "$OPENCODE_HEALTHY" == true ]]; then
+    printf 'Reusing OpenCode at %s\n' "$LOCAL_URL"
+else
+    start_opencode
+fi
+
+if [[ "$SERVE_STATE" == "compatible" ]]; then
+    printf 'Reusing compatible Tailscale Serve route\n'
+else
+    configure_serve
+fi
+
+if ! wait_for_remote_opencode "$REMOTE_URL"; then
+    printf 'Warning: %s is configured but has not answered yet\n' "$REMOTE_URL" >&2
+fi
+
+printf 'OpenCode: %s\n' "$REMOTE_URL"
+printf 'Attach: opencode attach %s --dir /path/on/host\n' "$REMOTE_URL"

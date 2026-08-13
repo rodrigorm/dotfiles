@@ -7,16 +7,11 @@
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
 log_error() {
@@ -64,6 +59,11 @@ test_package_installations() {
 
     # Test neovim (needs Homebrew PATH)
     run_test "neovim installation" "bash -c 'source ~/.bashrc && command -v nvim && nvim --version'"
+
+    # Test oc dependencies (need Homebrew PATH on Linux)
+    run_test "jq installation" "bash -c 'source ~/.bashrc && command -v jq && jq --version'"
+    run_test "lsof installation" "bash -c 'source ~/.bashrc && command -v lsof && lsof -v'"
+    run_test "tailscale installation" "bash -c 'source ~/.bashrc && command -v tailscale && tailscale version'"
 }
 
 # Test dotfile symlinks
@@ -81,6 +81,9 @@ test_dotfile_symlinks() {
 
     # Test .screenrc symlink
     run_test ".screenrc symlink" "[ -L ~/.screenrc ] && [ -f ~/.screenrc ]"
+
+    # Homeshick only links files tracked by Git; validate the mounted castle before commit.
+    run_test "oc executable" "[ -x /workspaces/dotfiles/home/bin/oc ]"
 }
 
 # Test bashrc functionality
@@ -114,6 +117,9 @@ test_tool_functionality() {
 
     # Test nvim can start (briefly, needs Homebrew PATH)
     run_test "neovim starts" "bash -c 'source ~/.bashrc && nvim --version | head -1 | grep -q NVIM'"
+
+    # Exercise oc with isolated OpenCode and Tailscale mocks.
+    run_test "oc wrapper behavior" "bash -c 'source ~/.bashrc && ./tests/oc.sh'"
 }
 
 # Test cross-platform compatibility
@@ -137,7 +143,7 @@ main() {
     log_info "Running tests on $(uname -a)"
 
     # Change to dotfiles directory
-    cd /workspaces/dotfiles
+    cd /workspaces/dotfiles || exit
 
     # Run all test suites
     test_package_installations

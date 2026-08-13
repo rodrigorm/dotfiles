@@ -41,8 +41,10 @@ brew install \
     fzf \
     gh \
     glab \
+    jq \
     lazygit \
     libnotify \
+    lsof \
     luarocks \
     neovim \
     node \
@@ -53,6 +55,11 @@ brew install \
     tmux \
     unzip \
     vim
+
+# Linux uses the Homebrew CLI and daemon. Tailscale installation on macOS is manual.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    brew install tailscale
+fi
 
 # Setup homeshick (clone only if missing)
 if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
