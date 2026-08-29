@@ -20,4 +20,4 @@ benchmark:
 	__bashrc_bench=1 bash -i
 
 shellcheck:
-	shellcheck $(SHELLCHECK_FILES) bootstrap.sh home/bin/oc tests/oc.sh
+	shellcheck $(SHELLCHECK_FILES) bootstrap.sh home/bin/oc home/bin/exedevctl tests/oc.sh

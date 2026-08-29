@@ -1,5 +1,16 @@
 {
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ./exedev/exedev.test.ts",
+    "typecheck": "./node_modules/.bin/tsc --noEmit -p tsconfig.json"
+  },
   "dependencies": {
-    "@opencode-ai/plugin": "1.15.12"
+    "@opencode-ai/plugin": "1.18.23"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "@types/node": "24.12.2",
+    "typescript": "5.8.2"
   }
 }
