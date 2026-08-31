@@ -16,5 +16,8 @@
       "permission": {}
     }
   },
-  "lsp": true
+  "lsp": true,
+  "plugin": [
+    "@dietrichgebert/ponytail"
+  ]
 }
