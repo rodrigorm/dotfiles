@@ -179,7 +179,8 @@ Progress on 2026-09-02:
 - Completed: remove the OpenCode workspace registration when Sandcastle start fails.
 - Completed: fail explicitly when neither the local Bun source nor the remote Node bundle is available.
 - Completed: redact and bound logs, diagnostics, and recovery metadata before response serialization.
-- Remaining: disposal, ownership proof, and serialization.
+- Completed: require the exact ownership tuple observed by the current SBX or Cloudflare provider instance before reuse, stop, or destruction.
+- Remaining: disposal and serialization.
 
 Changes:
 

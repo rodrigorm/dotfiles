@@ -74,7 +74,10 @@ export interface CloudflareProviderOptions {
 }
 
 interface CloudflareMetadata {
-  sessionId?: string
+  sessionId: string
+  generation: number
+  workspaceId: string
+  projectId: string
   sandboxId?: string
   branch?: string
   baseSha?: string
@@ -83,7 +86,11 @@ interface CloudflareMetadata {
 }
 
 interface Activation {
+  provider: "cloudflare"
+  sessionId: string
+  generation: number
   workspaceId: string
+  projectId: string
   sandboxId: string
   branch: string
   baseSha: string
@@ -96,6 +103,14 @@ interface Activation {
   controlToken?: string
   controlPoller?: Promise<void>
   closed?: boolean
+}
+
+interface CloudflareOwner {
+  provider: "cloudflare"
+  sessionId: string
+  generation: number
+  workspaceId: string
+  projectId: string
 }
 
 export class CloudflareProvider implements WorkspaceProviderBase {
@@ -115,6 +130,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   private readonly revokeControlToken?: (token: string) => void
   private readonly assetDirectory: string
   private readonly active = new Map<string, Activation>()
+  private readonly owned = new Map<string, CloudflareOwner>()
 
   constructor(options: CloudflareProviderOptions) {
     this.client = options.client ?? createClient(options)
@@ -158,8 +174,14 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   }
 
   async prepare(info: WorkspaceInfo, env: Record<string, string | undefined>, from?: WorkspaceInfo): Promise<void> {
-    if (this.active.has(info.id)) return
     const metadata = readMetadata(info, from)
+    const active = this.active.get(info.id)
+    if (active) {
+      const expected = ownerFromMetadata(metadata)
+      if (metadata.sandboxId !== active.sandboxId || !sameOwner(active, expected)) throw cloudflareOwnershipError()
+      this.assertOwned(active.sandboxId, expected)
+      return
+    }
     const branch = info.branch ?? metadata.branch ?? this.branch(info.id)
     assertSafeBranch(branch)
     const baseSha = metadata.baseSha ?? (await this.readHead())
@@ -167,7 +189,8 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const authContent = env.OPENCODE_AUTH_CONTENT
     if (!authContent) throw new SandboxError("bootstrap", "OpenCode auth content is unavailable", "AUTH_UNAVAILABLE")
 
-    const workspace = await this.ensureSandbox(metadata, branch, baseSha)
+    const owner = ownerFromMetadata(metadata)
+    const workspace = await this.ensureSandbox(metadata, branch, baseSha, owner)
     const password = randomBytes(32).toString("base64url")
     const tunnelName = metadata.tunnelName ?? tunnelNameFor(info.id)
     const controlEnabled = Boolean(this.localControlSocket || this.controlTokenFor)
@@ -186,7 +209,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       const controlDirectory = controlEnabled ? `${runtimeDirectory(info.id)}/control` : undefined
       if (controlDirectory) await this.installControlRuntime(workspace.sandboxId, runtimeDirectory(info.id), controlDirectory)
       activation = {
-        workspaceId: info.id,
+        ...owner,
         sandboxId: workspace.sandboxId,
         branch,
         baseSha,
@@ -210,7 +233,10 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       if (controlToken) this.revokeControlToken?.(controlToken)
       this.active.delete(info.id)
       await this.cleanupRuntime(workspace.sandboxId, info.id).catch(() => undefined)
-      if (workspace.created) await this.destroyIfPresent(workspace.sandboxId)
+      if (workspace.created) {
+        await this.destroyIfPresent(workspace.sandboxId)
+        this.owned.delete(workspace.sandboxId)
+      }
       throw error instanceof SandboxError ? error : new SandboxError("bootstrap", redactError(error), "CLOUDFLARE_PROVISION")
     }
   }
@@ -306,8 +332,12 @@ export class CloudflareProvider implements WorkspaceProviderBase {
 
   async release(info: WorkspaceInfo): Promise<void> {
     const activation = this.active.get(info.id)
-    const sandboxId = activation?.sandboxId ?? readMetadata(info).sandboxId
-    if (!sandboxId) return
+    const metadata = readMetadata(info)
+    const sandboxId = activation?.sandboxId ?? metadata.sandboxId
+    if (!sandboxId) throw new SandboxError("remove", "Cloudflare sandbox identity is unavailable", "CLOUDFLARE_ID_UNAVAILABLE")
+    const expected = ownerFromMetadata(metadata)
+    if (activation && (metadata.sandboxId !== activation.sandboxId || !sameOwner(activation, expected))) throw cloudflareOwnershipError()
+    this.assertOwned(sandboxId, expected)
     if (activation) activation.closed = true
     if (activation?.controlToken) this.revokeControlToken?.(activation.controlToken)
     await this.cleanupRuntime(sandboxId, info.id)
@@ -319,26 +349,37 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const metadata = readMetadata(info)
     const sandboxId = activation?.sandboxId ?? metadata.sandboxId
     if (!sandboxId) throw new SandboxError("remove", "Cloudflare sandbox identity is unavailable", "CLOUDFLARE_ID_UNAVAILABLE")
+    const expected = ownerFromMetadata(metadata)
+    if (activation && (metadata.sandboxId !== activation.sandboxId || !sameOwner(activation, expected))) throw cloudflareOwnershipError()
+    this.assertOwned(sandboxId, expected)
     await this.destroyIfPresent(sandboxId)
+    this.owned.delete(sandboxId)
     this.active.delete(info.id)
   }
 
   async dispose(): Promise<void> {
     const activations = [...this.active.values()]
-    this.active.clear()
+    for (const activation of activations) this.assertOwned(activation.sandboxId, activation)
     for (const activation of activations) {
       activation.closed = true
       if (activation.controlToken) this.revokeControlToken?.(activation.controlToken)
     }
-    await Promise.all(activations.map((activation) => this.cleanupRuntime(activation.sandboxId, activation.workspaceId).catch(() => undefined)))
+    await Promise.all(activations.map(async (activation) => {
+      await this.cleanupRuntime(activation.sandboxId, activation.workspaceId)
+      this.active.delete(activation.workspaceId)
+      this.owned.delete(activation.sandboxId)
+    }))
   }
 
   private async ensureSandbox(
     metadata: CloudflareMetadata,
     branch: string,
     baseSha: string,
+    owner: CloudflareOwner,
   ): Promise<{ sandboxId: string; created: boolean; checkoutHead: string }> {
-    if (metadata.sandboxId && metadata.baseSha === baseSha && metadata.checkoutHead) {
+    if (metadata.sandboxId) {
+      this.assertOwned(metadata.sandboxId, owner)
+      if (metadata.baseSha !== baseSha || !metadata.checkoutHead) throw cloudflareOwnershipError()
       try {
         if (await this.client.running(metadata.sandboxId) && await this.hasGitWorkspace(metadata.sandboxId)) {
           await this.ensureHead(metadata.sandboxId, metadata.checkoutHead)
@@ -348,20 +389,28 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       } catch (error) {
         if (!isNotFound(error)) throw error
       }
+      throw new SandboxError("provision", "owned Cloudflare sandbox is unavailable", "CLOUDFLARE_RESOURCE_UNAVAILABLE")
     }
 
     const archive = await this.createArchive(baseSha)
     const sandboxId = await this.client.createSandbox()
+    this.owned.set(sandboxId, owner)
     let checkoutHead: string
     try {
       await this.client.hydrate(sandboxId, archive)
       checkoutHead = await this.initializeWorkspace(sandboxId, branch)
     } catch (error) {
       await this.destroyIfPresent(sandboxId)
+      this.owned.delete(sandboxId)
       throw error
     }
-    if (metadata.sandboxId && metadata.sandboxId !== sandboxId) await this.destroyIfPresent(metadata.sandboxId)
     return { sandboxId, created: true, checkoutHead }
+  }
+
+  private assertOwned(sandboxId: string, expected: CloudflareOwner): void {
+    if (!sameOwner(this.owned.get(sandboxId), expected)) {
+      throw cloudflareOwnershipError()
+    }
   }
 
   private async hasGitWorkspace(sandboxId: string): Promise<boolean> {
@@ -783,16 +832,34 @@ function createClient(options: CloudflareProviderOptions): CloudflareSandboxClie
 }
 
 function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): CloudflareMetadata {
+  if (info.type !== "cloudflare") throw cloudflareOwnershipError()
   const value = isRecord(info.extra) ? info.extra : isRecord(from?.extra) ? from.extra : {}
   const state = isRecord(value.providerState) ? value.providerState : value
   const field = (key: string): unknown => value[key] ?? state[key]
-  const metadata: CloudflareMetadata = {}
+  const metadata: CloudflareMetadata = { sessionId: "", generation: 0, workspaceId: info.id, projectId: info.projectID }
 
+  const provider = field("provider")
+  if (provider !== undefined && provider !== "cloudflare") throw cloudflareOwnershipError()
   const sessionId = field("sessionId")
   if (sessionId !== undefined && (typeof sessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(sessionId))) {
     throw new SandboxError("validate", "Cloudflare session ID is invalid", "SESSION_ID")
   }
   if (typeof sessionId === "string") metadata.sessionId = sessionId
+  if (!metadata.sessionId) throw cloudflareOwnershipError()
+  const generation = field("generation")
+  if (generation !== undefined && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1)) {
+    throw new SandboxError("validate", "Cloudflare generation is invalid", "GENERATION_INVALID")
+  }
+  if (typeof generation === "number") metadata.generation = generation
+  if (metadata.generation < 1) throw cloudflareOwnershipError()
+  const workspaceId = field("workspaceId")
+  if (workspaceId !== undefined && workspaceId !== info.id) {
+    throw new SandboxError("validate", "Cloudflare workspace ownership is invalid", "CLOUDFLARE_OWNERSHIP_UNVERIFIED")
+  }
+  const projectId = field("projectId")
+  if (projectId !== undefined && projectId !== info.projectID) {
+    throw new SandboxError("validate", "Cloudflare project ownership is invalid", "CLOUDFLARE_OWNERSHIP_UNVERIFIED")
+  }
 
   const sandboxId = field("sandboxId")
   if (sandboxId !== undefined) {
@@ -830,12 +897,42 @@ function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): CloudflareMeta
 
 function metadataFor(activation: Activation): Record<string, unknown> {
   return {
+    provider: activation.provider,
+    sessionId: activation.sessionId,
+    generation: activation.generation,
+    workspaceId: activation.workspaceId,
+    projectId: activation.projectId,
     sandboxId: activation.sandboxId,
     branch: activation.branch,
     baseSha: activation.baseSha,
     checkoutHead: activation.checkoutHead,
     tunnelName: activation.tunnelName,
   }
+}
+
+function ownerFromMetadata(metadata: CloudflareMetadata): CloudflareOwner {
+  return {
+    provider: "cloudflare",
+    sessionId: metadata.sessionId,
+    generation: metadata.generation,
+    workspaceId: metadata.workspaceId,
+    projectId: metadata.projectId,
+  }
+}
+
+function sameOwner(actual: CloudflareOwner | undefined, expected: CloudflareOwner): boolean {
+  return Boolean(
+    actual &&
+    actual.provider === expected.provider &&
+    actual.sessionId === expected.sessionId &&
+    actual.generation === expected.generation &&
+    actual.workspaceId === expected.workspaceId &&
+    actual.projectId === expected.projectId
+  )
+}
+
+function cloudflareOwnershipError(): SandboxError {
+  return new SandboxError("validate", "Cloudflare resource ownership could not be verified", "CLOUDFLARE_OWNERSHIP_UNVERIFIED")
 }
 
 function runtimeDirectory(workspaceId: string): string {

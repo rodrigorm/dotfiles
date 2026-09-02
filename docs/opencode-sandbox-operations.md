@@ -14,7 +14,7 @@ Inside an OpenCode session, use `/sandbox <operation>`. The command delegates to
 | Inspect a failure | `/sandbox diagnose` | Provider-safe details are captured when diagnostics are configured; `{ "configured": false }` means provider inspection remains manual |
 | Repeat the recorded failed operation | `/sandbox retry` from the host | State leaves `error`, `sync_failed`, or `recovery_pending`; do not retry a failed start from a remote capability |
 | Preserve changes and remove | `/sandbox delete` | State becomes `deleted` after the idle transition |
-| Discard a `sync_failed` or detached runtime | `/sandbox delete --force` from host | State becomes `deleted`; separately verify ownership because the current adapters do not always do so |
+| Discard a `sync_failed` or detached runtime | `/sandbox delete --force` from host | State becomes `deleted`; unknown ownership remains blocked even with force |
 
 The current `/sandbox status` is record-only. It does not query provider inventory. Do not read "remote" as proof that a resource is healthy, or "orphaned" as proof that it stopped.
 

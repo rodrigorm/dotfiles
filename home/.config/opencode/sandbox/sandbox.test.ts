@@ -1405,6 +1405,7 @@ describe("Docker Sandbox provider", () => {
       },
     }
     const adapter = createSbxSandcastleAdapter({
+      ...fakeSbxOwnership(),
       input: {
         sessionId: "ses_sbx_adapter",
         projectId: "prj_1",
@@ -1542,7 +1543,9 @@ describe("Docker Sandbox provider", () => {
         return { exitCode: 0, signal: null, stdout: "", stderr: "" }
       },
     }
+    const ownership = fakeSbxOwnership()
     const provider = new SbxProvider({
+      ...ownership,
       worktree: root,
       runner,
       reservePort: async () => 4101,
@@ -1555,7 +1558,7 @@ describe("Docker Sandbox provider", () => {
       branch,
       directory: root,
       projectID: "prj_1",
-      extra: { baseSha },
+      extra: { baseSha, sessionId: "ses_sbx", generation: 1 },
     }
 
     await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
@@ -1570,7 +1573,13 @@ describe("Docker Sandbox provider", () => {
     expect(result).toEqual({ kind: "branch", baseSha, branch })
     expect(commands.some(({ argv }) => argv[0] === "git" && argv.includes("fetch") && argv.some((part) => part.startsWith("sandbox-")))).toBe(true)
 
-    await provider.release(info)
+    const create = commands.find(({ argv }) => argv.includes("create"))?.argv ?? []
+    const sandbox = create[create.indexOf("--name") + 1]
+    const ownershipId = sandbox ? await ownership.readOwnership(sandbox) : undefined
+    if (!sandbox || !ownershipId) throw new Error("SBX ownership fixture is unavailable")
+    ownership.setOwnership(sandbox, "x".repeat(43))
+    await expect(provider.destroy(info)).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    ownership.setOwnership(sandbox, ownershipId)
     await provider.destroy(info)
     expect(commands.some(({ argv }) => argv.includes("stop"))).toBe(true)
     expect(commands.some(({ argv }) => argv.includes("rm") && argv.includes("--force"))).toBe(true)
@@ -1582,6 +1591,7 @@ describe("Docker Sandbox provider", () => {
     const remoteSha = "fedcba9876543210fedcba9876543210fedcba98"
     const branch = "opencode/sbx-0123456789"
     const provider = new SbxProvider({
+      ...fakeSbxOwnership(),
       worktree: root,
       reservePort: async () => 4101,
       runner: {
@@ -1604,8 +1614,48 @@ describe("Docker Sandbox provider", () => {
       branch,
       directory: root,
       projectID: "prj_1",
-      extra: { baseSha },
+      extra: { baseSha, sessionId: "ses_sbx_mismatch", generation: 1 },
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
+  })
+
+  it("does not inspect, reuse, or destroy an unowned SBX name", async () => {
+    const baseSha = "0123456789012345678901234567890123456789"
+    const commands: string[][] = []
+    const provider = new SbxProvider({
+      ...fakeSbxOwnership(),
+      worktree: await temporaryDirectory(),
+      reservePort: async () => 4101,
+      runner: {
+        async run(input) {
+          commands.push(input.argv)
+          if (input.argv[0] === "sbx" && input.argv.includes("create")) {
+            return { exitCode: 1, signal: null, stdout: "", stderr: "name already exists" }
+          }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
+      },
+    })
+    const info = {
+      id: "wrk_sbx_collision",
+      type: "sbx",
+      name: "workspace",
+      branch: "opencode/sbx-collision",
+      directory: "/tmp/project",
+      projectID: "prj_1",
+      extra: { baseSha, sessionId: "ses_1", generation: 1 },
+    }
+
+    await expect(provider.prepare({ ...info, extra: { baseSha } }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    await expect(provider.prepare({ ...info, extra: { ...info.extra, provider: "cloudflare" } }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    expect(commands).toHaveLength(0)
+    await expect(provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    const create = commands[0] ?? []
+    const sandbox = create[create.indexOf("--name") + 1]
+    await expect(provider.destroy({
+      ...info,
+      extra: { providerState: { ...info.extra, workspaceId: info.id, projectId: info.projectID, sandbox } },
+    })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    expect(commands).toHaveLength(1)
   })
 
   it("keeps the shared control proxy alive while another workspace is active", async () => {
@@ -1619,6 +1669,7 @@ describe("Docker Sandbox provider", () => {
     const baseSha = "0123456789012345678901234567890123456789"
     const supervisorInputs: string[][] = []
     const provider = new SbxProvider({
+      ...fakeSbxOwnership(),
       worktree: root,
       deferActivation: true,
       localControlSocket: socketPath,
@@ -1668,7 +1719,7 @@ describe("Docker Sandbox provider", () => {
       const forwarding = supervisorInputs[0]?.at(supervisorInputs[0]!.indexOf("-R") + 1) ?? ""
       const controlPort = Number(forwarding.split(":").at(-1))
 
-      await expect(provider.destroy({ ...info("missing"), extra: {} })).rejects.toMatchObject({ code: "SBX_IDENTITY_UNAVAILABLE" })
+      await expect(provider.destroy({ ...info("missing"), extra: {} })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
       await expect(canConnect(controlPort)).resolves.toBeUndefined()
 
       await provider.release(first)
@@ -1685,6 +1736,7 @@ describe("Docker Sandbox provider", () => {
     const baseSha = "0123456789012345678901234567890123456789"
     let removed = false
     const provider = new SbxProvider({
+      ...fakeSbxOwnership(),
       worktree: root,
       reservePort: async () => 4101,
       runner: {
@@ -1708,7 +1760,7 @@ describe("Docker Sandbox provider", () => {
       branch: "opencode/sbx-failed",
       directory: root,
       projectID: "prj_1",
-      extra: { baseSha },
+      extra: { baseSha, sessionId: "ses_failed_sbx", generation: 1 },
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "SBX_COMMAND" })
     expect(removed).toBe(true)
   })
@@ -1781,6 +1833,7 @@ describe("Cloudflare Sandbox provider", () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
     const checkoutHead = "fedcba9876543210fedcba9876543210fedcba98"
+    let observedHead = checkoutHead
     const calls: string[] = []
     const client: CloudflareSandboxClient = {
       async createSandbox() {
@@ -1800,7 +1853,7 @@ describe("Cloudflare Sandbox provider", () => {
       async exec(id, input) {
         calls.push(`exec:${id}:${input.argv[0] ?? ""}`)
         if (input.argv.includes("--is-inside-work-tree")) return { exitCode: 0, signal: null, stdout: "true\n", stderr: "" }
-        if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: `${checkoutHead}\n`, stderr: "" }
+        if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: `${observedHead}\n`, stderr: "" }
         if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: "opencode/sandbox-cf\n", stderr: "" }
         return { exitCode: 0, signal: null, stdout: "", stderr: "" }
       },
@@ -1840,7 +1893,7 @@ describe("Cloudflare Sandbox provider", () => {
       branch: "opencode/sandbox-cf",
       directory: root,
       projectID: "prj_1",
-      extra: { baseSha },
+      extra: { baseSha, sessionId: "ses_cf", generation: 1 },
     }
 
     await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
@@ -1866,21 +1919,39 @@ describe("Cloudflare Sandbox provider", () => {
     await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
     expect(calls.filter((call) => call === "create")).toHaveLength(1)
     await provider.release(info)
+    observedHead = baseSha
+    await expect(provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
     await provider.destroy(info)
     expect(calls).toContain("destroy-tunnel:sandboxa2:4096")
     expect(calls).toContain("destroy:sandboxa2")
   })
 
   it("fails cleanup when the remote cleanup command fails", async () => {
+    const root = await temporaryDirectory()
+    const baseSha = "0123456789012345678901234567890123456789"
     let tunnelDestroyed = false
     const provider = new CloudflareProvider({
-      worktree: await temporaryDirectory(),
+      worktree: root,
+      deferActivation: true,
+      runner: {
+        async run(input) {
+          const output = input.argv.indexOf("-o")
+          if (output >= 0) await writeFile(input.argv[output + 1] ?? "", "tar")
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
+      },
       client: {
         async createSandbox() { return "sandboxa2" },
         async destroySandbox() {},
         async destroyTunnel() { tunnelDestroyed = true },
         async running() { return true },
-        async exec() { return { exitCode: 1, signal: null, stdout: "", stderr: "cleanup failed" } },
+        async exec(_id, input) {
+          if (input.argv[0] === "sh" && input.argv[2]?.includes("rm -rf --")) {
+            return { exitCode: 1, signal: null, stdout: "", stderr: "cleanup failed" }
+          }
+          if (input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
         async putFile() {},
         async getFile() { return new Uint8Array() },
         async hydrate() {},
@@ -1892,25 +1963,28 @@ describe("Cloudflare Sandbox provider", () => {
       type: "cloudflare",
       name: "workspace",
       branch: "opencode/cloudflare-cleanup",
-      directory: "/tmp/project",
+      directory: root,
       projectID: "prj_1",
-      extra: { providerState: { sandboxId: "sandboxa2", sessionId: "ses_1", generation: 1 } },
+      extra: { baseSha, sessionId: "ses_1", generation: 1 },
     }
 
+    await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
     await expect(provider.release(info)).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
     expect(tunnelDestroyed).toBe(true)
   })
 
-  it("does not reuse a Cloudflare checkout at a different revision", async () => {
+  it("does not inspect or reuse an unowned Cloudflare sandbox ID", async () => {
     const baseSha = "0123456789012345678901234567890123456789"
+    let inspected = false
     const provider = new CloudflareProvider({
       worktree: await temporaryDirectory(),
       client: {
         async createSandbox() { throw new Error("must not create") },
         async destroySandbox() {},
         async destroyTunnel() {},
-        async running() { return true },
+        async running() { inspected = true; return true },
         async exec(_id, input) {
+          inspected = true
           if (input.argv.includes("--is-inside-work-tree")) return { exitCode: 0, signal: null, stdout: "true\n", stderr: "" }
           if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: "fedcba9876543210fedcba9876543210fedcba98\n", stderr: "" }
           return { exitCode: 0, signal: null, stdout: "opencode/cloudflare-reuse\n", stderr: "" }
@@ -1922,7 +1996,7 @@ describe("Cloudflare Sandbox provider", () => {
       },
     })
 
-    await expect(provider.prepare({
+    const info = {
       id: "wrk_cf_reuse",
       type: "cloudflare",
       name: "workspace",
@@ -1930,7 +2004,12 @@ describe("Cloudflare Sandbox provider", () => {
       directory: "/tmp/project",
       projectID: "prj_1",
       extra: { providerState: { sandboxId: "sandboxa2", baseSha, checkoutHead: baseSha, branch: "opencode/cloudflare-reuse", sessionId: "ses_1", generation: 1 } },
-    }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
+    }
+
+    await expect(provider.prepare({ ...info, extra: { baseSha } }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "CLOUDFLARE_OWNERSHIP_UNVERIFIED" })
+    await expect(provider.prepare({ ...info, extra: { ...info.extra, provider: "sbx" } }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "CLOUDFLARE_OWNERSHIP_UNVERIFIED" })
+    await expect(provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "CLOUDFLARE_OWNERSHIP_UNVERIFIED" })
+    expect(inspected).toBe(false)
   })
 
   it("routes Cloudflare mailbox control through the local capability channel", async () => {
@@ -1997,7 +2076,7 @@ describe("Cloudflare Sandbox provider", () => {
       branch: "opencode/cloudflare-control",
       directory: root,
       projectID: "prj_1",
-      extra: { baseSha, sessionId: "ses_cf" },
+      extra: { baseSha, sessionId: "ses_cf", generation: 1 },
     }
 
     try {
@@ -2234,6 +2313,7 @@ async function prepareSbxHandleFixture() {
     },
   }
   const provider = new SbxProvider({
+    ...fakeSbxOwnership(),
     worktree: root,
     runner,
     reservePort: async () => 4101,
@@ -2246,7 +2326,7 @@ async function prepareSbxHandleFixture() {
     branch,
     directory: root,
     projectID: "prj_1",
-    extra: { baseSha },
+    extra: { baseSha, sessionId: "ses_sbx_contract", generation: 1 },
   }
 
   await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
@@ -2279,6 +2359,19 @@ function makeRecord(): SandboxRecord {
 
 function sha256ForTest(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex")
+}
+
+function fakeSbxOwnership(): {
+  writeOwnership(sandbox: string, ownershipId: string): Promise<void>
+  readOwnership(sandbox: string): Promise<string | undefined>
+  setOwnership(sandbox: string, ownershipId: string): void
+} {
+  const values = new Map<string, string>()
+  return {
+    async writeOwnership(sandbox, ownershipId) { values.set(sandbox, ownershipId) },
+    async readOwnership(sandbox) { return values.get(sandbox) },
+    setOwnership(sandbox, ownershipId) { values.set(sandbox, ownershipId) },
+  }
 }
 
 function canConnect(port: number): Promise<void> {

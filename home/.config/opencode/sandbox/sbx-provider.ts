@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
-import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { connect, createServer, type Server } from "node:net"
+import { tmpdir } from "node:os"
 import { setTimeout as delay } from "node:timers/promises"
 import { dirname, isAbsolute, join, posix } from "node:path"
 
@@ -37,6 +38,7 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
+const OWNERSHIP_FILE = "/tmp/opencode-sandbox-owner"
 const START_SERVER = String.raw`import json, os, shutil, signal, subprocess, sys, time
 
 frame = json.load(sys.stdin)
@@ -196,21 +198,29 @@ export interface SbxProviderOptions {
   revokeControlToken?: (token: string) => void
   assetDirectory?: string
   deferActivation?: boolean
+  writeOwnership?: (sandbox: string, ownershipId: string) => Promise<void>
+  readOwnership?: (sandbox: string) => Promise<string | undefined>
 }
 
 interface SbxMetadata {
   sessionId: string
   generation: number
+  workspaceId: string
+  projectId: string
   sandbox?: string
   hostPort?: number
   branch?: string
   baseSha?: string
+  ownershipId?: string
 }
 
 interface Activation {
+  provider: "sbx"
+  ownershipId: string
   sessionId: string
   generation: number
   workspaceId: string
+  projectId: string
   sandbox: string
   directory: string
   branch: string
@@ -227,6 +237,15 @@ interface Activation {
 interface EnsuredSandbox {
   hostPort: number
   created: boolean
+}
+
+interface SbxOwner {
+  provider: "sbx"
+  ownershipId: string
+  sessionId: string
+  generation: number
+  workspaceId: string
+  projectId: string
 }
 
 export class SbxProvider implements WorkspaceProviderBase {
@@ -248,7 +267,10 @@ export class SbxProvider implements WorkspaceProviderBase {
   private readonly revokeControlToken?: (token: string) => void
   private readonly assetDirectory: string
   private readonly deferActivation: boolean
+  private readonly writeOwnershipOverride?: (sandbox: string, ownershipId: string) => Promise<void>
+  private readonly readOwnershipOverride?: (sandbox: string) => Promise<string | undefined>
   private readonly active = new Map<string, Activation>()
+  private readonly owned = new Map<string, SbxOwner>()
   private controlProxy: Server | undefined
   private controlProxyPort: number | undefined
   private controlProxyCreation: Promise<number> | undefined
@@ -271,6 +293,8 @@ export class SbxProvider implements WorkspaceProviderBase {
     this.revokeControlToken = options.revokeControlToken
     this.assetDirectory = options.assetDirectory ?? fileURLToPath(new URL(".", import.meta.url))
     this.deferActivation = options.deferActivation ?? false
+    this.writeOwnershipOverride = options.writeOwnership
+    this.readOwnershipOverride = options.readOwnership
   }
 
   get description(): string {
@@ -292,8 +316,19 @@ export class SbxProvider implements WorkspaceProviderBase {
   }
 
   async prepare(info: WorkspaceInfo, env: Record<string, string | undefined>, from?: WorkspaceInfo): Promise<void> {
-    if (this.active.has(info.id)) return
     const metadata = readMetadata(info, from)
+    if (!metadata.ownershipId) {
+      if (metadata.sandbox) throw ownershipError()
+      metadata.ownershipId = randomBytes(32).toString("base64url")
+    }
+    if (metadata.sandbox && !metadata.hostPort) throw ownershipError()
+    const active = this.active.get(info.id)
+    if (active) {
+      const expected = ownerFromMetadata(metadata)
+      if (metadata.sandbox !== active.sandbox || !sameOwner(active, expected)) throw ownershipError()
+      await this.assertOwned(active.sandbox, expected)
+      return
+    }
     const branch = info.branch ?? metadata.branch ?? this.branch(info.id)
     assertSafeBranch(branch)
     const baseSha = metadata.baseSha ?? (await this.hostGit(["rev-parse", "HEAD"], "checkout")).stdout.trim()
@@ -304,7 +339,8 @@ export class SbxProvider implements WorkspaceProviderBase {
     assertSandboxName(sandbox)
     const rememberedPort = metadata.hostPort
     const requestedPort = rememberedPort ?? (await this.reservePort())
-    const ensured = await this.ensureSandbox(sandbox, requestedPort)
+    const owner = ownerFromMetadata(metadata)
+    const ensured = await this.ensureSandbox(sandbox, requestedPort, owner)
     let activation: Activation | undefined
     try {
       await this.configureManagedAuth(sandbox, env.OPENCODE_AUTH_CONTENT)
@@ -320,7 +356,7 @@ export class SbxProvider implements WorkspaceProviderBase {
       }
 
       const password = randomBytes(32).toString("base64url")
-      activation = { sessionId: metadata.sessionId, generation: metadata.generation, workspaceId: info.id, sandbox, directory, branch, baseSha, hostPort: ensured.hostPort, password }
+      activation = { ...owner, sandbox, directory, branch, baseSha, hostPort: ensured.hostPort, password }
       this.active.set(info.id, activation)
       if (this.controlTokenFor && this.localControlSocket) {
         activation.paths = makeRuntimePaths(metadata.sessionId, metadata.generation)
@@ -344,7 +380,8 @@ export class SbxProvider implements WorkspaceProviderBase {
       }
       if (activation?.controlToken) this.revokeControlToken?.(activation.controlToken)
       this.active.delete(info.id)
-      await this.runSbxRaw(ensured.created ? ["rm", "--force", sandbox] : ["stop", sandbox], "remove").catch(() => undefined)
+      const cleanup = await this.runSbxRaw(ensured.created ? ["rm", "--force", sandbox] : ["stop", sandbox], "remove").catch(() => undefined)
+      if (ensured.created && cleanup?.exitCode === 0) this.owned.delete(sandbox)
       throw error instanceof SandboxError ? error : new SandboxError("bootstrap", redactError(error), "SBX_PROVISION")
     }
   }
@@ -415,11 +452,15 @@ export class SbxProvider implements WorkspaceProviderBase {
 
   async release(info: WorkspaceInfo): Promise<void> {
     const activation = this.active.get(info.id)
-    const sandbox = activation?.sandbox ?? readMetadata(info).sandbox
+    const metadata = readMetadata(info)
+    const sandbox = activation?.sandbox ?? metadata.sandbox
     if (!sandbox) {
       if (this.active.size === 0) await this.closeControlProxy()
-      return
+      throw new SandboxError("remove", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
     }
+    const expected = ownerFromMetadata(metadata)
+    if (activation && (metadata.sandbox !== activation.sandbox || !sameOwner(activation, expected))) throw ownershipError()
+    await this.assertOwned(sandbox, expected)
     if (activation?.controlToken) this.revokeControlToken?.(activation.controlToken)
     if (activation?.process) {
       activation.process.terminate()
@@ -435,22 +476,41 @@ export class SbxProvider implements WorkspaceProviderBase {
 
   async destroy(info: WorkspaceInfo): Promise<void> {
     const activation = this.active.get(info.id)
-    const sandbox = activation?.sandbox ?? readMetadata(info).sandbox
+    const metadata = readMetadata(info)
+    const sandbox = activation?.sandbox ?? metadata.sandbox
     if (!sandbox) {
       if (this.active.size === 0) await this.closeControlProxy()
       throw new SandboxError("remove", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
     }
+    const expected = ownerFromMetadata(metadata)
+    if (activation && (metadata.sandbox !== activation.sandbox || !sameOwner(activation, expected))) throw ownershipError()
+    await this.assertOwned(sandbox, expected)
+    if (activation?.controlToken) this.revokeControlToken?.(activation.controlToken)
+    if (activation?.process) {
+      activation.process.terminate()
+      await waitForProcess(activation.process)
+    }
+    let failure: unknown
+    try {
+      await this.runSbx(["stop", sandbox], "detach")
+    } catch (error) {
+      failure = error
+    }
     try {
       await this.runSbx(["rm", "--force", sandbox], "remove")
+      this.owned.delete(sandbox)
+    } catch (error) {
+      failure ??= error
     } finally {
       this.active.delete(info.id)
       if (this.active.size === 0) await this.closeControlProxy()
     }
+    if (failure) throw failure
   }
 
   async dispose(): Promise<void> {
     const activations = [...this.active.values()]
-    this.active.clear()
+    for (const activation of activations) await this.assertOwned(activation.sandbox, activation)
     try {
       await Promise.all(activations.map(async (activation) => {
         if (activation.controlToken) this.revokeControlToken?.(activation.controlToken)
@@ -459,9 +519,11 @@ export class SbxProvider implements WorkspaceProviderBase {
           await waitForProcess(activation.process).catch(() => undefined)
         }
         await this.runSbx(["stop", activation.sandbox], "detach")
+        this.active.delete(activation.workspaceId)
+        this.owned.delete(activation.sandbox)
       }))
     } finally {
-      await this.closeControlProxy()
+      if (this.active.size === 0) await this.closeControlProxy()
     }
   }
 
@@ -483,18 +545,7 @@ export class SbxProvider implements WorkspaceProviderBase {
   }
 
   private async closeIsolated(info: WorkspaceInfo): Promise<void> {
-    let failure: unknown
-    try {
-      await this.release(info)
-    } catch (error) {
-      failure = error
-    }
-    try {
-      await this.destroy(info)
-    } catch (error) {
-      failure ??= error
-    }
-    if (failure) throw failure
+    await this.destroy(info)
   }
 
   async activate(workspaceId: string): Promise<void> {
@@ -520,7 +571,7 @@ export class SbxProvider implements WorkspaceProviderBase {
     }
   }
 
-  private async ensureSandbox(sandbox: string, hostPort: number): Promise<EnsuredSandbox> {
+  private async ensureSandbox(sandbox: string, hostPort: number, owner: SbxOwner): Promise<EnsuredSandbox> {
     const create = await this.runSbxRaw(
       [
         "create",
@@ -535,8 +586,18 @@ export class SbxProvider implements WorkspaceProviderBase {
       ],
       "provision",
     )
-    if (create.exitCode === 0) return { hostPort, created: true }
+    if (create.exitCode === 0) {
+      try {
+        await this.writeOwnership(sandbox, owner.ownershipId)
+      } catch (error) {
+        await this.runSbxRaw(["rm", "--force", sandbox], "remove").catch(() => undefined)
+        throw error
+      }
+      this.owned.set(sandbox, owner)
+      return { hostPort, created: true }
+    }
 
+    await this.assertOwned(sandbox, owner)
     const started = await this.runSbxRaw(["exec", sandbox, "true"], "provision")
     if (started.exitCode !== 0) {
       throw new SandboxError("provision", redactText(create.stderr || started.stderr || "could not create sandbox"), "SBX_CREATE")
@@ -551,6 +612,34 @@ export class SbxProvider implements WorkspaceProviderBase {
     const result = await this.runSbx(["ports", sandbox, "--json"], "tunnel")
     const mapping = parsePortMappings(result.stdout).find((item) => item.sandboxPort === this.remotePort && isLoopback(item.hostIp))
     return mapping?.hostPort
+  }
+
+  private async assertOwned(sandbox: string, expected: SbxOwner): Promise<void> {
+    const ownershipId = this.readOwnershipOverride
+      ? await this.readOwnershipOverride(sandbox)
+      : await this.readOwnership(sandbox)
+    if (!sameOwner(this.owned.get(sandbox), expected) || ownershipId !== expected.ownershipId) {
+      throw ownershipError()
+    }
+  }
+
+  private async writeOwnership(sandbox: string, ownershipId: string): Promise<void> {
+    if (this.writeOwnershipOverride) return this.writeOwnershipOverride(sandbox, ownershipId)
+    await this.runSbx(["exec", "-i", sandbox, "python3", "-c", REMOTE_WRITE_PATH, OWNERSHIP_FILE], "provision", `${ownershipId}\n`)
+  }
+
+  private async readOwnership(sandbox: string): Promise<string | undefined> {
+    const directory = await mkdtemp(join(tmpdir(), "opencode-sbx-owner-"))
+    const path = join(directory, "owner")
+    try {
+      const result = await this.runSbxRaw(["cp", `${sandbox}:${OWNERSHIP_FILE}`, path], "validate")
+      if (result.exitCode !== 0) return undefined
+      return (await readFile(path, "utf8")).trim()
+    } catch {
+      return undefined
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
   }
 
   private async cloneDirectory(sandbox: string): Promise<string> {
@@ -950,20 +1039,33 @@ export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions)
 }
 
 function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): SbxMetadata {
+  if (info.type !== "sbx") throw ownershipError()
   const value = isRecord(info.extra) ? info.extra : isRecord(from?.extra) ? from.extra : {}
   const state = isRecord(value.providerState) ? value.providerState : value
-  const metadata: SbxMetadata = { sessionId: info.id, generation: 1 }
+  const metadata: SbxMetadata = { sessionId: "", generation: 0, workspaceId: info.id, projectId: info.projectID }
   const field = (key: string): unknown => state[key] ?? value[key]
+  const provider = field("provider")
+  if (provider !== undefined && provider !== "sbx") throw ownershipError()
   const sessionId = field("sessionId")
   if (sessionId !== undefined && typeof sessionId !== "string") {
     throw new SandboxError("validate", "sandbox session ID is invalid", "SESSION_ID")
   }
   if (typeof sessionId === "string") metadata.sessionId = sessionId
+  if (!metadata.sessionId) throw ownershipError()
   const generation = field("generation")
   if (generation !== undefined && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1)) {
     throw new SandboxError("validate", "sandbox generation is invalid", "GENERATION_INVALID")
   }
   if (typeof generation === "number") metadata.generation = generation
+  if (metadata.generation < 1) throw ownershipError()
+  const workspaceId = field("workspaceId")
+  if (workspaceId !== undefined && workspaceId !== info.id) {
+    throw new SandboxError("validate", "sandbox workspace ownership is invalid", "SBX_OWNERSHIP_UNVERIFIED")
+  }
+  const projectId = field("projectId")
+  if (projectId !== undefined && projectId !== info.projectID) {
+    throw new SandboxError("validate", "sandbox project ownership is invalid", "SBX_OWNERSHIP_UNVERIFIED")
+  }
   const sandbox = field("sandbox")
   if (typeof sandbox === "string") {
     assertSandboxName(sandbox)
@@ -986,18 +1088,54 @@ function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): SbxMetadata {
     assertSha(baseSha)
     metadata.baseSha = baseSha
   }
+  const ownershipId = field("ownershipId")
+  if (ownershipId !== undefined) {
+    if (typeof ownershipId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(ownershipId)) throw ownershipError()
+    metadata.ownershipId = ownershipId
+  }
   return metadata
 }
 
 function metadataFor(activation: Activation): Record<string, unknown> {
   return {
+    provider: activation.provider,
     sessionId: activation.sessionId,
     generation: activation.generation,
+    workspaceId: activation.workspaceId,
+    projectId: activation.projectId,
     sandbox: activation.sandbox,
     hostPort: activation.hostPort,
     branch: activation.branch,
     baseSha: activation.baseSha,
+    ownershipId: activation.ownershipId,
   }
+}
+
+function ownerFromMetadata(metadata: SbxMetadata): SbxOwner {
+  return {
+    provider: "sbx",
+    ownershipId: metadata.ownershipId ?? "",
+    sessionId: metadata.sessionId,
+    generation: metadata.generation,
+    workspaceId: metadata.workspaceId,
+    projectId: metadata.projectId,
+  }
+}
+
+function sameOwner(actual: SbxOwner | undefined, expected: SbxOwner): boolean {
+  return Boolean(
+    actual &&
+    actual.provider === expected.provider &&
+    actual.ownershipId === expected.ownershipId &&
+    actual.sessionId === expected.sessionId &&
+    actual.generation === expected.generation &&
+    actual.workspaceId === expected.workspaceId &&
+    actual.projectId === expected.projectId
+  )
+}
+
+function ownershipError(): SandboxError {
+  return new SandboxError("validate", "SBX resource ownership could not be verified", "SBX_OWNERSHIP_UNVERIFIED")
 }
 
 function canonicalGitRemote(value: string): string | undefined {

@@ -64,7 +64,7 @@ projectId + sessionId + generation + workspaceId + provider
 
 `baseSha` and `branch` bind the Git lineage. Provider metadata binds the external resource. A control capability binds `sessionId`, `generation`, and role. Any destructive operation must establish this chain from the lifecycle record to the observed resource.
 
-This is the required ownership rule. The current provider adapters do not enforce it consistently. Names are conveniences, not proof of ownership. A matching `oc-sbx-*` prefix alone is insufficient for deletion.
+SBX and Cloudflare now require this tuple to match a resource observed as created by the current provider instance before reuse, stop, or destruction. SBX also compares a random external fingerprint through `sbx cp`, so a recreated name does not inherit ownership and inspection does not start a stopped sandbox. Names are conveniences, not proof of ownership. After plugin restart the process-local half of the proof is gone, so these providers fail closed until explicit adoption exists.
 
 ## Authoritative state
 
@@ -118,7 +118,7 @@ The command returns while activation is pending. The next message runs remotely 
 
 ### Delete
 
-Normal deletion attempts to preserve changes before destruction. `delete --force` is host-only and is limited to a detached runtime or explicit discard after sync failure. The lifecycle should block unknown ownership, but the current SBX and Cloudflare adapters can destroy by recorded name or ID without independent ownership proof. Perform the operator preflight in the runbook until Phase 0 closes this gap.
+Normal deletion attempts to preserve changes before destruction. `delete --force` is host-only and is limited to a detached runtime or explicit discard after sync failure. SBX and Cloudflare block unknown ownership even when force is requested. A control-lost resource still requires the operator preflight in the runbook because automatic inspection and adoption are not available.
 
 ### Recovery
 
@@ -190,9 +190,11 @@ The current implementation has documented gaps, not hidden assumptions:
 
 - Plugin disposal drops Sandcastle handles without closing their sessions.
 - A restarted plugin cannot inspect, adopt, or delete a control-lost runtime through `sandboxctl`.
-- SBX and Cloudflare reuse or destruction do not consistently prove provider-resource ownership.
+- SBX and Cloudflare ownership proof is process-local; a restarted plugin cannot inspect or adopt a previously owned resource.
+- The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path recreates the runtime.
 - `delete`, `retry`, and reconciliation do not hold the record lock across their complete decision and write.
 - A missing Sandcastle handle can be marked deleted without proving the provider resource is absent.
+- Provider cleanup failure before workspace registration can leave a resource whose ID never reached the lifecycle record.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.
 - Default `diagnose` reports only that diagnostics are not configured.
 
