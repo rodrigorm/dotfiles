@@ -181,7 +181,8 @@ Progress on 2026-09-02:
 - Completed: redact and bound logs, diagnostics, and recovery metadata before response serialization.
 - Completed: require the exact ownership tuple observed by the current SBX or Cloudflare provider instance before reuse, stop, or destruction.
 - Completed: await idempotent plugin disposal, cancel idle work, and close every owned Sandcastle session.
-- Remaining: serialization.
+- Completed: hold the session record lock across delete, retry, and reconciliation effects and final writes.
+- Phase 0 complete.
 
 Changes:
 

@@ -169,127 +169,33 @@ export class LifecycleController {
   }
 
   private async processSessionIdle(sessionId: string, expected?: { record: SandboxRecord; capability: ControlCapability }): Promise<void> {
-    await this.store.withRecordLock(sessionId, async (record, write) => {
-      if (!record) {
-        if (expected) throw retryStale()
-        return
-      }
-      if (expected) {
-        if (!sameRetryRecord(record, expected.record)) throw retryStale()
-        this.assertCapability(record, expected.capability)
-        this.assertOperationAllowed(record, { operation: "retry", force: false, capability: expected.capability })
-      }
-      if (this.sandcastle) {
-        try {
-          await this.onSandcastleIdle(record, write)
-        } catch (error) {
-          this.rejectTargetGate(record.workspaceId, error)
-          await write({
-            ...record,
-            state: failureState(error, Boolean(this.sandcastle)),
-            operation: failedOperation(record, error, Boolean(this.sandcastle)),
-            updatedAt: this.now().toISOString(),
-            lastError: {
-              stage: failureStage(error),
-              message: redactError(error),
-            },
-          })
-        }
-        return
-      }
-      let current = record
-      if (record.state === "remote") {
-        if (!this.workspace.syncOut) return
-        try {
-          await this.syncOut(record)
-        } catch (error) {
-          await write({
-            ...record,
-            state: failureState(error, false),
-            operation: failedOperation(record, error, false),
-            updatedAt: this.now().toISOString(),
-            lastError: {
-              stage: failureStage(error),
-              message: redactError(error),
-            },
-          })
-        }
-        return
-      }
-      if (!isTransitionPending(record.state)) return
+    await this.store.withRecordLock(sessionId, (record, write) => this.processSessionIdleLocked(sessionId, record, write, expected))
+  }
 
+  private async processSessionIdleLocked(
+    sessionId: string,
+    record: SandboxRecord | undefined,
+    write: (record: SandboxRecord) => Promise<void>,
+    expected?: { record: SandboxRecord; capability: ControlCapability },
+  ): Promise<void> {
+    if (!record) {
+      if (expected) throw retryStale()
+      return
+    }
+    if (expected) {
+      if (!sameRetryRecord(record, expected.record)) throw retryStale()
+      this.assertCapability(record, expected.capability)
+      this.assertOperationAllowed(record, { operation: "retry", force: false, capability: expected.capability })
+    }
+    if (this.sandcastle) {
       try {
-        if (record.state === "activation_pending") {
-          await this.waitForSync(record)
-          await this.workspace.warp({ sessionId, workspaceId: record.workspaceId, directory: record.directory })
-          await write({
-            ...record,
-            state: "remote",
-            operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
-            updatedAt: this.now().toISOString(),
-            lastError: undefined,
-          })
-          return
-        }
-
-        if (record.state === "stop_pending" || (record.state === "recovery_pending" && record.operation?.kind !== "delete")) {
-          if (record.operation?.kind === "stop" || record.operation?.phase === "remote") await this.syncOut(record)
-          await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
-          await this.cleanupWorkspace(record)
-          const nextState = "detached"
-          assertTransition(record.state, nextState)
-          await write({
-            ...record,
-            state: nextState,
-            operation: record.operation ? { ...record.operation, phase: "detached" } : undefined,
-            updatedAt: this.now().toISOString(),
-            lastError: undefined,
-          })
-          return
-        }
-
-        if (record.state === "delete_pending" || (record.state === "recovery_pending" && record.operation?.kind === "delete")) {
-          const discarding = record.operation?.phase === "discarding"
-          const workspaceStillAttached = !discarding && !["removing", "destroying"].includes(record.operation?.phase ?? "")
-          if (workspaceStillAttached && record.workspaceId) {
-            await this.syncOut(record)
-            await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
-            current = {
-              ...record,
-              operation: record.operation ? { ...record.operation, phase: "removing" } : undefined,
-              updatedAt: this.now().toISOString(),
-            }
-            await write(current)
-          }
-          if (current.operation?.phase === "removing" || current.operation?.phase === "discarding" || workspaceStillAttached) {
-            await this.cleanupWorkspace(current)
-            current = {
-              ...current,
-              operation: current.operation ? { ...current.operation, phase: "destroying" } : undefined,
-              updatedAt: this.now().toISOString(),
-            }
-            await write(current)
-          }
-          if (this.providerDestroy) await this.providerDestroy(current)
-          else {
-            if (!this.infrastructure.remove) {
-              throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
-            }
-            await this.infrastructure.remove(current)
-          }
-          await write({
-            ...current,
-            state: "deleted",
-            operation: current.operation ? { ...current.operation, phase: "deleted" } : undefined,
-            updatedAt: this.now().toISOString(),
-            lastError: undefined,
-          })
-        }
+        await this.onSandcastleIdle(record, write)
       } catch (error) {
+        this.rejectTargetGate(record.workspaceId, error)
         await write({
-          ...current,
-          state: failureState(error, false),
-          operation: failedOperation(current, error, false),
+          ...record,
+          state: failureState(error, Boolean(this.sandcastle)),
+          operation: failedOperation(record, error, Boolean(this.sandcastle)),
           updatedAt: this.now().toISOString(),
           lastError: {
             stage: failureStage(error),
@@ -297,7 +203,108 @@ export class LifecycleController {
           },
         })
       }
-    })
+      return
+    }
+    let current = record
+    if (record.state === "remote") {
+      if (!this.workspace.syncOut) return
+      try {
+        await this.syncOut(record)
+      } catch (error) {
+        await write({
+          ...record,
+          state: failureState(error, false),
+          operation: failedOperation(record, error, false),
+          updatedAt: this.now().toISOString(),
+          lastError: {
+            stage: failureStage(error),
+            message: redactError(error),
+          },
+        })
+      }
+      return
+    }
+    if (!isTransitionPending(record.state)) return
+
+    try {
+      if (record.state === "activation_pending") {
+        await this.waitForSync(record)
+        await this.workspace.warp({ sessionId, workspaceId: record.workspaceId, directory: record.directory })
+        await write({
+          ...record,
+          state: "remote",
+          operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        })
+        return
+      }
+
+      if (record.state === "stop_pending" || (record.state === "recovery_pending" && record.operation?.kind !== "delete")) {
+        if (record.operation?.kind === "stop" || record.operation?.phase === "remote") await this.syncOut(record)
+        await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
+        await this.cleanupWorkspace(record)
+        const nextState = "detached"
+        assertTransition(record.state, nextState)
+        await write({
+          ...record,
+          state: nextState,
+          operation: record.operation ? { ...record.operation, phase: "detached" } : undefined,
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        })
+        return
+      }
+
+      if (record.state === "delete_pending" || (record.state === "recovery_pending" && record.operation?.kind === "delete")) {
+        const discarding = record.operation?.phase === "discarding"
+        const workspaceStillAttached = !discarding && !["removing", "destroying"].includes(record.operation?.phase ?? "")
+        if (workspaceStillAttached && record.workspaceId) {
+          await this.syncOut(record)
+          await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
+          current = {
+            ...record,
+            operation: record.operation ? { ...record.operation, phase: "removing" } : undefined,
+            updatedAt: this.now().toISOString(),
+          }
+          await write(current)
+        }
+        if (current.operation?.phase === "removing" || current.operation?.phase === "discarding" || workspaceStillAttached) {
+          await this.cleanupWorkspace(current)
+          current = {
+            ...current,
+            operation: current.operation ? { ...current.operation, phase: "destroying" } : undefined,
+            updatedAt: this.now().toISOString(),
+          }
+          await write(current)
+        }
+        if (this.providerDestroy) await this.providerDestroy(current)
+        else {
+          if (!this.infrastructure.remove) {
+            throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
+          }
+          await this.infrastructure.remove(current)
+        }
+        await write({
+          ...current,
+          state: "deleted",
+          operation: current.operation ? { ...current.operation, phase: "deleted" } : undefined,
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        })
+      }
+    } catch (error) {
+      await write({
+        ...current,
+        state: failureState(error, false),
+        operation: failedOperation(current, error, false),
+        updatedAt: this.now().toISOString(),
+        lastError: {
+          stage: failureStage(error),
+          message: redactError(error),
+        },
+      })
+    }
   }
 
   async assertMessageAllowed(sessionId: string): Promise<void> {
@@ -314,32 +321,41 @@ export class LifecycleController {
     }
   }
 
-  async reconcile(projectId?: string): Promise<void> {
-    for (const record of await this.store.list()) {
-      if (projectId && record.projectId !== projectId) continue
-      if (this.sandcastle && isSandcastleActive(record.state) && !this.sessions.has(record.sessionId)) {
-        await this.store.write({
+  reconcile(projectId?: string): Promise<void> {
+    return this.track(this.reconcileRecords(projectId))
+  }
+
+  private async reconcileRecords(projectId?: string): Promise<void> {
+    for (const candidate of await this.store.list()) {
+      if (projectId && candidate.projectId !== projectId) continue
+      await this.store.withRecordLock(candidate.sessionId, async (record, write) => {
+        if (!record || (projectId && record.projectId !== projectId)) return
+        if (this.sandcastle && isSandcastleActive(record.state) && !this.sessions.has(record.sessionId)) {
+          await write({
+            ...record,
+            state: "orphaned",
+            operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
+            updatedAt: this.now().toISOString(),
+            lastError: {
+              stage: "reconcile",
+              message: "Sandcastle session handle is unavailable; manual recovery is required",
+            },
+          })
+          return
+        }
+        if (this.sandcastle && isSandcastleActive(record.state)) return
+        if (record.state !== "provisioning" && record.state !== "activation_pending" && record.state !== "remote" && record.state !== "stop_pending" && record.state !== "delete_pending") return
+        assertTransition(record.state, "recovery_pending")
+        const next: SandboxRecord = {
           ...record,
-          state: "orphaned",
-          operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
+          state: "recovery_pending",
+          operation: record.operation ? { ...record.operation } : undefined,
           updatedAt: this.now().toISOString(),
-          lastError: {
-            stage: "reconcile",
-            message: "Sandcastle session handle is unavailable; manual recovery is required",
-          },
-        })
-        continue
-      }
-      if (record.state !== "provisioning" && record.state !== "activation_pending" && record.state !== "remote" && record.state !== "stop_pending" && record.state !== "delete_pending") continue
-      assertTransition(record.state, "recovery_pending")
-      await this.store.write({
-        ...record,
-        state: "recovery_pending",
-        operation: record.operation ? { ...record.operation } : undefined,
-        updatedAt: this.now().toISOString(),
-        lastError: undefined,
+          lastError: undefined,
+        }
+        await write(next)
+        await this.processSessionIdleLocked(record.sessionId, next, write)
       })
-      await this.onSessionIdle(record.sessionId)
     }
   }
 
@@ -383,7 +399,7 @@ export class LifecycleController {
     write: (record: SandboxRecord) => Promise<void>,
   ): Promise<void> {
     if (record.state === "remote") return
-    if (record.state === "activation_pending") {
+    if (record.state === "activation_pending" || (record.state === "recovery_pending" && record.operation?.kind === "start")) {
       const session = this.sessions.get(record.sessionId)
       if (!session) throw new SandboxError("reconcile", "Sandcastle session handle is unavailable", "SANDCASTLE_HANDLE")
       if (!this.workspace.replaySession || !this.workspace.startSync || !this.workspace.waitForSync) {
@@ -395,6 +411,7 @@ export class LifecycleController {
       await this.withTarget(record.workspaceId, session.target, () => this.workspace.startSync!({ directory: record.directory }))
       await this.workspace.waitForSync({ workspaceId: record.workspaceId, directory: record.directory, timeoutMs: 30_000 })
       await this.workspace.replaySession({ sessionId: record.sessionId, directory: record.directory, target: session.target })
+      assertTransition(record.state, "remote")
       await write({
         ...record,
         state: "remote",
@@ -405,7 +422,11 @@ export class LifecycleController {
       this.resolveTargetGate(record.workspaceId, session.target)
       return
     }
-    if (record.state !== "stop_pending" && record.state !== "delete_pending") return
+    if (
+      record.state !== "stop_pending" &&
+      record.state !== "delete_pending" &&
+      !(record.state === "recovery_pending" && (record.operation?.kind === "stop" || record.operation?.kind === "delete"))
+    ) return
 
     const session = this.sessions.get(record.sessionId)
     if (!session) {
@@ -465,19 +486,21 @@ export class LifecycleController {
     this.targets.delete(record.workspaceId)
   }
 
-  private async start(capability: ControlCapability): Promise<SandboxResponse> {
-    if (this.sandcastle) return this.startWithSandcastle(capability)
+  private async start(capability: ControlCapability, expected?: SandboxRecord): Promise<SandboxResponse> {
+    if (this.sandcastle) return this.startWithSandcastle(capability, expected)
 
     const context = this.contexts.get(capability.sessionId)
     if (!context) throw new SandboxError("validate", "session context is not available", "SESSION_CONTEXT")
 
     return this.store.withRecordLock(capability.sessionId, async (existing, write) => {
+      if (expected && (!existing || !sameRetryRecord(existing, expected))) throw retryStale()
       this.assertCapability(existing, capability)
       this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
       if (existing?.state === "remote") return successResponse("start", existing, "session is already remote")
       if (existing && (existing.state === "provisioning" || existing.state === "activation_pending")) {
         return successResponse("start", existing, "session activation is already pending")
       }
+      if (existing && isTransitionPending(existing.state)) throw new SandboxError("transition", "cannot start while another transition is pending", "START_TRANSITION")
       if (existing?.state === "deleted") throw new SandboxError("validate", "session workspace has already been deleted", "SESSION_DELETED")
       if (existing && existing.provider !== this.providerType) {
         throw new SandboxError("validate", `session belongs to provider ${existing.provider}`, "PROVIDER_MISMATCH")
@@ -600,19 +623,21 @@ export class LifecycleController {
     })
   }
 
-  private async startWithSandcastle(capability: ControlCapability): Promise<SandboxResponse> {
+  private async startWithSandcastle(capability: ControlCapability, expected?: SandboxRecord): Promise<SandboxResponse> {
     const factory = this.sandcastle
     if (!factory) throw new SandboxError("validate", "Sandcastle session factory is unavailable", "SANDCASTLE_UNAVAILABLE")
     const context = this.contexts.get(capability.sessionId)
     if (!context) throw new SandboxError("validate", "session context is not available", "SESSION_CONTEXT")
 
     return this.store.withRecordLock(capability.sessionId, async (existing, write) => {
+      if (expected && (!existing || !sameRetryRecord(existing, expected))) throw retryStale()
       this.assertCapability(existing, capability)
       this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
       if (existing?.state === "remote") return successResponse("start", existing, "session is already remote")
       if (existing && (existing.state === "provisioning" || existing.state === "activation_pending")) {
         return successResponse("start", existing, "session activation is already pending")
       }
+      if (existing && isTransitionPending(existing.state)) throw new SandboxError("transition", "cannot start while another transition is pending", "START_TRANSITION")
       if (existing?.state === "deleted") throw new SandboxError("validate", "session workspace has already been deleted", "SESSION_DELETED")
       if (existing?.state === "sync_failed") {
         throw new SandboxError("transition", "session sync failed; retry or discard it first", "SESSION_SYNC_FAILED")
@@ -830,7 +855,7 @@ export class LifecycleController {
     const decision = await this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "delete", force, capability })
-      if (!record || record.state === "deleted") return { record, forceDiscard: false }
+      if (!record || record.state === "deleted") return { record, forceDiscard: false, alreadyDeleted: true }
       const forceDiscard = force && record.state === "sync_failed"
       if (force && (capability.role !== "host" || (record.state !== "detached" && !forceDiscard))) {
         throw new SandboxError("remove", "force delete is available only on the host after stop", "FORCE_DELETE_SCOPE")
@@ -858,15 +883,19 @@ export class LifecycleController {
       }
       assertTransition(record.state, next.state)
       await write(next)
-      return { record: next, forceDiscard }
+      if (!force) return { record: next, forceDiscard, alreadyDeleted: false }
+
+      let final = next
+      await this.processSessionIdleLocked(capability.sessionId, next, async (updated) => {
+        final = updated
+        await write(updated)
+      }, { record: next, capability })
+      return { record: final, forceDiscard, alreadyDeleted: false }
     })
 
-    const next = decision.record
-    if (!next || next.state === "deleted") return successResponse("delete", next, "Sandbox is already deleted")
-    if (!force) return successResponse("delete", next, "Delete agendado; a resposta atual sera concluida primeiro.")
-
-    await this.onSessionIdle(capability.sessionId, { record: next, capability })
-    const final = await this.store.get(capability.sessionId)
+    const final = decision.record
+    if (decision.alreadyDeleted) return successResponse("delete", final, "Sandbox is already deleted")
+    if (!force) return successResponse("delete", final, "Delete agendado; a resposta atual sera concluida primeiro.")
     if (final?.state !== "deleted") {
       const lastError = final?.lastError ?? { stage: "remove", message: "sandbox removal is still pending" }
       return failureResponse("delete", final?.state ?? "error", lastError.stage, lastError.message, final)
@@ -880,8 +909,19 @@ export class LifecycleController {
       throw new SandboxError("reconcile", "session sandbox is orphaned; manual recovery is required", "SESSION_ORPHANED")
     }
     if (record?.state === "recovery_pending") {
-      await this.onSessionIdle(record.sessionId, { record, capability })
-      return successResponse("retry", (await this.store.get(record.sessionId)) ?? record, "Retry completed.")
+      return this.store.withRecordLock(record.sessionId, async (current, write) => {
+        if (!current || !sameRetryRecord(current, record)) throw retryStale()
+        let final = current
+        await this.processSessionIdleLocked(record.sessionId, current, async (updated) => {
+          final = updated
+          await write(updated)
+        }, { record, capability })
+        if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned" || final.state === "recovery_pending") {
+          const lastError = final.lastError ?? { stage: "reconcile", message: "retry did not complete" }
+          return failureResponse("retry", final.state, lastError.stage, lastError.message, final)
+        }
+        return successResponse("retry", final, "Retry completed.")
+      })
     }
     if (!record || (record.state !== "error" && record.state !== "sync_failed")) {
       return successResponse("retry", record, "there is no failed operation to retry")
@@ -890,7 +930,7 @@ export class LifecycleController {
     if (operation === "start") {
       if (record.operation?.phase === "awaiting_idle") return this.retryPending(capability, record, "activation_pending", "start", "awaiting_idle")
       if (record.operation?.phase === "remote") return this.retryRemoteSync(capability, record)
-      return this.start(capability)
+      return this.start(capability, record)
     }
     if (operation === "stop") return this.retryPending(capability, record, "stop_pending", "stop", "awaiting_idle")
     if (operation === "delete") {
@@ -910,7 +950,7 @@ export class LifecycleController {
     kind: "start" | "stop" | "delete",
     phase: string,
   ): Promise<SandboxResponse> {
-    const next = await this.store.withRecordLock(record.sessionId, async (current, write) => {
+    return this.store.withRecordLock(record.sessionId, async (current, write) => {
       if (!current || !sameRetryRecord(current, record)) throw retryStale()
       this.assertCapability(current, capability)
       this.assertOperationAllowed(current, { operation: "retry", force: false, capability })
@@ -927,15 +967,17 @@ export class LifecycleController {
       }
       assertTransition(current.state, next.state)
       await write(next)
-      return next
+      let final = next
+      await this.processSessionIdleLocked(record.sessionId, next, async (updated) => {
+        final = updated
+        await write(updated)
+      }, { record: next, capability })
+      if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned") {
+        const lastError = final.lastError ?? { stage: "reconcile", message: "retry failed" }
+        return failureResponse("retry", final.state, lastError.stage, lastError.message, final)
+      }
+      return successResponse("retry", final, "Retry completed.")
     })
-    await this.onSessionIdle(record.sessionId, { record: next, capability })
-    const final = (await this.store.get(record.sessionId)) ?? next
-    if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned") {
-      const lastError = final.lastError ?? { stage: "reconcile", message: "retry failed" }
-      return failureResponse("retry", final.state, lastError.stage, lastError.message, final)
-    }
-    return successResponse("retry", final, "Retry completed.")
   }
 
   private async retryRemoteSync(capability: ControlCapability, record: SandboxRecord): Promise<SandboxResponse> {

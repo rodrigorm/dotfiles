@@ -111,6 +111,7 @@ describe("lifecycle state", () => {
     expect(canTransition("stop_pending", "sync_failed")).toBe(true)
     expect(canTransition("sync_failed", "stop_pending")).toBe(true)
     expect(canTransition("sync_failed", "orphaned")).toBe(true)
+    expect(canTransition("recovery_pending", "remote")).toBe(true)
   })
 })
 
@@ -648,6 +649,164 @@ describe("lifecycle controller", () => {
     await expect(controller.handle({ operation: "retry", force: false, capability })).resolves.toMatchObject({ state: "deleted" })
     expect(removeCalls).toBe(2)
     expect(destroyCalls).toBe(2)
+  })
+
+  it("holds the record lock through force-delete destruction", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write({ ...makeRecord(), state: "detached" })
+    let unblockDestroy!: () => void
+    let destroyStarted!: () => void
+    const started = new Promise<void>((resolve) => { destroyStarted = resolve })
+    const controller = new LifecycleController({
+      store,
+      providerDestroy: async () => {
+        destroyStarted()
+        await new Promise<void>((resolve) => { unblockDestroy = resolve })
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+
+    const deleting = controller.handle({ operation: "delete", force: true, capability })
+    await started
+    const concurrent = await controller.handle({ operation: "delete", force: true, capability })
+    unblockDestroy()
+
+    expect(concurrent).toMatchObject({ ok: false, stage: "validate" })
+    expect(concurrent.message).toMatch(/locked/)
+    await expect(deleting).resolves.toMatchObject({ ok: true, state: "deleted" })
+  })
+
+  it("allows only one concurrent retry to perform destruction", async () => {
+    let unblockReads!: () => void
+    let readsStarted!: () => void
+    const readsReady = new Promise<void>((resolve) => { readsStarted = resolve })
+    const readGate = new Promise<void>((resolve) => { unblockReads = resolve })
+    const store = new (class extends FileStateStore {
+      private reads = 0
+
+      override async get(sessionId: string) {
+        const record = await super.get(sessionId)
+        if (this.reads < 2) {
+          this.reads++
+          if (this.reads === 2) readsStarted()
+          await readGate
+        }
+        return record
+      }
+    })(await temporaryDirectory())
+    await store.write({
+      ...makeRecord(),
+      state: "error",
+      operation: { kind: "delete", phase: "destroying" },
+      lastError: { stage: "remove", message: "destroy failed" },
+    })
+    let unblockDestroy!: () => void
+    let destroyStarted!: () => void
+    let destroyCalls = 0
+    const destroying = new Promise<void>((resolve) => { destroyStarted = resolve })
+    const controller = new LifecycleController({
+      store,
+      providerDestroy: async () => {
+        destroyCalls++
+        destroyStarted()
+        await new Promise<void>((resolve) => { unblockDestroy = resolve })
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+
+    const retries = [
+      controller.handle({ operation: "retry", force: false, capability }),
+      controller.handle({ operation: "retry", force: false, capability }),
+    ]
+    await readsReady
+    unblockReads()
+    await destroying
+    const concurrent = await Promise.race(retries)
+    expect(concurrent).toMatchObject({ ok: false, stage: "validate" })
+    expect(concurrent.message).toMatch(/locked/)
+    unblockDestroy()
+    const results = await Promise.all(retries)
+
+    expect(results.filter((result) => result.ok)).toHaveLength(1)
+    expect(destroyCalls).toBe(1)
+    expect(await store.get("ses_1")).toMatchObject({ state: "deleted" })
+  })
+
+  it("holds the record lock through reconciliation effects", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write({ ...makeRecord(), state: "remote" })
+    let unblockRelease!: () => void
+    let releaseStarted!: () => void
+    const started = new Promise<void>((resolve) => { releaseStarted = resolve })
+    const controller = new LifecycleController({
+      store,
+      providerRelease: async () => {
+        releaseStarted()
+        await new Promise<void>((resolve) => { unblockRelease = resolve })
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+
+    const reconciliation = controller.reconcile("prj_1")
+    await started
+    const concurrent = await controller.handle({ operation: "delete", force: false, capability })
+    unblockRelease()
+    await reconciliation
+
+    expect(concurrent).toMatchObject({ ok: false, stage: "validate" })
+    expect(concurrent.message).toMatch(/locked/)
+    expect(await store.get("ses_1")).toMatchObject({ state: "detached" })
+  })
+
+  it("reconciles the latest record instead of a stale list snapshot", async () => {
+    let unblockList!: () => void
+    let listStarted!: () => void
+    const started = new Promise<void>((resolve) => { listStarted = resolve })
+    const store = new (class extends FileStateStore {
+      override async list() {
+        const records = await super.list()
+        listStarted()
+        await new Promise<void>((resolve) => { unblockList = resolve })
+        return records
+      }
+    })(await temporaryDirectory())
+    await store.write({ ...makeRecord(), state: "remote" })
+    let destroyCalls = 0
+    const controller = new LifecycleController({
+      store,
+      providerDestroy: async () => { destroyCalls++ },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async syncOut(input) { return { kind: "control-plane", baseSha: input.baseSha } },
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+
+    const reconciliation = controller.reconcile("prj_1")
+    await started
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({ state: "delete_pending" })
+    unblockList()
+    await reconciliation
+
+    expect(await store.get("ses_1")).toMatchObject({ state: "deleted" })
+    expect(destroyCalls).toBe(1)
   })
 
   it("does not let a remote capability retry a failed start", async () => {

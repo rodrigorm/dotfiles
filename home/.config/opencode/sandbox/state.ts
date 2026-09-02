@@ -10,7 +10,7 @@ const TRANSITIONS: Record<SandboxState, readonly SandboxState[]> = {
   detached: ["provisioning", "delete_pending", "deleted", "error"],
   delete_pending: ["deleted", "sync_failed", "error", "recovery_pending"],
   deleted: [],
-  recovery_pending: ["detached", "deleted", "error", "orphaned"],
+  recovery_pending: ["remote", "detached", "deleted", "error", "orphaned"],
   orphaned: [],
   error: ["provisioning", "activation_pending", "remote", "stop_pending", "delete_pending", "recovery_pending", "sync_failed", "orphaned"],
 }

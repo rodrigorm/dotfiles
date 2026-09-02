@@ -192,7 +192,6 @@ The current implementation has documented gaps, not hidden assumptions:
 - A restarted plugin cannot inspect, adopt, or delete a control-lost runtime through `sandboxctl`.
 - SBX and Cloudflare ownership proof is process-local; a restarted plugin cannot inspect or adopt a previously owned resource.
 - The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path recreates the runtime.
-- `delete`, `retry`, and reconciliation do not hold the record lock across their complete decision and write.
 - A missing Sandcastle handle can be marked deleted without proving the provider resource is absent.
 - Provider cleanup failure before workspace registration can leave a resource whose ID never reached the lifecycle record.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.

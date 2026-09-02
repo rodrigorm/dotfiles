@@ -312,6 +312,20 @@ describe("Sandcastle lifecycle", () => {
     expect(resources.handle?.closed).toBe(true)
   })
 
+  it("does not replace a Sandcastle workspace while delete is pending", async () => {
+    const setup = await setupFakeLifecycle()
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+    await setup.controller.handle({ operation: "delete", force: false, capability: setup.capability })
+
+    const restarted = await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+
+    expect(restarted).toMatchObject({ ok: false, state: "delete_pending", stage: "transition" })
+    expect(setup.calls.filter((call) => call === "worktree:create")).toHaveLength(1)
+    await setup.controller.onSessionIdle("ses_1")
+    expect(await setup.store.get("ses_1")).toMatchObject({ state: "deleted" })
+  })
+
   it("marks active Sandcastle records orphaned after restart", async () => {
     const setup = await setupFakeLifecycle()
     const record = {
