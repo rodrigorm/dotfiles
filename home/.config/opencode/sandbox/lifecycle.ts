@@ -23,6 +23,8 @@ import {
   type SandcastleSessionFactory,
 } from "./sandcastle-session"
 
+const MAX_DIAGNOSTIC_BYTES = 64 * 1024
+
 export interface InfrastructureOperations {
   remove?(record: SandboxRecord): Promise<void>
   diagnose?(record: SandboxRecord): Promise<Record<string, unknown>>
@@ -743,14 +745,17 @@ export class LifecycleController {
 
   private async logs(record: SandboxRecord | undefined): Promise<SandboxResponse> {
     if (!record) return successResponse("logs", undefined, "no sandbox session is associated")
-    const logs = this.infrastructure.logs ? await this.infrastructure.logs(record) : []
-    return successResponse("logs", record, logs.join("\n"), { logs })
+    const output = boundedText((this.infrastructure.logs ? await this.infrastructure.logs(record) : []).join("\n"))
+    return successResponse("logs", record, output.value, {
+      logs: output.value ? output.value.split("\n") : [],
+      ...(output.truncated ? { truncated: true } : {}),
+    })
   }
 
   private async diagnose(record: SandboxRecord | undefined): Promise<SandboxResponse> {
     if (!record) return successResponse("diagnose", undefined, "no sandbox session is associated")
     const details = this.infrastructure.diagnose
-      ? nonSecretDetails(await this.infrastructure.diagnose(record))
+      ? boundedDetails(nonSecretDetails(await this.infrastructure.diagnose(record)))
       : { configured: false }
     return successResponse("diagnose", record, "diagnostics completed", details)
   }
@@ -1029,6 +1034,22 @@ function nonSecretValue(value: unknown): unknown {
   return typeof value === "string" ? redactText(value) : value
 }
 
+function boundedDetails(details: Record<string, unknown>): Record<string, unknown> {
+  const output = boundedText(JSON.stringify(details))
+  return output.truncated ? { truncated: true, preview: output.value } : details
+}
+
+function boundedText(value: string): { value: string; truncated: boolean } {
+  const redacted = redactText(value)
+  const bytes = Buffer.from(redacted)
+  if (bytes.byteLength <= MAX_DIAGNOSTIC_BYTES) return { value: redacted, truncated: false }
+  const suffix = "\n[truncated]"
+  return {
+    value: `${bytes.subarray(0, MAX_DIAGNOSTIC_BYTES - Buffer.byteLength(suffix)).toString("utf8")}${suffix}`,
+    truncated: true,
+  }
+}
+
 function workspaceIdFor(sessionId: string, generation: number): string {
   const compact = Buffer.from(`${sessionId}:${generation}`).toString("base64url").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40)
   return `wrk_${compact}`
@@ -1129,7 +1150,7 @@ function failureResponse(operation: "start" | "stop" | "status" | "delete" | "lo
 
 function recordDetails(record: SandboxRecord | undefined): Record<string, unknown> {
   if (!record) return {}
-  const recoveryMetadata = nonSecretDetails(record.providerState)
+  const recoveryMetadata = boundedDetails(nonSecretDetails(record.providerState))
   return {
     branch: record.branch,
     provider: record.provider,

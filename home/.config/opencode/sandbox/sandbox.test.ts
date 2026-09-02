@@ -802,6 +802,34 @@ describe("lifecycle controller", () => {
     expect(JSON.stringify(result)).not.toContain("secret")
   })
 
+  it("redacts and bounds logs and diagnostics before returning them", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "orphaned" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      infrastructure: {
+        diagnose: async () => ({ output: `token=private ${"x".repeat(100_000)}` }),
+        logs: async () => [`Authorization: Bearer private`, "x".repeat(100_000)],
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { throw new Error("must not warp") },
+        async remove() { throw new Error("must not remove") },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const logs = await controller.handle({ operation: "logs", force: false, capability })
+    const diagnostics = await controller.handle({ operation: "diagnose", force: false, capability })
+
+    expect(logs.details).toMatchObject({ truncated: true })
+    expect(diagnostics.details).toMatchObject({ truncated: true })
+    expect(Buffer.byteLength(JSON.stringify(logs))).toBeLessThan(140_000)
+    expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThan(70_000)
+    expect(`${JSON.stringify(logs)}${JSON.stringify(diagnostics)}`).not.toContain("private")
+  })
+
   it("finishes a detached delete recovery", async () => {
     const store = new FileStateStore(await temporaryDirectory())
     await store.write({

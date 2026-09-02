@@ -178,7 +178,8 @@ Progress on 2026-09-02:
 - Completed: route workspace creation and replay through the requested directory and injected transport.
 - Completed: remove the OpenCode workspace registration when Sandcastle start fails.
 - Completed: fail explicitly when neither the local Bun source nor the remote Node bundle is available.
-- Remaining: disposal, ownership proof, serialization, and bounded diagnostics.
+- Completed: redact and bound logs, diagnostics, and recovery metadata before response serialization.
+- Remaining: disposal, ownership proof, and serialization.
 
 Changes:
 

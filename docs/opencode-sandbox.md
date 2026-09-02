@@ -194,7 +194,7 @@ The current implementation has documented gaps, not hidden assumptions:
 - `delete`, `retry`, and reconciliation do not hold the record lock across their complete decision and write.
 - A missing Sandcastle handle can be marked deleted without proving the provider resource is absent.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.
-- Default `diagnose` reports only that diagnostics are not configured. Log production is not redacted or bounded before transport.
+- Default `diagnose` reports only that diagnostics are not configured.
 
 The ordered fix plan and acceptance criteria live in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
 
