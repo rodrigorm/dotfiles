@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 
-set -o errexit
-set -o nounset
-set -o pipefail
+set -euo pipefail
 
 script_path="${BASH_SOURCE[0]}"
 while [[ -L "$script_path" ]]; do
@@ -16,4 +14,8 @@ while [[ -L "$script_path" ]]; do
 done
 
 script_dir="$(cd -P "$(dirname "$script_path")" && pwd)"
-exec bun "$script_dir/../.config/opencode/exedev/cli.ts" "$@"
+cli_source="$script_dir/../.config/opencode/sandbox/cli.ts"
+if command -v bun >/dev/null 2>&1 && [[ -f "$cli_source" ]]; then
+    exec bun "$cli_source" "$@"
+fi
+exec node "$script_dir/../.config/opencode/sandbox/cli.mjs" "$@"

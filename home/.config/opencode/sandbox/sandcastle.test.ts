@@ -1,0 +1,763 @@
+import { afterEach, describe, expect, it } from "bun:test"
+import { spawn } from "node:child_process"
+import { cp, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { dirname, join } from "node:path"
+
+import {
+  createIsolatedSandboxProvider,
+  createWorktree,
+  type IsolatedSandboxHandle,
+  type Sandbox,
+  type Worktree,
+} from "@ai-hero/sandcastle"
+
+import { createCapability } from "./control-channel"
+import { LifecycleController } from "./lifecycle"
+import { nodeProcessRunner } from "./process"
+import { FileStateStore } from "./state-store"
+import { runSyncBarrier } from "./sync-barrier"
+import { captureWorkingTree } from "./working-tree"
+import type { SandcastleSessionFactory } from "./sandcastle-session"
+import type { SessionContext } from "./types"
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
+})
+
+describe("Sandcastle sync barrier", () => {
+  it("syncs out-of-band commits and dirty files through the public lifecycle", async () => {
+    const repository = await createRepository()
+    const fake = createFakeProvider()
+    const branch = "opencode/sandcastle-sync"
+    const worktree = await createWorktree({
+      cwd: repository,
+      branchStrategy: { type: "branch", branch },
+    })
+    const sandbox = await worktree.createSandbox({ sandbox: fake.provider })
+    const remotePath = fake.handles[0]?.worktreePath
+    if (!remotePath) throw new Error("fake provider did not create a handle")
+
+    let preservedWorktreePath: string | undefined
+    try {
+      const streamed: string[] = []
+      const streamResult = await sandbox.exec("printf 'first\\nsecond\\n'", {
+        onLine: (line) => streamed.push(line),
+      })
+      expect(streamResult.exitCode).toBe(0)
+      expect(streamed).toEqual(["first", "second"])
+
+      await execSandbox(sandbox, "git config user.name 'Sandbox Test'")
+      await execSandbox(sandbox, "git config user.email 'sandbox@example.invalid'")
+      await execSandbox(sandbox, "printf 'committed\\n' > committed.txt && git add committed.txt && git commit -q -m committed")
+      await execSandbox(sandbox, "printf 'staged\\n' > staged.txt && git add staged.txt")
+      await execSandbox(sandbox, "printf 'unstaged\\n' > tracked.txt")
+      await execSandbox(sandbox, "printf '\\000\\001\\002\\377' > binary.bin")
+      await execSandbox(sandbox, "printf 'untracked\\n' > untracked.txt")
+
+      const remoteHead = await runGit(remotePath, ["rev-parse", "HEAD"])
+      const remoteStatus = await runGit(remotePath, ["status", "--porcelain"])
+      const result = await runSyncBarrier(sandbox)
+
+      expect(result.iterations).toHaveLength(1)
+      expect(result.stdout).toBe("")
+      expect(result.completionSignal).toBeUndefined()
+      expect(result.commits).toHaveLength(1)
+      expect(fake.handles[0]?.commands.some((command) => command.trim() === "true")).toBe(true)
+      expect(fake.handles[0]?.commands.some((command) => /(^|\s)opencode(?:\s|$)/.test(command))).toBe(false)
+      expect(await runGit(remotePath, ["rev-parse", "HEAD"])).toBe(remoteHead)
+      expect(await runGit(remotePath, ["status", "--porcelain"])).toBe(remoteStatus)
+
+      expect(await runGit(worktree.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe(branch)
+      expect(await readFile(join(worktree.worktreePath, "committed.txt"), "utf8")).toBe("committed\n")
+      expect(await readFile(join(worktree.worktreePath, "staged.txt"), "utf8")).toBe("staged\n")
+      expect(await readFile(join(worktree.worktreePath, "tracked.txt"), "utf8")).toBe("unstaged\n")
+      expect(await readFile(join(worktree.worktreePath, "binary.bin"))).toEqual(Buffer.from([0, 1, 2, 255]))
+      expect(await readFile(join(worktree.worktreePath, "untracked.txt"), "utf8")).toBe("untracked\n")
+
+      const status = await runGit(worktree.worktreePath, ["status", "--porcelain"])
+      expect(status).toContain(" M tracked.txt")
+      expect(status).toContain("?? staged.txt")
+      expect(status).toContain("?? untracked.txt")
+      expect(await runGit(repository, ["rev-parse", "HEAD"])).not.toBe(await runGit(worktree.worktreePath, ["rev-parse", "HEAD"]))
+      expect(await runGit(repository, ["status", "--porcelain"])).toBe("")
+      expect(fake.handles[0]?.closed).toBe(false)
+    } finally {
+      await sandbox.close()
+      preservedWorktreePath = (await worktree.close()).preservedWorktreePath
+    }
+
+    expect(fake.handles[0]?.closed).toBe(true)
+    expect(preservedWorktreePath).toBe(worktree.worktreePath)
+  })
+
+  it("leaves recovery artifacts and the provider handle open when sync fails", async () => {
+    const repository = await createRepository()
+    const fake = createFakeProvider({ failCopyFileOut: true })
+    const worktree = await createWorktree({
+      cwd: repository,
+      branchStrategy: { type: "branch", branch: "opencode/sandcastle-failure" },
+    })
+    const sandbox = await worktree.createSandbox({ sandbox: fake.provider })
+
+    try {
+      await execSandbox(sandbox, "git config user.name 'Sandbox Test'")
+      await execSandbox(sandbox, "git config user.email 'sandbox@example.invalid'")
+      await execSandbox(sandbox, "printf 'committed\\n' > committed.txt && git add committed.txt && git commit -q -m committed")
+
+      await expect(runSyncBarrier(sandbox)).rejects.toThrow()
+
+      expect(fake.handles[0]?.closed).toBe(false)
+      const patchRoot = join(worktree.worktreePath, ".sandcastle", "patches")
+      expect((await readdir(patchRoot)).length).toBeGreaterThan(0)
+    } finally {
+      await sandbox.close()
+      await worktree.close()
+    }
+  })
+
+  it("supports concurrent named worktree creation for the pinned package", async () => {
+    // Keep this check before lifecycle integration; failures require local serialization.
+    const repository = await createRepository()
+    const results = await Promise.allSettled([
+      createWorktree({
+        cwd: repository,
+        branchStrategy: { type: "branch", branch: "opencode/sandcastle-concurrent-a" },
+      }),
+      createWorktree({
+        cwd: repository,
+        branchStrategy: { type: "branch", branch: "opencode/sandcastle-concurrent-b" },
+      }),
+    ])
+
+    for (const result of results) {
+      if (result.status === "fulfilled") await result.value.close()
+    }
+
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"])
+    if (results[0]?.status === "fulfilled" && results[1]?.status === "fulfilled") {
+      expect(results[0].value.worktreePath).not.toBe(results[1].value.worktreePath)
+      expect(results[0].value.branch).not.toBe(results[1].value.branch)
+    }
+  })
+})
+
+describe("Sandcastle lifecycle", () => {
+  it("starts from dirty input, waits to warp, and stops into a clean branch", async () => {
+    const setup = await setupFakeLifecycle()
+    const { controller, capability, calls, repository, resources } = setup
+
+    const started = await controller.handle({ operation: "start", force: false, capability })
+    expect(started).toMatchObject({ ok: true, operation: "start", state: "activation_pending" })
+    const activationTarget = controller.targetFor("ses_1")
+    expect(activationTarget).toBeInstanceOf(Promise)
+    expect(controller.targetForWorkspace(started.workspaceId ?? "")).toBeInstanceOf(Promise)
+    expect(calls).toEqual(["worktree:create", "sandbox:create", "capture", "workspace:create"])
+    expect(await runGit(repository, ["rev-parse", "HEAD"])).toBe(setup.sourceHead)
+    expect(await runGit(repository, ["status", "--porcelain"])).toBe(setup.sourceStatus)
+    const handle = resources.handle
+    if (!handle) throw new Error("fake provider handle was not retained")
+    expect(await readFile(join(handle.worktreePath, "tracked.txt"), "utf8")).toBe("unstaged input\n")
+    expect(await readFile(join(handle.worktreePath, "staged.txt"), "utf8")).toBe("staged input\n")
+    expect(await readFile(join(handle.worktreePath, "binary.bin"))).toEqual(Buffer.from([0, 1, 2, 255]))
+    expect(await readFile(join(handle.worktreePath, "untracked.txt"), "utf8")).toBe("untracked input\n")
+    expect(await pathExists(join(handle.worktreePath, "deleted.txt"))).toBe(false)
+
+    await controller.onSessionIdle("ses_1")
+    expect((await setup.store.get("ses_1"))?.state).toBe("remote")
+    expect(await activationTarget).toEqual({ type: "remote", url: "https://fake.example.test" })
+    expect(await controller.targetFor("ses_1")).toEqual({ type: "remote", url: "https://fake.example.test" })
+    expect(calls).toContain("warp:remote")
+    expect(calls).toContain("replay")
+    expect(calls).not.toContain("sync")
+
+    const callsBeforeIdle = [...calls]
+    await controller.onSessionIdle("ses_1")
+    expect(calls).toEqual(callsBeforeIdle)
+
+    const sandbox = resources.sandbox
+    if (!sandbox) throw new Error("fake sandbox was not created")
+    await execSandbox(sandbox, "git config user.name 'Sandbox Test' && git config user.email 'sandbox@example.invalid' && git add -A && printf 'implementation\\n' > implementation.txt && git add implementation.txt && git commit -q -m implementation")
+
+    const stopped = await controller.handle({ operation: "stop", force: false, capability })
+    expect(stopped).toMatchObject({ ok: true, operation: "stop", state: "stop_pending" })
+    const detachTarget = controller.targetFor("ses_1")
+    expect(detachTarget).toBeInstanceOf(Promise)
+    expect(calls).not.toContain("warp:local")
+
+    await controller.onSessionIdle("ses_1")
+    const record = await setup.store.get("ses_1")
+    expect(record?.state).toBe("detached")
+    expect(await detachTarget).toEqual({ type: "local", directory: repository })
+    expect(record?.preservedWorktreePath).toBeUndefined()
+    expect((await controller.handle({ operation: "status", force: false, capability })).details).toMatchObject({
+      branch: record?.branch,
+      provider: "fake",
+    })
+    expect(await runGit(repository, ["show-ref", "--verify", `refs/heads/${record?.branch}`])).toContain(record?.branch ?? "")
+    expect(await pathExists(resources.worktreePath)).toBe(false)
+    expect(calls.indexOf("sync")).toBeGreaterThan(calls.indexOf("warp:remote"))
+    expect(calls.indexOf("warp:local")).toBeGreaterThan(calls.indexOf("sync"))
+    expect(calls.indexOf("sandbox:close")).toBeGreaterThan(calls.indexOf("warp:local"))
+    expect(calls.indexOf("worktree:close")).toBeGreaterThan(calls.indexOf("sandbox:close"))
+    expect(calls.indexOf("workspace:remove")).toBeGreaterThan(calls.indexOf("worktree:close"))
+    expect(await runGit(repository, ["rev-parse", "HEAD"])).toBe(setup.sourceHead)
+    expect(await runGit(repository, ["status", "--porcelain"])).toBe(setup.sourceStatus)
+
+    const deleted = await controller.handle({ operation: "delete", force: true, capability })
+    expect(deleted).toMatchObject({ ok: true, operation: "delete", state: "deleted" })
+    expect(calls.filter((call) => call === "workspace:remove")).toHaveLength(2)
+  })
+
+  it("commits dirty output before removing the Sandcastle worktree", async () => {
+    const setup = await setupFakeLifecycle()
+    const { controller, capability, repository, resources } = setup
+
+    await controller.handle({ operation: "start", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+    const sandbox = resources.sandbox
+    if (!sandbox) throw new Error("fake sandbox was not created")
+    await execSandbox(sandbox, "printf 'unfinished\\n' > unfinished.txt")
+    await controller.handle({ operation: "stop", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+
+    const record = await setup.store.get("ses_1")
+    const worktreePath = resources.worktreePath
+    if (!worktreePath) throw new Error("fake worktree was not created")
+    expect(record?.state).toBe("detached")
+    expect(record?.preservedWorktreePath).toBeUndefined()
+    expect(await pathExists(worktreePath)).toBe(false)
+    expect(await runGit(repository, ["show", `${record?.branch}:unfinished.txt`])).toBe("unfinished")
+    expect((await controller.handle({ operation: "status", force: false, capability })).details).toMatchObject({
+      branch: record?.branch,
+    })
+    expect(await runGit(repository, ["rev-parse", "HEAD"])).toBe(setup.sourceHead)
+    expect(await runGit(repository, ["status", "--porcelain"])).toBe(setup.sourceStatus)
+  })
+
+  it("keeps a failed sync retryable without reprovisioning", async () => {
+    const setup = await setupFakeLifecycle({ syncFailures: 1 })
+    const { controller, capability, calls, resources } = setup
+
+    await controller.handle({ operation: "start", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+    const sandbox = resources.sandbox
+    if (!sandbox) throw new Error("fake sandbox was not created")
+    await execSandbox(sandbox, "printf 'retry me\\n' > retry.txt")
+
+    await controller.handle({ operation: "stop", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+
+    const failed = await setup.store.get("ses_1")
+    expect(failed).toMatchObject({ state: "sync_failed", lastError: { stage: "sync" } })
+    expect(resources.handle?.closed).toBe(false)
+    expect(calls.filter((call) => call === "worktree:create")).toHaveLength(1)
+    expect(calls).not.toContain("warp:local")
+
+    const retried = await controller.handle({ operation: "retry", force: false, capability })
+
+    expect(retried).toMatchObject({ ok: true, operation: "retry", state: "detached" })
+    expect(calls.filter((call) => call === "worktree:create")).toHaveLength(1)
+    expect(calls.filter((call) => call === "sandbox:create")).toHaveLength(1)
+    expect(calls.filter((call) => call === "sync")).toHaveLength(2)
+    expect(resources.handle?.closed).toBe(true)
+  })
+
+  it("requires explicit host force before discarding a failed sync", async () => {
+    const setup = await setupFakeLifecycle({ syncFailures: Number.POSITIVE_INFINITY })
+    const { controller, capability, calls, resources } = setup
+
+    await controller.handle({ operation: "start", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+    const sandbox = resources.sandbox
+    if (!sandbox) throw new Error("fake sandbox was not created")
+    await execSandbox(sandbox, "printf 'discard me\\n' > discard.txt")
+    await controller.handle({ operation: "stop", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+
+    const refused = await controller.handle({ operation: "delete", force: false, capability })
+    expect(refused).toMatchObject({ ok: false, state: "sync_failed" })
+    expect(resources.handle?.closed).toBe(false)
+
+    const remoteCapability = createCapability({ sessionId: "ses_1", generation: 1, role: "remote" })
+    const remoteRefused = await controller.handle({ operation: "delete", force: true, capability: remoteCapability })
+    expect(remoteRefused).toMatchObject({ ok: false, state: "sync_failed" })
+    expect(resources.handle?.closed).toBe(false)
+
+    const discarded = await controller.handle({ operation: "delete", force: true, capability })
+    expect(discarded).toMatchObject({ ok: true, operation: "delete", state: "deleted" })
+    expect(calls.filter((call) => call === "sync")).toHaveLength(1)
+    expect(resources.handle?.closed).toBe(true)
+  })
+
+  it("marks active Sandcastle records orphaned after restart", async () => {
+    const setup = await setupFakeLifecycle()
+    const record = {
+      sessionId: "ses_1",
+      workspaceId: "wrk_orphaned",
+      projectId: "prj_1",
+      provider: "fake",
+      providerState: { resourceId: "sandbox-1" },
+      generation: 1,
+      directory: setup.repository,
+      branch: "opencode/sandbox-orphaned",
+      baseSha: setup.sourceHead,
+      state: "remote" as const,
+      createdAt: new Date(1000).toISOString(),
+      updatedAt: new Date(1000).toISOString(),
+    }
+    await setup.store.write(record)
+
+    let provisioned = false
+    const restarted = new LifecycleController({
+      store: setup.store,
+      providerType: "fake",
+      sandcastle: {
+        createAdapter: async () => {
+          provisioned = true
+          throw new Error("must not reprovision an orphan")
+        },
+      },
+      workspace: {
+        async create() {
+          throw new Error("must not create a workspace")
+        },
+        async warp() {
+          throw new Error("must not warp an orphan")
+        },
+        async remove() {
+          throw new Error("must not remove an orphan")
+        },
+      },
+    })
+
+    await restarted.reconcile("prj_1")
+
+    expect(provisioned).toBe(false)
+    expect(await setup.store.get("ses_1")).toMatchObject({
+      state: "orphaned",
+      lastError: { stage: "reconcile" },
+    })
+    const status = await restarted.handle({
+      operation: "status",
+      force: false,
+      capability: createCapability({ sessionId: "ses_1", generation: 1, role: "host" }),
+    })
+    expect(status).toMatchObject({ state: "orphaned" })
+    expect(status.details).toMatchObject({
+      branch: record.branch,
+      provider: "fake",
+      recoveryMetadata: { resourceId: "sandbox-1" },
+    })
+    expect(JSON.stringify(status)).not.toContain("token")
+  })
+
+  it("keeps parallel session ownership isolated", async () => {
+    const setup = await setupParallelFakeLifecycle()
+    const capabilityA = createCapability({ sessionId: "ses_a", generation: 1, role: "host" })
+    const capabilityB = createCapability({ sessionId: "ses_b", generation: 1, role: "host" })
+
+    const [startedA, startedB] = await Promise.all([
+      setup.controller.handle({ operation: "start", force: false, capability: capabilityA }),
+      setup.controller.handle({ operation: "start", force: false, capability: capabilityB }),
+    ])
+    expect(startedA).toMatchObject({ ok: true, state: "activation_pending" })
+    expect(startedB).toMatchObject({ ok: true, state: "activation_pending" })
+    expect(startedA.workspaceId).not.toBe(startedB.workspaceId)
+
+    const recordA = await setup.store.get("ses_a")
+    const recordB = await setup.store.get("ses_b")
+    expect(recordA?.branch).not.toBe(recordB?.branch)
+    expect(setup.resources.get("ses_a")?.worktreePath).not.toBe(setup.resources.get("ses_b")?.worktreePath)
+    expect(setup.controller.targetFor("ses_a")).toBeInstanceOf(Promise)
+    expect(setup.controller.targetFor("ses_b")).toBeInstanceOf(Promise)
+
+    await Promise.all([setup.controller.onSessionIdle("ses_a"), setup.controller.onSessionIdle("ses_b")])
+    expect((await setup.store.get("ses_a"))?.state).toBe("remote")
+    expect((await setup.store.get("ses_b"))?.state).toBe("remote")
+    expect(await setup.controller.targetFor("ses_a")).toEqual({ type: "remote", url: "https://fake-ses_a.example.test" })
+    expect(await setup.controller.targetFor("ses_b")).toEqual({ type: "remote", url: "https://fake-ses_b.example.test" })
+
+    const sandboxA = setup.resources.get("ses_a")?.sandbox
+    const sandboxB = setup.resources.get("ses_b")?.sandbox
+    if (!sandboxA || !sandboxB) throw new Error("parallel fake sandboxes were not created")
+    await execSandbox(sandboxA, "printf 'session a\\n' > session-a.txt")
+    await execSandbox(sandboxB, "printf 'session b\\n' > session-b.txt")
+
+    await setup.controller.handle({ operation: "stop", force: false, capability: capabilityA })
+    await setup.controller.onSessionIdle("ses_a")
+    expect((await setup.store.get("ses_a"))?.state).toBe("detached")
+    expect((await setup.store.get("ses_b"))?.state).toBe("remote")
+    expect(setup.resources.get("ses_a")?.handle?.closed).toBe(true)
+    expect(setup.resources.get("ses_b")?.handle?.closed).toBe(false)
+
+    const statusB = await setup.controller.handle({ operation: "status", force: false, capability: capabilityB })
+    expect(statusB).toMatchObject({ ok: true, state: "remote", sessionId: "ses_b" })
+
+    await setup.controller.handle({ operation: "stop", force: false, capability: capabilityB })
+    await setup.controller.onSessionIdle("ses_b")
+    expect((await setup.store.get("ses_b"))?.state).toBe("detached")
+    expect(setup.resources.get("ses_b")?.handle?.closed).toBe(true)
+  })
+})
+
+interface FakeLifecycleSetup {
+  controller: LifecycleController
+  capability: ReturnType<typeof createCapability>
+  repository: string
+  store: FileStateStore
+  calls: string[]
+  resources: FakeSessionResources
+  sourceHead: string
+  sourceStatus: string
+}
+
+interface FakeSessionResources {
+  sandbox?: Sandbox
+  handle?: FakeHandle
+  worktreePath?: string
+}
+
+async function setupFakeLifecycle(options: { syncFailures?: number } = {}): Promise<FakeLifecycleSetup> {
+  const repository = await createRepository()
+  await writeFile(join(repository, "deleted.txt"), "delete me\n")
+  await runGit(repository, ["add", "deleted.txt"])
+  await runGit(repository, ["commit", "-q", "-m", "deletion fixture"])
+  await writeFile(join(repository, "tracked.txt"), "unstaged input\n")
+  await writeFile(join(repository, "staged.txt"), "staged input\n")
+  await runGit(repository, ["add", "staged.txt"])
+  await rm(join(repository, "deleted.txt"))
+  await writeFile(join(repository, "binary.bin"), Buffer.from([0, 1, 2, 255]))
+  await writeFile(join(repository, "untracked.txt"), "untracked input\n")
+
+  const sourceHead = await runGit(repository, ["rev-parse", "HEAD"])
+  const sourceStatus = await runGit(repository, ["status", "--porcelain"])
+  const stateRoot = await temporaryDirectory()
+  const store = new FileStateStore(stateRoot)
+  const calls: string[] = []
+  const resources: FakeSessionResources = {}
+  const context: SessionContext = {
+    sessionId: "ses_1",
+    projectId: "prj_1",
+    directory: repository,
+    worktree: repository,
+  }
+  const controller = new LifecycleController({
+    store,
+    capture: (value) => captureWorkingTree(value),
+    providerType: "fake",
+    sandcastle: createFakeSessionFactory(calls, resources, options),
+    workspace: {
+      async create(input) {
+        calls.push("workspace:create")
+        return {
+          id: input.id ?? "wrk_1",
+          type: input.type,
+          name: "fake-workspace",
+          branch: input.branch,
+          directory: input.directory,
+          projectID: input.projectId,
+          extra: {},
+        }
+      },
+      async warp(input) {
+        calls.push(input.workspaceId ? "warp:remote" : "warp:local")
+      },
+      async replaySession() {
+        calls.push("replay")
+      },
+      async startSync() {
+        calls.push("sync:start")
+      },
+      async waitForSync() {
+        calls.push("sync:connected")
+      },
+      async remove() {
+        calls.push("workspace:remove")
+      },
+    },
+  })
+  controller.registerContext(context)
+
+  return {
+    controller,
+    capability: createCapability({ sessionId: context.sessionId, generation: 1, role: "host" }),
+    repository,
+    store,
+    calls,
+    resources,
+    sourceHead,
+    sourceStatus,
+  }
+}
+
+interface ParallelFakeLifecycleSetup {
+  controller: LifecycleController
+  store: FileStateStore
+  resources: Map<string, FakeSessionResources & { branch: string }>
+}
+
+async function setupParallelFakeLifecycle(): Promise<ParallelFakeLifecycleSetup> {
+  const repository = await createRepository()
+  const store = new FileStateStore(await temporaryDirectory())
+  const resources = new Map<string, FakeSessionResources & { branch: string }>()
+  const controller = new LifecycleController({
+    store,
+    capture: (context) => captureWorkingTree(context),
+    providerType: "fake",
+    sandcastle: {
+      createAdapter: async (input) => {
+        const fake = createFakeProvider()
+        const resource: FakeSessionResources & { branch: string } = { branch: input.branch }
+        resources.set(input.sessionId, resource)
+        return {
+          provider: fake.provider,
+          async applyCapture({ sandbox, capture }) {
+            resource.sandbox = sandbox
+            const handle = fake.handles.at(-1)
+            if (!handle) throw new Error("fake provider did not create a handle")
+            resource.handle = handle
+            if (capture.patch) {
+              const result = await sandbox.exec("git apply --binary -", { stdin: capture.patch })
+              if (result.exitCode !== 0) throw new Error(result.stderr || "capture patch failed")
+            }
+          },
+          target() {
+            return { type: "remote", url: `https://fake-${input.sessionId}.example.test` }
+          },
+        }
+      },
+      async createWorktree(options) {
+        const worktree = await createWorktree(options)
+        const branch = options.branchStrategy.type === "branch" ? options.branchStrategy.branch : undefined
+        const resource = [...resources.values()].find((candidate) => candidate.branch === branch)
+        if (resource) resource.worktreePath = worktree.worktreePath
+        return worktree
+      },
+    },
+    workspace: {
+      async create(input) {
+        return {
+          id: input.id ?? "wrk_missing",
+          type: input.type,
+          name: input.type,
+          branch: input.branch,
+          directory: input.directory,
+          projectID: input.projectId,
+          extra: {},
+        }
+      },
+      async warp() {},
+      async replaySession() {},
+      async startSync() {},
+      async waitForSync() {},
+      async remove() {},
+    },
+  })
+  for (const sessionId of ["ses_a", "ses_b"]) {
+    controller.registerContext({ sessionId, projectId: "prj_1", directory: repository, worktree: repository })
+  }
+  return { controller, store, resources }
+}
+
+function createFakeSessionFactory(calls: string[], resources: FakeSessionResources, options: { syncFailures?: number } = {}): SandcastleSessionFactory {
+  const fake = createFakeProvider({
+    failCopyFileOutCount: options.syncFailures,
+    onCommand(command) {
+      if (command.trim() === "true") calls.push("sync")
+    },
+  })
+  return {
+    createAdapter: async () => ({
+      provider: fake.provider,
+      async applyCapture({ sandbox, capture }) {
+        calls.push("capture")
+        if (capture.patch) {
+          const result = await sandbox.exec("git apply --binary -", { stdin: capture.patch })
+          if (result.exitCode !== 0) throw new Error(result.stderr || "capture patch failed")
+        }
+        const handle = fake.handles.at(-1)
+        if (!handle) throw new Error("fake provider did not create a handle")
+        resources.handle = handle
+        for (const file of capture.untracked) {
+          const root = await mkdtemp(join(tmpdir(), "opencode-capture-"))
+          temporaryDirectories.push(root)
+          const hostPath = join(root, file.path)
+          await mkdir(dirname(hostPath), { recursive: true })
+          await writeFile(hostPath, file.content)
+          await handle.copyIn(hostPath, join(handle.worktreePath, file.path))
+        }
+      },
+      target() {
+        if (!fake.handles.at(-1)) throw new Error("fake provider did not create a handle")
+        return { type: "remote", url: "https://fake.example.test" }
+      },
+      recoveryMetadata: () => ({ runtime: "fake" }),
+    }),
+    async createWorktree(options) {
+      calls.push("worktree:create")
+      const worktree = await createWorktree(options)
+      resources.worktreePath = worktree.worktreePath
+      return instrumentWorktree(worktree, calls, resources)
+    },
+  }
+}
+
+function instrumentWorktree(worktree: Worktree, calls: string[], resources: FakeSessionResources): Worktree {
+  return {
+    ...worktree,
+    async createSandbox(options) {
+      const sandbox = await worktree.createSandbox(options)
+      resources.sandbox = sandbox
+      calls.push("sandbox:create")
+      return {
+        ...sandbox,
+        async close() {
+          calls.push("sandbox:close")
+          return sandbox.close()
+        },
+      }
+    },
+    async close() {
+      calls.push("worktree:close")
+      return worktree.close()
+    },
+  }
+}
+
+async function pathExists(path: string | undefined): Promise<boolean> {
+  if (!path) return false
+  try {
+    await readdir(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+interface FakeHandle extends IsolatedSandboxHandle {
+  closed: boolean
+  commands: string[]
+}
+
+function createFakeProvider(options: { failCopyFileOut?: boolean; failCopyFileOutCount?: number; onCommand?: (command: string) => void } = {}) {
+  const handles: FakeHandle[] = []
+  const provider = createIsolatedSandboxProvider({
+    name: "fake-isolated",
+    create: async () => {
+      const root = await mkdtemp(join(tmpdir(), "opencode-sandcastle-test-"))
+      temporaryDirectories.push(root)
+      const worktreePath = join(root, "workspace")
+      const homePath = join(root, "home")
+      await mkdir(worktreePath)
+      await mkdir(homePath)
+      const environment = {
+        ...process.env,
+        HOME: homePath,
+        GIT_CONFIG_GLOBAL: join(root, "gitconfig"),
+      }
+      const handle: FakeHandle = {
+        worktreePath,
+        closed: false,
+        commands: [],
+        exec: (command, execOptions) => {
+          handle.commands.push(command)
+          options.onCommand?.(command)
+          return execute(command, worktreePath, environment, execOptions)
+        },
+        async copyIn(hostPath, sandboxPath) {
+          await mkdir(dirname(sandboxPath), { recursive: true })
+          await cp(hostPath, sandboxPath, { recursive: true })
+        },
+        async copyFileOut(sandboxPath, hostPath) {
+          if (options.failCopyFileOut || (options.failCopyFileOutCount ?? 0) > 0) {
+            if (options.failCopyFileOutCount !== undefined) options.failCopyFileOutCount--
+            throw new Error("fake copy failure")
+          }
+          await mkdir(dirname(hostPath), { recursive: true })
+          await copyFile(sandboxPath, hostPath)
+        },
+        async close() {
+          handle.closed = true
+          await rm(root, { recursive: true, force: true })
+        },
+      }
+      handles.push(handle)
+      return handle
+    },
+  })
+
+  return { provider, handles }
+}
+
+async function createRepository(): Promise<string> {
+  const repository = await temporaryDirectory()
+  await runGit(repository, ["init", "-q"])
+  await runGit(repository, ["config", "user.name", "Repository Test"])
+  await runGit(repository, ["config", "user.email", "repository@example.invalid"])
+  await writeFile(join(repository, ".gitignore"), ".sandcastle/\n")
+  await writeFile(join(repository, "tracked.txt"), "base\n")
+  await runGit(repository, ["add", "."])
+  await runGit(repository, ["commit", "-q", "-m", "initial"])
+  return repository
+}
+
+async function temporaryDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "opencode-sandcastle-repo-"))
+  temporaryDirectories.push(directory)
+  return directory
+}
+
+async function execSandbox(sandbox: { exec(command: string): Promise<{ exitCode: number; stderr: string }> }, command: string): Promise<void> {
+  const result = await sandbox.exec(command)
+  if (result.exitCode !== 0) throw new Error(result.stderr || `sandbox command failed: ${command}`)
+}
+
+async function runGit(cwd: string, args: string[]): Promise<string> {
+  const result = await nodeProcessRunner.run({ argv: ["git", "-C", cwd, ...args], cwd })
+  if (result.exitCode !== 0) throw new Error(result.stderr || `git ${args[0]} failed`)
+  return result.stdout.trimEnd()
+}
+
+async function execute(
+  command: string,
+  defaultCwd: string,
+  environment: NodeJS.ProcessEnv,
+  options: { onLine?: (line: string) => void; cwd?: string; stdin?: string } = {},
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const child = spawn("/bin/sh", ["-c", command], {
+    cwd: options.cwd ?? defaultCwd,
+    env: environment,
+    stdio: ["pipe", "pipe", "pipe"],
+  })
+
+  let stdout = ""
+  let stderr = ""
+  let pendingLine = ""
+  const emitLines = (chunk: Buffer) => {
+    if (!options.onLine) return
+    pendingLine += chunk.toString("utf8")
+    const lines = pendingLine.split("\n")
+    pendingLine = lines.pop() ?? ""
+    for (const line of lines) options.onLine(line.replace(/\r$/, ""))
+  }
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString("utf8")
+    emitLines(chunk)
+  })
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString("utf8")
+  })
+  child.stdin.end(options.stdin)
+
+  return new Promise((resolve, reject) => {
+    child.once("error", reject)
+    child.once("close", (exitCode) => {
+      if (options.onLine && pendingLine) options.onLine(pendingLine.replace(/\r$/, ""))
+      resolve({ stdout, stderr, exitCode: exitCode ?? -1 })
+    })
+  })
+}

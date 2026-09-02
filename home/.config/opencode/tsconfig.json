@@ -10,5 +10,5 @@
     "types": ["bun", "node"],
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["exedev/**/*.ts", "plugin/**/*.ts"]
+  "include": ["sandbox/**/*.ts", "plugin/**/*.ts"]
 }

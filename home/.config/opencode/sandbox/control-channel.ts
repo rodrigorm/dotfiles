@@ -3,13 +3,15 @@ import { randomBytes, timingSafeEqual } from "node:crypto"
 import { chmod, unlink } from "node:fs/promises"
 
 import { preparePrivateSocket } from "./secure-fs"
+import { redactError } from "./redaction"
 import {
-  ExedevError,
-  isExedevOperation,
+  SandboxError,
+  isSandboxOperation,
+  isRecord,
   type AuthorizedControlRequest,
   type ControlCapability,
   type ControlRequest,
-  type ExedevResponse,
+  type SandboxResponse,
 } from "./types"
 
 const DEFAULT_REQUEST_BYTES = 8 * 1024
@@ -18,7 +20,7 @@ const DEFAULT_CAPABILITY_TTL_MS = 15 * 60 * 1000
 
 export interface ControlChannelOptions {
   socketPath: string
-  handler?: (request: AuthorizedControlRequest) => Promise<ExedevResponse>
+  handler?: (request: AuthorizedControlRequest) => Promise<SandboxResponse>
   maxRequestBytes?: number
   requestTimeoutMs?: number
   now?: () => number
@@ -32,15 +34,15 @@ export function createCapability(input: {
   ttlMs?: number
 }): ControlCapability {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.sessionId)) {
-    throw new ExedevError("validate", "capability session ID is invalid", "CAPABILITY_SESSION")
+    throw new SandboxError("validate", "capability session ID is invalid", "CAPABILITY_SESSION")
   }
   if (!Number.isSafeInteger(input.generation) || input.generation < 1) {
-    throw new ExedevError("validate", "capability generation is invalid", "CAPABILITY_GENERATION")
+    throw new SandboxError("validate", "capability generation is invalid", "CAPABILITY_GENERATION")
   }
   const now = input.now ?? Date.now()
   const ttlMs = input.ttlMs ?? DEFAULT_CAPABILITY_TTL_MS
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 1) {
-    throw new ExedevError("validate", "capability expiry is invalid", "CAPABILITY_EXPIRY")
+    throw new SandboxError("validate", "capability expiry is invalid", "CAPABILITY_EXPIRY")
   }
   return {
     token: randomBytes(32).toString("base64url"),
@@ -48,14 +50,12 @@ export function createCapability(input: {
     generation: input.generation,
     role: input.role,
     expiresAt: now + ttlMs,
-    allowStart: input.role === "host",
-    allowForce: input.role === "host",
   }
 }
 
 export class ControlChannel {
   readonly socketPath: string
-  private readonly handler: (request: AuthorizedControlRequest) => Promise<ExedevResponse>
+  private readonly handler: (request: AuthorizedControlRequest) => Promise<SandboxResponse>
   private readonly maxRequestBytes: number
   private readonly requestTimeoutMs: number
   private readonly now: () => number
@@ -76,14 +76,6 @@ export class ControlChannel {
 
   revoke(token: string): void {
     this.capabilities.delete(token)
-  }
-
-  revokeSession(sessionId: string, generation?: number): void {
-    for (const [token, capability] of this.capabilities) {
-      if (capability.sessionId === sessionId && (generation === undefined || capability.generation === generation)) {
-        this.capabilities.delete(token)
-      }
-    }
   }
 
   async start(): Promise<void> {
@@ -149,7 +141,7 @@ export class ControlChannel {
     try {
       body = await readJson(request, this.maxRequestBytes)
     } catch (error) {
-      send(error instanceof ExedevError && error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
+      send(error instanceof SandboxError && error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
         ok: false,
         message: error instanceof Error ? error.message : "invalid control request",
       })
@@ -168,7 +160,7 @@ export class ControlChannel {
       const result = await this.handler({ ...controlRequest, capability })
       send(result.ok ? 200 : 409, result)
     } catch (error) {
-      const message = error instanceof Error ? error.message : "control operation failed"
+      const message = redactError(error)
       send(500, { ok: false, operation: controlRequest.operation, state: "error", message })
     }
   }
@@ -186,42 +178,42 @@ export class ControlChannel {
 }
 
 export function parseControlRequest(value: unknown, capability: ControlCapability): ControlRequest {
-  if (!isRecord(value)) throw new ExedevError("validate", "control request must be an object", "REQUEST_SCHEMA")
+  if (!isRecord(value)) throw new SandboxError("validate", "control request must be an object", "REQUEST_SCHEMA")
   const keys = Object.keys(value).sort()
   const allowedKeys = value.force === undefined ? ["operation"] : ["force", "operation"]
   if (keys.length !== allowedKeys.length || !keys.every((key, index) => key === allowedKeys[index])) {
-    throw new ExedevError("validate", "control request contains unsupported fields", "REQUEST_FIELDS")
+    throw new SandboxError("validate", "control request contains unsupported fields", "REQUEST_FIELDS")
   }
-  if (!isExedevOperation(value.operation)) throw new ExedevError("validate", "control operation is invalid", "REQUEST_OPERATION")
-   if (value.force !== undefined && typeof value.force !== "boolean") {
-     throw new ExedevError("validate", "control force flag is invalid", "REQUEST_FORCE")
-   }
-   const force = value.force ?? false
-  if (force && (!capability.allowForce || value.operation !== "delete")) {
-    throw new ExedevError("validate", "force is not authorized for this capability", "REQUEST_FORCE")
+  if (!isSandboxOperation(value.operation)) throw new SandboxError("validate", "control operation is invalid", "REQUEST_OPERATION")
+  if (value.force !== undefined && typeof value.force !== "boolean") {
+    throw new SandboxError("validate", "control force flag is invalid", "REQUEST_FORCE")
   }
-  if (value.operation === "start" && !capability.allowStart) {
-    throw new ExedevError("validate", "start is only authorized from the host", "REQUEST_START")
+  const force = value.force ?? false
+  if (force && (capability.role !== "host" || value.operation !== "delete")) {
+    throw new SandboxError("validate", "force is not authorized for this capability", "REQUEST_FORCE")
+  }
+  if (value.operation === "start" && capability.role !== "host") {
+    throw new SandboxError("validate", "start is only authorized from the host", "REQUEST_START")
   }
   return { operation: value.operation, force }
 }
 
 async function readJson(request: IncomingMessage, maxBytes: number): Promise<unknown> {
   const declaredLength = Number(request.headers["content-length"] ?? 0)
-  if (declaredLength > maxBytes) throw new ExedevError("validate", "control request is too large", "REQUEST_TOO_LARGE")
+  if (declaredLength > maxBytes) throw new SandboxError("validate", "control request is too large", "REQUEST_TOO_LARGE")
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     size += buffer.byteLength
-    if (size > maxBytes) throw new ExedevError("validate", "control request is too large", "REQUEST_TOO_LARGE")
+    if (size > maxBytes) throw new SandboxError("validate", "control request is too large", "REQUEST_TOO_LARGE")
     chunks.push(buffer)
   }
   const text = Buffer.concat(chunks).toString("utf8")
   try {
     return JSON.parse(text)
   } catch {
-    throw new ExedevError("validate", "control request is not valid JSON", "REQUEST_JSON")
+    throw new SandboxError("validate", "control request is not valid JSON", "REQUEST_JSON")
   }
 }
 
@@ -231,7 +223,7 @@ function equalSecret(expected: string, actual: string): boolean {
   return left.byteLength === right.byteLength && timingSafeEqual(left, right)
 }
 
-async function defaultHandler(request: AuthorizedControlRequest): Promise<ExedevResponse> {
+async function defaultHandler(request: AuthorizedControlRequest): Promise<SandboxResponse> {
   return {
     ok: true,
     operation: request.operation,
@@ -239,10 +231,6 @@ async function defaultHandler(request: AuthorizedControlRequest): Promise<Exedev
     sessionId: request.capability.sessionId,
     message: `${request.operation} accepted`,
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 async function closeServer(server: Server): Promise<void> {

@@ -1,7 +1,8 @@
-import { ExedevError, type CopyVmInput, type CreateVmInput, type ProcessRunner, type VmIdentity, type VmInfo } from "./types"
-import { identityMatches, assertSafeSshDestination, assertSafeTag, assertSafeVmName } from "./naming"
+import { isRecord, SandboxError, type CopyVmInput, type CreateVmInput, type ProcessRunner, type VmIdentity, type VmInfo } from "./types"
+import { identityMatches, assertSafeComment, assertSafeSshDestination, assertSafeTag, assertSafeVmName, quoteRemoteCommandPart } from "./naming"
 import { nodeProcessRunner, sanitizeEnvironment } from "./process"
 import { redactError } from "./redaction"
+import { DEFAULT_SSH_BIN, fixedSshOptions } from "./remote-runtime"
 
 export interface ExeControl {
   create(input: CreateVmInput): Promise<VmInfo>
@@ -9,6 +10,8 @@ export interface ExeControl {
   list(): Promise<VmInfo[]>
   remove(identity: VmIdentity): Promise<void>
   tag(name: string, tags: string[]): Promise<void>
+  replaceTags?(identity: VmIdentity, tags: string[]): Promise<void>
+  comment?(name: string, comment: string): Promise<void>
 }
 
 export interface SshExeControlOptions {
@@ -23,24 +26,13 @@ export function buildExeDevSshArgv(
   command: readonly string[],
 ): string[] {
   if (!options.sshBin || !options.lobby || !options.knownHostsFile || command.length === 0) {
-    throw new ExedevError("validate", "SSH command configuration is incomplete", "SSH_CONFIG")
+    throw new SandboxError("validate", "SSH command configuration is incomplete", "SSH_CONFIG")
   }
   return [
     options.sshBin,
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "StrictHostKeyChecking=yes",
-    "-o",
-    `UserKnownHostsFile=${options.knownHostsFile}`,
-    "-o",
-    "GlobalKnownHostsFile=/dev/null",
-    "-o",
-    "ForwardAgent=no",
-    "-o",
-    "ClearAllForwardings=yes",
+    ...fixedSshOptions(options.knownHostsFile),
     options.lobby,
-    ...command,
+    ...command.map(quoteRemoteCommandPart),
   ]
 }
 
@@ -49,7 +41,7 @@ export class SshExeControl implements ExeControl {
 
   constructor(options: SshExeControlOptions) {
     this.options = {
-      sshBin: options.sshBin ?? "ssh",
+      sshBin: options.sshBin ?? DEFAULT_SSH_BIN,
       lobby: options.lobby,
       knownHostsFile: options.knownHostsFile,
       runner: options.runner ?? nodeProcessRunner,
@@ -59,6 +51,7 @@ export class SshExeControl implements ExeControl {
   async create(input: CreateVmInput): Promise<VmInfo> {
     assertSafeVmName(input.name)
     input.tags.forEach(assertSafeTag)
+    assertSafeComment(input.comment)
     const command = [
       "new",
       "--name",
@@ -80,6 +73,7 @@ export class SshExeControl implements ExeControl {
     assertSafeVmName(input.name)
     assertSafeVmName(input.baseVm)
     input.tags.forEach(assertSafeTag)
+    assertSafeComment(input.comment)
     const command = [
       "cp",
       input.baseVm,
@@ -89,12 +83,20 @@ export class SshExeControl implements ExeControl {
       String(input.cpu),
       "--memory",
       input.memory,
-      "--comment",
-      input.comment,
-      ...input.tags.flatMap((tag) => ["--tag", tag]),
       "--json",
     ]
-    return this.runVmCommand(command)
+    const vm = await this.runVmCommand(command)
+    await this.tag(input.name, input.tags)
+    await this.comment(input.name, input.comment)
+    return {
+      ...vm,
+      identity: {
+        ...vm.identity,
+        name: input.name,
+        tags: [...input.tags],
+        comment: input.comment,
+      },
+    }
   }
 
   async list(): Promise<VmInfo[]> {
@@ -107,16 +109,22 @@ export class SshExeControl implements ExeControl {
     assertSafeSshDestination(identity.sshDest)
     const matches = (await this.list()).filter((item) => identityMatches(identity, item.identity))
     if (matches.length !== 1) {
-      throw new ExedevError("remove", "VM identity did not match exactly one observed VM", "VM_IDENTITY_MISMATCH")
+    throw new SandboxError("remove", "VM identity did not match exactly one observed VM", "VM_IDENTITY_MISMATCH")
     }
     await this.runJson(["rm", identity.name, "--json"])
   }
 
   async tag(name: string, tags: string[]): Promise<void> {
     assertSafeVmName(name)
-    if (tags.length === 0) throw new ExedevError("validate", "at least one VM tag is required", "TAG_EMPTY")
+    if (tags.length === 0) throw new SandboxError("validate", "at least one VM tag is required", "TAG_EMPTY")
     tags.forEach(assertSafeTag)
     await this.runJson(["tag", name, ...tags, "--json"])
+  }
+
+  async comment(name: string, comment: string): Promise<void> {
+    assertSafeVmName(name)
+    assertSafeComment(comment)
+    await this.runJson(["comment", name, comment, "--json"])
   }
 
   async replaceTags(identity: VmIdentity, tags: string[]): Promise<void> {
@@ -138,12 +146,12 @@ export class SshExeControl implements ExeControl {
       maxOutputBytes: 512 * 1024,
     })
     if (result.exitCode !== 0) {
-      throw new ExedevError("discover", redactError(result.stderr || result.stdout), "EXEDEV_COMMAND")
+    throw new SandboxError("discover", redactError(result.stderr || result.stdout), "EXEDEV_COMMAND")
     }
     try {
       return JSON.parse(result.stdout.trim())
     } catch {
-      throw new ExedevError("discover", "exe.dev returned invalid JSON", "EXEDEV_JSON")
+    throw new SandboxError("discover", "exe.dev returned invalid JSON", "EXEDEV_JSON")
     }
   }
 }
@@ -156,7 +164,7 @@ export function parseVmList(value: unknown): VmInfo[] {
 }
 
 export function parseVm(value: unknown): VmInfo {
-  if (!isRecord(value)) throw new ExedevError("discover", "exe.dev VM response is not an object", "EXEDEV_SCHEMA")
+  if (!isRecord(value)) throw new SandboxError("discover", "exe.dev VM response is not an object", "EXEDEV_SCHEMA")
   const name = stringField(value, "vm_name", "name")
   const sshDest = stringField(value, "ssh_dest", "sshDest")
   assertSafeVmName(name)
@@ -164,7 +172,7 @@ export function parseVm(value: unknown): VmInfo {
 
   const tags = value.tags === undefined ? [] : value.tags
   if (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string")) {
-    throw new ExedevError("discover", "exe.dev returned invalid VM tags", "EXEDEV_SCHEMA")
+    throw new SandboxError("discover", "exe.dev returned invalid VM tags", "EXEDEV_SCHEMA")
   }
   tags.forEach(assertSafeTag)
 
@@ -189,13 +197,9 @@ function stringField(value: Record<string, unknown>, ...keys: string[]): string 
   for (const key of keys) {
     if (typeof value[key] === "string" && value[key].length > 0) return value[key]
   }
-  throw new ExedevError("discover", `exe.dev response is missing ${keys[0]}`, "EXEDEV_SCHEMA")
+  throw new SandboxError("discover", `exe.dev response is missing ${keys[0]}`, "EXEDEV_SCHEMA")
 }
 
 function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
