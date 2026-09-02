@@ -490,29 +490,22 @@ export class SbxProvider implements WorkspaceProviderBase {
       activation.process.terminate()
       await waitForProcess(activation.process)
     }
-    let failure: unknown
-    try {
-      await this.runSbx(["stop", sandbox], "detach")
-    } catch (error) {
-      failure = error
-    }
+    await this.runSbx(["stop", sandbox], "detach").catch(() => undefined)
     try {
       await this.runSbx(["rm", "--force", sandbox], "remove")
       this.owned.delete(sandbox)
-    } catch (error) {
-      failure ??= error
     } finally {
       this.active.delete(info.id)
       if (this.active.size === 0) await this.closeControlProxy()
     }
-    if (failure) throw failure
   }
 
   async dispose(): Promise<void> {
     const activations = [...this.active.values()]
     for (const activation of activations) await this.assertOwned(activation.sandbox, activation)
+    let failure: unknown
     try {
-      await Promise.all(activations.map(async (activation) => {
+      const results = await Promise.allSettled(activations.map(async (activation) => {
         if (activation.controlToken) this.revokeControlToken?.(activation.controlToken)
         if (activation.process) {
           activation.process.terminate()
@@ -522,9 +515,11 @@ export class SbxProvider implements WorkspaceProviderBase {
         this.active.delete(activation.workspaceId)
         this.owned.delete(activation.sandbox)
       }))
+      failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")?.reason
     } finally {
       if (this.active.size === 0) await this.closeControlProxy()
     }
+    if (failure) throw failure
   }
 
   createIsolatedHandle(info: WorkspaceInfo): IsolatedSandboxHandle {
@@ -538,13 +533,13 @@ export class SbxProvider implements WorkspaceProviderBase {
       copyIn: (hostPath, sandboxPath) => this.copyIn(activation, hostPath, sandboxPath),
       copyFileOut: (sandboxPath, hostPath) => this.copyFileOut(activation, sandboxPath, hostPath),
       close: () => {
-        closing ??= this.closeIsolated(info)
+        closing ??= this.close(info)
         return closing
       },
     }
   }
 
-  private async closeIsolated(info: WorkspaceInfo): Promise<void> {
+  async close(info: WorkspaceInfo): Promise<void> {
     await this.destroy(info)
   }
 
@@ -1035,6 +1030,7 @@ export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions)
     },
     target: () => provider.target(info),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
+    close: () => provider.close(info),
   }
 }
 

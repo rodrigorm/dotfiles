@@ -60,6 +60,10 @@ export class LifecycleController {
   private readonly sessions = new Map<string, SandcastleSession>()
   private readonly targets = new Map<string, WorkspaceTarget | Promise<WorkspaceTarget>>()
   private readonly targetGates = new Map<string, Deferred<WorkspaceTarget>>()
+  private readonly operations = new Set<Promise<unknown>>()
+  private readonly idleTimers = new Set<ReturnType<typeof setTimeout>>()
+  private disposed = false
+  private disposal?: Promise<void>
 
   constructor(dependencies: LifecycleDependencies) {
     this.store = dependencies.store
@@ -75,11 +79,14 @@ export class LifecycleController {
   }
 
   registerContext(context: SessionContext): void {
+    if (this.disposed) return
     this.contexts.set(context.sessionId, context)
   }
 
   async capabilityFor(sessionId: string, role: "host" | "remote" = "host"): Promise<ControlCapability> {
+    if (this.disposed) throw pluginDisposed()
     const record = await this.store.get(sessionId)
+    if (this.disposed) throw pluginDisposed()
     return createCapability({
       sessionId,
       generation: record?.generation ?? 1,
@@ -88,11 +95,13 @@ export class LifecycleController {
   }
 
   targetFor(sessionId: string): WorkspaceTarget | Promise<WorkspaceTarget> | undefined {
+    if (this.disposed) return undefined
     const session = this.sessions.get(sessionId)
     return session ? this.targetForWorkspace(session.workspaceId) : undefined
   }
 
   targetForWorkspace(workspaceId: string): WorkspaceTarget | Promise<WorkspaceTarget> | undefined {
+    if (this.disposed) return undefined
     const target = this.targets.get(workspaceId)
     if (target) return target
     for (const session of this.sessions.values()) {
@@ -101,8 +110,13 @@ export class LifecycleController {
     return undefined
   }
 
-  async handle(request: AuthorizedControlRequest): Promise<SandboxResponse> {
+  handle(request: AuthorizedControlRequest): Promise<SandboxResponse> {
+    return this.track(this.handleRequest(request))
+  }
+
+  private async handleRequest(request: AuthorizedControlRequest): Promise<SandboxResponse> {
     try {
+      if (this.disposed) throw pluginDisposed()
       const record = await this.store.get(request.capability.sessionId)
       this.assertCapability(record, request.capability)
       this.assertOperationAllowed(record, request)
@@ -113,7 +127,7 @@ export class LifecycleController {
         case "stop": {
           const response = await this.stop(request.capability)
           if (this.sandcastle && response.state === "stop_pending") {
-            setTimeout(() => void this.onSessionIdle(request.capability.sessionId), 500)
+            this.scheduleSessionIdle(request.capability.sessionId)
           }
           return response
         }
@@ -140,7 +154,21 @@ export class LifecycleController {
     }
   }
 
-  async onSessionIdle(sessionId: string, expected?: { record: SandboxRecord; capability: ControlCapability }): Promise<void> {
+  onSessionIdle(sessionId: string, expected?: { record: SandboxRecord; capability: ControlCapability }): Promise<void> {
+    if (this.disposed) return Promise.reject(pluginDisposed())
+    return this.track(this.processSessionIdle(sessionId, expected))
+  }
+
+  scheduleSessionIdle(sessionId: string, complete?: () => void | Promise<void>): void {
+    if (this.disposed) return
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(timer)
+      void this.track(this.onSessionIdle(sessionId).then(complete)).catch(() => undefined)
+    }, 500)
+    this.idleTimers.add(timer)
+  }
+
+  private async processSessionIdle(sessionId: string, expected?: { record: SandboxRecord; capability: ControlCapability }): Promise<void> {
     await this.store.withRecordLock(sessionId, async (record, write) => {
       if (!record) {
         if (expected) throw retryStale()
@@ -315,11 +343,39 @@ export class LifecycleController {
     }
   }
 
-  dispose(): void {
-    this.contexts.clear()
-    for (const [workspaceId] of this.targetGates) {
-      this.rejectTargetGate(workspaceId, new SandboxError("transition", "sandbox plugin was disposed", "PLUGIN_DISPOSED"))
-    }
+  dispose(): Promise<void> {
+    this.disposal ??= (async () => {
+      this.disposed = true
+      for (const timer of this.idleTimers) clearTimeout(timer)
+      this.idleTimers.clear()
+      for (const [workspaceId] of this.targetGates) this.rejectTargetGate(workspaceId, pluginDisposed())
+      await Promise.allSettled([...this.operations])
+      for (const [workspaceId] of this.targetGates) this.rejectTargetGate(workspaceId, pluginDisposed())
+
+      const sessions = [...this.sessions.entries()]
+      const results = await Promise.allSettled(sessions.map(async ([sessionId, session]) => {
+        const record = await this.store.get(sessionId)
+        if (record && ["remote", "stop_pending", "delete_pending", "sync_failed"].includes(record.state)) await session.sync()
+        return session.close()
+      }))
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") this.sessions.delete(sessions[index]![0])
+      })
+      this.contexts.clear()
+      this.targets.clear()
+      const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+      if (failure) throw failure.reason
+    })().catch((error) => {
+      this.disposal = undefined
+      throw error
+    })
+    return this.disposal
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    this.operations.add(operation)
+    void operation.finally(() => this.operations.delete(operation)).catch(() => undefined)
+    return operation
   }
 
   private async onSandcastleIdle(
@@ -564,6 +620,14 @@ export class LifecycleController {
       if (existing?.state === "orphaned") {
         throw new SandboxError("reconcile", "session sandbox is orphaned; recover it manually before starting again", "SESSION_ORPHANED")
       }
+      if (existing?.state === "error" && existing.operation?.kind === "start") {
+        const retained = this.sessions.get(capability.sessionId)
+        if (retained) {
+          await retained.close()
+          this.sessions.delete(capability.sessionId)
+        }
+        await this.removeWorkspace(existing)
+      }
 
       const generation = (existing?.generation ?? 0) + 1
       const workspaceId = workspaceIdFor(capability.sessionId, generation)
@@ -651,12 +715,14 @@ export class LifecycleController {
         let cleanupError: unknown
         let preservedWorktreePath: string | undefined
         if (session) {
+          let sessionClosed = false
           try {
             preservedWorktreePath = (await session.close()).preservedWorktreePath
+            sessionClosed = true
           } catch (error) {
             cleanupError = error
           }
-          this.sessions.delete(capability.sessionId)
+          if (sessionClosed) this.sessions.delete(capability.sessionId)
           this.rejectTargetGate(workspaceId, error)
           this.targets.delete(workspaceId)
         }
@@ -1070,6 +1136,10 @@ function sameRetryRecord(current: SandboxRecord, expected: SandboxRecord): boole
 
 function retryStale(): SandboxError {
   return new SandboxError("validate", "session changed while retry was pending; retry again", "RETRY_STALE")
+}
+
+function pluginDisposed(): SandboxError {
+  return new SandboxError("transition", "sandbox plugin was disposed", "PLUGIN_DISPOSED")
 }
 
 function isForceDelete(record: SandboxRecord | undefined): boolean {

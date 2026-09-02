@@ -452,21 +452,24 @@ export class ExedevProvider implements WorkspaceProviderBase {
         throw new SandboxError("remove", "workspace VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
     }
     await this.control.remove(metadata.vmIdentity)
+    this.active.delete(info.id)
   }
 
   async dispose(): Promise<void> {
     const activations = [...this.active.values()]
-    this.active.clear()
-    await Promise.all(
+    const results = await Promise.allSettled(
       activations.map(async (activation) => {
         this.revokeControlToken?.(activation.controlToken)
         if (activation.process) {
           activation.process.terminate()
           await waitForProcess(activation.process)
         }
-        await this.remote(activation.vm.identity, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach").catch(() => undefined)
+        await this.remote(activation.vm.identity, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach")
+        this.active.delete(activation.workspaceId)
       }),
     )
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+    if (failure) throw failure.reason
   }
 
   createIsolatedHandle(info: WorkspaceInfo): IsolatedSandboxHandle {
@@ -480,13 +483,13 @@ export class ExedevProvider implements WorkspaceProviderBase {
       copyIn: (hostPath, sandboxPath) => this.copyIn(activation, hostPath, sandboxPath),
       copyFileOut: (sandboxPath, hostPath) => this.copyFileOut(activation, sandboxPath, hostPath),
       close: () => {
-        closing ??= this.closeIsolated(info)
+        closing ??= this.close(info)
         return closing
       },
     }
   }
 
-  private async closeIsolated(info: WorkspaceInfo): Promise<void> {
+  async close(info: WorkspaceInfo): Promise<void> {
     let failure: unknown
     try {
       await this.release(info)
@@ -495,10 +498,12 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }
     try {
       await this.destroy(info)
+      this.active.delete(info.id)
+      return
     } catch (error) {
       failure ??= error
     }
-    if (failure) throw failure
+    throw failure
   }
 
   private async execute(
@@ -822,6 +827,7 @@ export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOp
       await provider.activate(input.workspaceId)
     },
     target: () => provider.target(info),
+    close: () => provider.close(info),
     recoveryMetadata: () => {
       const metadata = provider.runtimeMetadata(input.workspaceId)
       return {

@@ -16,6 +16,7 @@ export interface OpenCodeSandboxAdapter {
   applyCapture(input: { sandbox: Sandbox; capture: WorkingTreeCapture }): Promise<void>
   target(): WorkspaceTarget | Promise<WorkspaceTarget>
   recoveryMetadata?(): Record<string, unknown>
+  close?(): Promise<void>
 }
 
 export interface SandcastleAdapterInput {
@@ -81,8 +82,12 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
     const sessionWorktree = worktree
     const sessionSandbox = sandbox
     let target: Extract<WorkspaceTarget, { type: "remote" }> | undefined
-    let closed = false
-    let closeResult: CloseResult | undefined
+    let closing: Promise<CloseResult> | undefined
+    let sandboxClosed = false
+    let sandboxCloseFailed = false
+    let sandboxFailure: unknown
+    let worktreeClosed = false
+    let closeResult: CloseResult = {}
 
     return {
       workspaceId: input.workspaceId,
@@ -121,12 +126,53 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
         }
         return runSyncBarrier(sessionSandbox)
       },
-      async close() {
-        if (closed) return closeResult ?? {}
-        await sessionSandbox.close()
-        closeResult = await sessionWorktree.close()
-        closed = true
-        return closeResult
+      close() {
+        closing ??= (async () => {
+          let failure: unknown
+          if (!sandboxClosed) {
+            if (sandboxCloseFailed && !adapter.close) {
+              failure = sandboxFailure
+            } else if (sandboxCloseFailed) {
+              try {
+                await adapter.close!()
+                sandboxClosed = true
+              } catch (error) {
+                failure = error
+              }
+            } else {
+              try {
+                await sessionSandbox.close()
+                sandboxClosed = true
+              } catch (error) {
+                sandboxCloseFailed = true
+                sandboxFailure = error
+                if (!adapter.close) failure = error
+                else {
+                  try {
+                    await adapter.close()
+                    sandboxClosed = true
+                  } catch (closeError) {
+                    failure = closeError
+                  }
+                }
+              }
+            }
+          }
+          if (!worktreeClosed) {
+            try {
+              closeResult = await sessionWorktree.close()
+              worktreeClosed = true
+            } catch (error) {
+              failure ??= error
+            }
+          }
+          if (failure) throw failure
+          return closeResult
+        })().catch((error) => {
+          closing = undefined
+          throw error
+        })
+        return closing
       },
     }
   } catch (error) {

@@ -309,13 +309,13 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       copyIn: (hostPath, sandboxPath) => this.copyIn(activation, hostPath, sandboxPath),
       copyFileOut: (sandboxPath, hostPath) => this.copyFileOut(activation, sandboxPath, hostPath),
       close: () => {
-        closing ??= this.closeIsolated(info)
+        closing ??= this.close(info)
         return closing
       },
     }
   }
 
-  private async closeIsolated(info: WorkspaceInfo): Promise<void> {
+  async close(info: WorkspaceInfo): Promise<void> {
     let failure: unknown
     try {
       await this.release(info)
@@ -324,10 +324,11 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     }
     try {
       await this.destroy(info)
+      return
     } catch (error) {
       failure ??= error
     }
-    if (failure) throw failure
+    throw failure
   }
 
   async release(info: WorkspaceInfo): Promise<void> {
@@ -364,11 +365,13 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       activation.closed = true
       if (activation.controlToken) this.revokeControlToken?.(activation.controlToken)
     }
-    await Promise.all(activations.map(async (activation) => {
+    const results = await Promise.allSettled(activations.map(async (activation) => {
       await this.cleanupRuntime(activation.sandboxId, activation.workspaceId)
       this.active.delete(activation.workspaceId)
       this.owned.delete(activation.sandboxId)
     }))
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+    if (failure) throw failure.reason
   }
 
   private async ensureSandbox(
@@ -821,6 +824,7 @@ export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleA
     },
     target: () => provider.target(info),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
+    close: () => provider.close(info),
   }
 }
 

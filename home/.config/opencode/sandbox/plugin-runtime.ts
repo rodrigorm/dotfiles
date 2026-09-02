@@ -89,6 +89,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
     const controlSocket = join(runtimeRoot, `oe-${shortHash(`${process.pid}:${input.project.id}`)}`, "c.sock")
     const store = new FileStateStore(config.stateDirectory)
     const capabilities = new Map<string, ControlCapability>()
+    let disposing = false
     const controllerRef: { current?: LifecycleController } = {}
     let controlChannel: ControlChannel | undefined
     const exeControl = options.control ?? new SshExeControl({
@@ -251,6 +252,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
 
     const capabilityFor = async (sessionId: string): Promise<ControlCapability> => {
       const next = await controller.capabilityFor(sessionId, "host")
+      if (disposing) throw new SandboxError("transition", "sandbox plugin was disposed", "PLUGIN_DISPOSED")
       const previous = capabilities.get(sessionId)
       if (!previous || previous.generation !== next.generation || previous.expiresAt <= Date.now()) {
         if (previous) channel.revoke(previous.token)
@@ -266,13 +268,35 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
       channel.revoke(capability.token)
       capabilities.delete(sessionId)
     }
+    let disposal: Promise<void> | undefined
 
     return {
-      async dispose() {
-        controller.dispose()
-        capabilities.clear()
-        await provider?.dispose?.()
-        await channel.close()
+      dispose() {
+        disposal ??= (async () => {
+          disposing = true
+          capabilities.clear()
+          let failure: unknown
+          try {
+            await controller.dispose()
+          } catch (error) {
+            failure = error
+          }
+          try {
+            await provider?.dispose?.()
+          } catch (error) {
+            failure ??= error
+          }
+          try {
+            await channel.close()
+          } catch (error) {
+            failure ??= error
+          }
+          if (failure) throw failure
+        })().catch((error) => {
+          disposal = undefined
+          throw error
+        })
+        return disposal
       },
       async event({ event }) {
         const value = isRecord(event) ? event : undefined
@@ -288,12 +312,10 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
           const sessionId = properties.sessionID
           contextFor(sessionId)
           // ponytail: drain trailing events for 500 ms; replace with a durable idle fence when OpenCode exposes one.
-          setTimeout(() => {
-            void controller.onSessionIdle(sessionId).then(async () => {
-              const record = await store.get(sessionId)
-              if (record && !isTransitionPending(record.state)) revokeHostCapability(sessionId)
-            })
-          }, 500)
+          controller.scheduleSessionIdle(sessionId, async () => {
+            const record = await store.get(sessionId)
+            if (record && !isTransitionPending(record.state)) revokeHostCapability(sessionId)
+          })
         }
       },
       async "chat.message"({ sessionID }) {

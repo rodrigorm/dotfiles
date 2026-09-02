@@ -1521,9 +1521,13 @@ describe("Docker Sandbox provider", () => {
     const branch = "opencode/sbx-0123456789"
     const clone = "/workspace/project"
     const commands: Array<{ argv: string[]; stdin?: string | Uint8Array }> = []
+    let failStop = false
     const runner: ProcessRunner = {
       async run(input) {
         commands.push({ argv: input.argv, stdin: input.stdin })
+        if (failStop && input.argv[0] === "sbx" && input.argv[1] === "stop") {
+          return { exitCode: 1, signal: null, stdout: "", stderr: "already stopped" }
+        }
         if (input.argv[0] === "sbx" && input.argv.includes("--show-toplevel")) {
           return { exitCode: 0, signal: null, stdout: `${clone}\n`, stderr: "" }
         }
@@ -1580,6 +1584,7 @@ describe("Docker Sandbox provider", () => {
     ownership.setOwnership(sandbox, "x".repeat(43))
     await expect(provider.destroy(info)).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
     ownership.setOwnership(sandbox, ownershipId)
+    failStop = true
     await provider.destroy(info)
     expect(commands.some(({ argv }) => argv.includes("stop"))).toBe(true)
     expect(commands.some(({ argv }) => argv.includes("rm") && argv.includes("--force"))).toBe(true)
@@ -1930,6 +1935,7 @@ describe("Cloudflare Sandbox provider", () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
     let tunnelDestroyed = false
+    let sandboxDestroyed = false
     const provider = new CloudflareProvider({
       worktree: root,
       deferActivation: true,
@@ -1942,7 +1948,7 @@ describe("Cloudflare Sandbox provider", () => {
       },
       client: {
         async createSandbox() { return "sandboxa2" },
-        async destroySandbox() {},
+        async destroySandbox() { sandboxDestroyed = true },
         async destroyTunnel() { tunnelDestroyed = true },
         async running() { return true },
         async exec(_id, input) {
@@ -1971,6 +1977,8 @@ describe("Cloudflare Sandbox provider", () => {
     await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
     await expect(provider.release(info)).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
     expect(tunnelDestroyed).toBe(true)
+    await expect(provider.close(info)).resolves.toBeUndefined()
+    expect(sandboxDestroyed).toBe(true)
   })
 
   it("does not inspect or reuse an unowned Cloudflare sandbox ID", async () => {

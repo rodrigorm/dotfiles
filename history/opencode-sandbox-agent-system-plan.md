@@ -180,7 +180,8 @@ Progress on 2026-09-02:
 - Completed: fail explicitly when neither the local Bun source nor the remote Node bundle is available.
 - Completed: redact and bound logs, diagnostics, and recovery metadata before response serialization.
 - Completed: require the exact ownership tuple observed by the current SBX or Cloudflare provider instance before reuse, stop, or destruction.
-- Remaining: disposal and serialization.
+- Completed: await idempotent plugin disposal, cancel idle work, and close every owned Sandcastle session.
+- Remaining: serialization.
 
 Changes:
 

@@ -188,7 +188,7 @@ The Bun tests are the executable sandbox contract. `make test` validates the wid
 
 The current implementation has documented gaps, not hidden assumptions:
 
-- Plugin disposal drops Sandcastle handles without closing their sessions.
+- Plugin disposal syncs and closes owned remote Sandcastle sessions and cancels pending idle work, but it does not yet persist a provider-observed final state.
 - A restarted plugin cannot inspect, adopt, or delete a control-lost runtime through `sandboxctl`.
 - SBX and Cloudflare ownership proof is process-local; a restarted plugin cannot inspect or adopt a previously owned resource.
 - The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path recreates the runtime.

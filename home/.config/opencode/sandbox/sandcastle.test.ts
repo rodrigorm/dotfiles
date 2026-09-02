@@ -156,6 +156,15 @@ describe("Sandcastle lifecycle", () => {
     expect(setup.resources.handle?.closed).toBe(true)
   })
 
+  it("retains a Sandcastle session when start cleanup fails", async () => {
+    const setup = await setupFakeLifecycle({ workspaceMismatch: true, closeFailures: 2 })
+
+    await expect(setup.controller.handle({ operation: "start", force: false, capability: setup.capability })).resolves.toMatchObject({ ok: false })
+    expect(setup.resources.handle?.closed).toBe(false)
+    await expect(setup.controller.dispose()).resolves.toBeUndefined()
+    expect(setup.resources.handle?.closed).toBe(true)
+  })
+
   it("starts from dirty input, waits to warp, and stops into a clean branch", async () => {
     const setup = await setupFakeLifecycle()
     const { controller, capability, calls, repository, resources } = setup
@@ -365,6 +374,53 @@ describe("Sandcastle lifecycle", () => {
     expect(JSON.stringify(status)).not.toContain("token")
   })
 
+  it("awaits idempotent disposal and closes every owned session", async () => {
+    const setup = await setupParallelFakeLifecycle()
+    const capabilityA = createCapability({ sessionId: "ses_a", generation: 1, role: "host" })
+    const capabilityB = createCapability({ sessionId: "ses_b", generation: 1, role: "host" })
+    await Promise.all([
+      setup.controller.handle({ operation: "start", force: false, capability: capabilityA }),
+      setup.controller.handle({ operation: "start", force: false, capability: capabilityB }),
+    ])
+
+    const targetA = setup.controller.targetFor("ses_a")
+    const first = setup.controller.dispose()
+    const second = setup.controller.dispose()
+
+    expect(second).toBe(first)
+    await first
+    await expect(targetA).rejects.toMatchObject({ code: "PLUGIN_DISPOSED" })
+    expect(setup.resources.get("ses_a")?.handle?.closed).toBe(true)
+    expect(setup.resources.get("ses_b")?.handle?.closed).toBe(true)
+    expect(setup.controller.targetFor("ses_a")).toBeUndefined()
+    expect(setup.controller.targetFor("ses_b")).toBeUndefined()
+  })
+
+  it("cancels scheduled idle work during disposal", async () => {
+    const setup = await setupFakeLifecycle()
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+    setup.controller.scheduleSessionIdle("ses_1")
+
+    await setup.controller.dispose()
+    await new Promise((resolve) => setTimeout(resolve, 550))
+
+    expect(setup.calls).not.toContain("warp:remote")
+    expect(setup.calls).not.toContain("replay")
+    expect(setup.resources.handle?.closed).toBe(true)
+  })
+
+  it("retains a failed session so disposal can retry it", async () => {
+    const setup = await setupFakeLifecycle({ closeFailures: 2 })
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+
+    await expect(setup.controller.dispose()).rejects.toThrow("fake close failure")
+    expect(setup.calls).toContain("worktree:close")
+    expect(setup.resources.handle?.closed).toBe(false)
+
+    await expect(setup.controller.dispose()).resolves.toBeUndefined()
+    expect(setup.resources.handle?.closed).toBe(true)
+  })
+
   it("keeps parallel session ownership isolated", async () => {
     const setup = await setupParallelFakeLifecycle()
     const capabilityA = createCapability({ sessionId: "ses_a", generation: 1, role: "host" })
@@ -431,7 +487,7 @@ interface FakeSessionResources {
   worktreePath?: string
 }
 
-async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMismatch?: boolean } = {}): Promise<FakeLifecycleSetup> {
+async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMismatch?: boolean; closeFailures?: number } = {}): Promise<FakeLifecycleSetup> {
   const repository = await createRepository()
   await writeFile(join(repository, "deleted.txt"), "delete me\n")
   await runGit(repository, ["add", "deleted.txt"])
@@ -538,6 +594,9 @@ async function setupParallelFakeLifecycle(): Promise<ParallelFakeLifecycleSetup>
           target() {
             return { type: "remote", url: `https://fake-${input.sessionId}.example.test` }
           },
+          async close() {
+            await resource.handle?.close()
+          },
         }
       },
       async createWorktree(options) {
@@ -573,9 +632,10 @@ async function setupParallelFakeLifecycle(): Promise<ParallelFakeLifecycleSetup>
   return { controller, store, resources }
 }
 
-function createFakeSessionFactory(calls: string[], resources: FakeSessionResources, options: { syncFailures?: number } = {}): SandcastleSessionFactory {
+function createFakeSessionFactory(calls: string[], resources: FakeSessionResources, options: { syncFailures?: number; closeFailures?: number } = {}): SandcastleSessionFactory {
   const fake = createFakeProvider({
     failCopyFileOutCount: options.syncFailures,
+    closeFailures: options.closeFailures,
     onCommand(command) {
       if (command.trim() === "true") calls.push("sync")
     },
@@ -604,6 +664,9 @@ function createFakeSessionFactory(calls: string[], resources: FakeSessionResourc
       target() {
         if (!fake.handles.at(-1)) throw new Error("fake provider did not create a handle")
         return { type: "remote", url: "https://fake.example.test" }
+      },
+      async close() {
+        await fake.handles.at(-1)?.close()
       },
       recoveryMetadata: () => ({ runtime: "fake" }),
     }),
@@ -653,7 +716,7 @@ interface FakeHandle extends IsolatedSandboxHandle {
   commands: string[]
 }
 
-function createFakeProvider(options: { failCopyFileOut?: boolean; failCopyFileOutCount?: number; onCommand?: (command: string) => void } = {}) {
+function createFakeProvider(options: { failCopyFileOut?: boolean; failCopyFileOutCount?: number; closeFailures?: number; onCommand?: (command: string) => void } = {}) {
   const handles: FakeHandle[] = []
   const provider = createIsolatedSandboxProvider({
     name: "fake-isolated",
@@ -691,6 +754,10 @@ function createFakeProvider(options: { failCopyFileOut?: boolean; failCopyFileOu
           await copyFile(sandboxPath, hostPath)
         },
         async close() {
+          if ((options.closeFailures ?? 0) > 0) {
+            options.closeFailures = (options.closeFailures ?? 0) - 1
+            throw new Error("fake close failure")
+          }
           handle.closed = true
           await rm(root, { recursive: true, force: true })
         },
