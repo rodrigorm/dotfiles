@@ -81,6 +81,7 @@ export interface SandboxRecord {
   operation?: {
     kind: SandboxOperation
     phase: string
+    force?: boolean
   }
   createdAt: string
   updatedAt: string
@@ -187,7 +188,7 @@ export interface WorkspaceGateway {
   create(input: WorkspaceCreateInput): Promise<WorkspaceInfo>
   applyCapture?(input: { workspaceId: string; directory: string; capture: WorkingTreeCapture }): Promise<void>
   warp(input: { sessionId: string; workspaceId: string | null; directory: string }): Promise<void>
-  replaySession?(input: { sessionId: string; target: Extract<WorkspaceTarget, { type: "remote" }> }): Promise<void>
+  replaySession?(input: { sessionId: string; directory: string; target: Extract<WorkspaceTarget, { type: "remote" }> }): Promise<void>
   startSync?(input: { directory: string }): Promise<void>
   remove(input: { workspaceId: string; directory: string }): Promise<void>
   waitForSync?(input: { workspaceId: string; directory: string; timeoutMs: number }): Promise<void>

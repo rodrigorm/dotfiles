@@ -63,6 +63,7 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
   async create(input: WorkspaceCreateInput): Promise<WorkspaceInfo> {
     const value = await this.request("/experimental/workspace", {
       method: "POST",
+      directory: input.directory,
       body: {
         id: input.id,
         type: input.type,
@@ -113,11 +114,11 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
     })
   }
 
-  async replaySession(input: { sessionId: string; target: Extract<WorkspaceTarget, { type: "remote" }> }): Promise<void> {
+  async replaySession(input: { sessionId: string; directory: string; target: Extract<WorkspaceTarget, { type: "remote" }> }): Promise<void> {
     const events = await this.sessionEvents?.(input.sessionId) ?? []
     if (events.length === 0) throw new SandboxError("sync", "OpenCode session history is empty", "WORKSPACE_HISTORY")
     for (let index = 0; index < events.length; index += 10) {
-      await this.requestTarget(input.target, "/sync/replay", { directory: "", events: events.slice(index, index + 10) })
+      await this.requestTarget(input.target, "/sync/replay", { directory: input.directory, events: events.slice(index, index + 10) })
     }
   }
 
@@ -193,7 +194,7 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
     url.search = ""
     const headers = new Headers(target.headers)
     headers.set("Content-Type", "application/json")
-    const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) })
+    const response = await this.fetcher(url, { method: "POST", headers, body: JSON.stringify(body) })
     const text = await readLimitedBody(response)
     if (!response.ok) throw new SandboxError("sync", redactText(text), `WORKSPACE_HTTP_${response.status}`)
   }

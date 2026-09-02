@@ -103,6 +103,7 @@ export class LifecycleController {
     try {
       const record = await this.store.get(request.capability.sessionId)
       this.assertCapability(record, request.capability)
+      this.assertOperationAllowed(record, request)
 
       switch (request.operation) {
         case "start":
@@ -121,7 +122,7 @@ export class LifecycleController {
         case "diagnose":
           return await this.diagnose(record)
         case "delete":
-          return await this.delete(request.capability, record, request.force)
+          return await this.delete(request.capability, request.force)
         case "retry":
           return await this.retry(request.capability, record)
       }
@@ -137,9 +138,17 @@ export class LifecycleController {
     }
   }
 
-  async onSessionIdle(sessionId: string): Promise<void> {
+  async onSessionIdle(sessionId: string, expected?: { record: SandboxRecord; capability: ControlCapability }): Promise<void> {
     await this.store.withRecordLock(sessionId, async (record, write) => {
-      if (!record) return
+      if (!record) {
+        if (expected) throw retryStale()
+        return
+      }
+      if (expected) {
+        if (!sameRetryRecord(record, expected.record)) throw retryStale()
+        this.assertCapability(record, expected.capability)
+        this.assertOperationAllowed(record, { operation: "retry", force: false, capability: expected.capability })
+      }
       if (this.sandcastle) {
         try {
           await this.onSandcastleIdle(record, write)
@@ -327,7 +336,7 @@ export class LifecycleController {
         this.workspace.warp({ sessionId: record.sessionId, workspaceId: record.workspaceId, directory: record.directory }))
       await this.withTarget(record.workspaceId, session.target, () => this.workspace.startSync!({ directory: record.directory }))
       await this.workspace.waitForSync({ workspaceId: record.workspaceId, directory: record.directory, timeoutMs: 30_000 })
-      await this.workspace.replaySession({ sessionId: record.sessionId, target: session.target })
+      await this.workspace.replaySession({ sessionId: record.sessionId, directory: record.directory, target: session.target })
       await write({
         ...record,
         state: "remote",
@@ -405,6 +414,8 @@ export class LifecycleController {
     if (!context) throw new SandboxError("validate", "session context is not available", "SESSION_CONTEXT")
 
     return this.store.withRecordLock(capability.sessionId, async (existing, write) => {
+      this.assertCapability(existing, capability)
+      this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
       if (existing?.state === "remote") return successResponse("start", existing, "session is already remote")
       if (existing && (existing.state === "provisioning" || existing.state === "activation_pending")) {
         return successResponse("start", existing, "session activation is already pending")
@@ -538,6 +549,8 @@ export class LifecycleController {
     if (!context) throw new SandboxError("validate", "session context is not available", "SESSION_CONTEXT")
 
     return this.store.withRecordLock(capability.sessionId, async (existing, write) => {
+      this.assertCapability(existing, capability)
+      this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
       if (existing?.state === "remote") return successResponse("start", existing, "session is already remote")
       if (existing && (existing.state === "provisioning" || existing.state === "activation_pending")) {
         return successResponse("start", existing, "session activation is already pending")
@@ -664,6 +677,8 @@ export class LifecycleController {
 
   private async stop(capability: ControlCapability): Promise<SandboxResponse> {
     return this.store.withRecordLock(capability.sessionId, async (record, write) => {
+      this.assertCapability(record, capability)
+      this.assertOperationAllowed(record, { operation: "stop", force: false, capability })
       if (!record) return successResponse("stop", undefined, "session is already local")
       if (record.state === "detached" || record.state === "local") return successResponse("stop", record, "session is already local")
       if (record.state === "stop_pending") return successResponse("stop", record, "session detach is already pending")
@@ -735,52 +750,61 @@ export class LifecycleController {
     return successResponse("diagnose", record, "diagnostics completed", details)
   }
 
-  private async delete(capability: ControlCapability, record: SandboxRecord | undefined, force: boolean): Promise<SandboxResponse> {
-    if (!record || record.state === "deleted") return successResponse("delete", record, "Sandbox is already deleted")
-    const forceDiscard = force && record.state === "sync_failed"
-    if (force && (capability.role !== "host" || (record.state !== "detached" && !forceDiscard))) {
-      throw new SandboxError("remove", "force delete is available only on the host after stop", "FORCE_DELETE_SCOPE")
-    }
-    if (!forceDiscard && record.state !== "remote" && record.state !== "detached") {
-      throw new SandboxError("transition", "delete is blocked while a transition is pending", "DELETE_TRANSITION")
-    }
-    if (!force && this.infrastructure.preflightDelete) await this.infrastructure.preflightDelete(record)
-    if (!this.sandcastle && !this.providerDestroy && !this.infrastructure.remove) {
-      throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
-    }
+  private async delete(capability: ControlCapability, force: boolean): Promise<SandboxResponse> {
+    const decision = await this.store.withRecordLock(capability.sessionId, async (record, write) => {
+      this.assertCapability(record, capability)
+      this.assertOperationAllowed(record, { operation: "delete", force, capability })
+      if (!record || record.state === "deleted") return { record, forceDiscard: false }
+      const forceDiscard = force && record.state === "sync_failed"
+      if (force && (capability.role !== "host" || (record.state !== "detached" && !forceDiscard))) {
+        throw new SandboxError("remove", "force delete is available only on the host after stop", "FORCE_DELETE_SCOPE")
+      }
+      if (!forceDiscard && record.state !== "remote" && record.state !== "detached") {
+        throw new SandboxError("transition", "delete is blocked while a transition is pending", "DELETE_TRANSITION")
+      }
+      if (!force && this.infrastructure.preflightDelete) await this.infrastructure.preflightDelete(record)
+      if (!this.sandcastle && !this.providerDestroy && !this.infrastructure.remove) {
+        throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
+      }
 
-    let phase = "awaiting_idle"
-    if (forceDiscard) phase = "discarding"
-    else if (force || record.state === "detached") phase = "removing"
+      let phase = "awaiting_idle"
+      if (forceDiscard) phase = "discarding"
+      else if (record.state === "detached") phase = "removing"
+      const next: SandboxRecord = {
+        ...record,
+        state: "delete_pending",
+        operation: {
+          kind: "delete",
+          phase,
+          force,
+        },
+        updatedAt: this.now().toISOString(),
+      }
+      assertTransition(record.state, next.state)
+      await write(next)
+      return { record: next, forceDiscard }
+    })
 
-    const next: SandboxRecord = {
-      ...record,
-      state: "delete_pending",
-      operation: {
-        kind: "delete",
-        phase,
-      },
-      updatedAt: this.now().toISOString(),
-    }
-    assertTransition(record.state, next.state)
-    await this.store.write(next)
+    const next = decision.record
+    if (!next || next.state === "deleted") return successResponse("delete", next, "Sandbox is already deleted")
     if (!force) return successResponse("delete", next, "Delete agendado; a resposta atual sera concluida primeiro.")
 
-    await this.onSessionIdle(capability.sessionId)
+    await this.onSessionIdle(capability.sessionId, { record: next, capability })
     const final = await this.store.get(capability.sessionId)
     if (final?.state !== "deleted") {
       const lastError = final?.lastError ?? { stage: "remove", message: "sandbox removal is still pending" }
       return failureResponse("delete", final?.state ?? "error", lastError.stage, lastError.message, final)
     }
-    return successResponse("delete", final, forceDiscard ? "Failed sandbox discarded." : "Sandbox removed.")
+    return successResponse("delete", final, decision.forceDiscard ? "Failed sandbox discarded." : "Sandbox removed.")
   }
 
   private async retry(capability: ControlCapability, record: SandboxRecord | undefined): Promise<SandboxResponse> {
+    this.assertOperationAllowed(record, { operation: "retry", force: false, capability })
     if (record?.state === "orphaned") {
       throw new SandboxError("reconcile", "session sandbox is orphaned; manual recovery is required", "SESSION_ORPHANED")
     }
     if (record?.state === "recovery_pending") {
-      await this.onSessionIdle(record.sessionId)
+      await this.onSessionIdle(record.sessionId, { record, capability })
       return successResponse("retry", (await this.store.get(record.sessionId)) ?? record, "Retry completed.")
     }
     if (!record || (record.state !== "error" && record.state !== "sync_failed")) {
@@ -788,40 +812,48 @@ export class LifecycleController {
     }
     const operation = record.operation?.kind
     if (operation === "start") {
-      if (record.operation?.phase === "awaiting_idle") return this.retryPending(record, "activation_pending", "start", "awaiting_idle")
-      if (record.operation?.phase === "remote") return this.retryRemoteSync(record)
+      if (record.operation?.phase === "awaiting_idle") return this.retryPending(capability, record, "activation_pending", "start", "awaiting_idle")
+      if (record.operation?.phase === "remote") return this.retryRemoteSync(capability, record)
       return this.start(capability)
     }
-    if (operation === "stop") return this.retryPending(record, "stop_pending", "stop", "awaiting_idle")
+    if (operation === "stop") return this.retryPending(capability, record, "stop_pending", "stop", "awaiting_idle")
     if (operation === "delete") {
       let phase = "awaiting_idle"
       if (record.operation?.phase === "destroying") phase = "destroying"
       else if (record.operation?.phase === "removing") phase = "removing"
       else if (record.operation?.phase === "discarding") phase = "discarding"
-      return this.retryPending(record, "delete_pending", "delete", phase)
+      return this.retryPending(capability, record, "delete_pending", "delete", phase)
     }
     throw new SandboxError("validate", "no retryable operation is recorded", "RETRY_UNAVAILABLE")
   }
 
   private async retryPending(
+    capability: ControlCapability,
     record: SandboxRecord,
     state: "activation_pending" | "stop_pending" | "delete_pending",
     kind: "start" | "stop" | "delete",
     phase: string,
   ): Promise<SandboxResponse> {
-    const next: SandboxRecord = {
-      ...record,
-      state,
-      operation: {
-        kind,
-        phase,
-      },
-      updatedAt: this.now().toISOString(),
-      lastError: undefined,
-    }
-    assertTransition(record.state, next.state)
-    await this.store.write(next)
-    await this.onSessionIdle(record.sessionId)
+    const next = await this.store.withRecordLock(record.sessionId, async (current, write) => {
+      if (!current || !sameRetryRecord(current, record)) throw retryStale()
+      this.assertCapability(current, capability)
+      this.assertOperationAllowed(current, { operation: "retry", force: false, capability })
+      const next: SandboxRecord = {
+        ...current,
+        state,
+        operation: {
+          ...current.operation,
+          kind,
+          phase,
+        },
+        updatedAt: this.now().toISOString(),
+        lastError: undefined,
+      }
+      assertTransition(current.state, next.state)
+      await write(next)
+      return next
+    })
+    await this.onSessionIdle(record.sessionId, { record: next, capability })
     const final = (await this.store.get(record.sessionId)) ?? next
     if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned") {
       const lastError = final.lastError ?? { stage: "reconcile", message: "retry failed" }
@@ -830,33 +862,39 @@ export class LifecycleController {
     return successResponse("retry", final, "Retry completed.")
   }
 
-  private async retryRemoteSync(record: SandboxRecord): Promise<SandboxResponse> {
-    try {
-      await this.syncOut(record)
-      const next = {
-        ...record,
-        state: "remote" as const,
-        updatedAt: this.now().toISOString(),
-        operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
-        lastError: undefined,
+  private async retryRemoteSync(capability: ControlCapability, record: SandboxRecord): Promise<SandboxResponse> {
+    const next = await this.store.withRecordLock(record.sessionId, async (current, write) => {
+      if (!current || !sameRetryRecord(current, record)) throw retryStale()
+      this.assertCapability(current, capability)
+      this.assertOperationAllowed(current, { operation: "retry", force: false, capability })
+      try {
+        await this.syncOut(current)
+        const next = {
+          ...current,
+          state: "remote" as const,
+          updatedAt: this.now().toISOString(),
+          operation: current.operation ? { ...current.operation, phase: "remote" } : undefined,
+          lastError: undefined,
+        }
+        assertTransition(current.state, next.state)
+        await write(next)
+        return next
+      } catch (error) {
+        const state = failureState(error, false)
+        await write({
+          ...current,
+          state,
+          operation: failedOperation(current, error, false),
+          updatedAt: this.now().toISOString(),
+          lastError: {
+            stage: failureStage(error),
+            message: redactError(error),
+          },
+        })
+        throw error
       }
-      assertTransition(record.state, next.state)
-      await this.store.write(next)
-      return successResponse("retry", next, "Retry completed.")
-    } catch (error) {
-      const state = failureState(error, false)
-      await this.store.write({
-        ...record,
-        state,
-        operation: failedOperation(record, error, false),
-        updatedAt: this.now().toISOString(),
-        lastError: {
-          stage: failureStage(error),
-          message: redactError(error),
-        },
-      })
-      throw error
-    }
+    })
+    return successResponse("retry", next, "Retry completed.")
   }
 
   private assertCapability(record: SandboxRecord | undefined, capability: ControlCapability): void {
@@ -865,6 +903,19 @@ export class LifecycleController {
     }
     if (record && capability.role === "remote" && record.state === "detached") {
       throw new SandboxError("validate", "remote capability is detached", "CAPABILITY_REVOKED")
+    }
+  }
+
+  private assertOperationAllowed(record: SandboxRecord | undefined, request: AuthorizedControlRequest): void {
+    if (request.capability.role !== "remote") return
+    if (request.operation === "start" || (request.operation === "retry" && record?.operation?.kind === "start")) {
+      throw new SandboxError("validate", "start is only authorized from the host", "REQUEST_START")
+    }
+    if (request.operation === "delete" && request.force) {
+      throw new SandboxError("validate", "force delete is only authorized from the host", "REQUEST_FORCE")
+    }
+    if (request.operation === "retry" && isForceDelete(record)) {
+      throw new SandboxError("validate", "force delete can only be retried from the host", "REQUEST_FORCE")
     }
   }
 
@@ -976,6 +1027,30 @@ function nonSecretValue(value: unknown): unknown {
 function workspaceIdFor(sessionId: string, generation: number): string {
   const compact = Buffer.from(`${sessionId}:${generation}`).toString("base64url").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40)
   return `wrk_${compact}`
+}
+
+function sameRetryRecord(current: SandboxRecord, expected: SandboxRecord): boolean {
+  return (
+    current.sessionId === expected.sessionId &&
+    current.generation === expected.generation &&
+    current.workspaceId === expected.workspaceId &&
+    current.state === expected.state &&
+    current.updatedAt === expected.updatedAt &&
+    current.operation?.kind === expected.operation?.kind &&
+    current.operation?.phase === expected.operation?.phase &&
+    current.operation?.force === expected.operation?.force
+  )
+}
+
+function retryStale(): SandboxError {
+  return new SandboxError("validate", "session changed while retry was pending; retry again", "RETRY_STALE")
+}
+
+function isForceDelete(record: SandboxRecord | undefined): boolean {
+  const operation = record?.operation
+  if (operation?.kind !== "delete") return false
+  if (operation.force === true || operation.phase === "discarding") return true
+  return operation.force === undefined && (operation.phase === "removing" || operation.phase === "destroying")
 }
 
 interface Deferred<T> {

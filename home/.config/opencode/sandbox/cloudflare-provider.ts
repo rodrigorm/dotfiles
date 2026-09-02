@@ -78,6 +78,7 @@ interface CloudflareMetadata {
   sandboxId?: string
   branch?: string
   baseSha?: string
+  checkoutHead?: string
   tunnelName?: string
 }
 
@@ -86,6 +87,7 @@ interface Activation {
   sandboxId: string
   branch: string
   baseSha: string
+  checkoutHead: string
   tunnelName: string
   tunnel?: CloudflareTunnelInfo
   password: string
@@ -188,6 +190,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
         sandboxId: workspace.sandboxId,
         branch,
         baseSha,
+        checkoutHead: workspace.checkoutHead,
         tunnelName,
         password,
         authContent,
@@ -334,12 +337,13 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     metadata: CloudflareMetadata,
     branch: string,
     baseSha: string,
-  ): Promise<{ sandboxId: string; created: boolean }> {
-    if (metadata.sandboxId && metadata.baseSha === baseSha) {
+  ): Promise<{ sandboxId: string; created: boolean; checkoutHead: string }> {
+    if (metadata.sandboxId && metadata.baseSha === baseSha && metadata.checkoutHead) {
       try {
         if (await this.client.running(metadata.sandboxId) && await this.hasGitWorkspace(metadata.sandboxId)) {
+          await this.ensureHead(metadata.sandboxId, metadata.checkoutHead)
           await this.ensureBranch(metadata.sandboxId, branch)
-          return { sandboxId: metadata.sandboxId, created: false }
+          return { sandboxId: metadata.sandboxId, created: false, checkoutHead: metadata.checkoutHead }
         }
       } catch (error) {
         if (!isNotFound(error)) throw error
@@ -348,15 +352,16 @@ export class CloudflareProvider implements WorkspaceProviderBase {
 
     const archive = await this.createArchive(baseSha)
     const sandboxId = await this.client.createSandbox()
+    let checkoutHead: string
     try {
       await this.client.hydrate(sandboxId, archive)
-      await this.initializeWorkspace(sandboxId, branch)
+      checkoutHead = await this.initializeWorkspace(sandboxId, branch)
     } catch (error) {
       await this.destroyIfPresent(sandboxId)
       throw error
     }
     if (metadata.sandboxId && metadata.sandboxId !== sandboxId) await this.destroyIfPresent(metadata.sandboxId)
-    return { sandboxId, created: true }
+    return { sandboxId, created: true, checkoutHead }
   }
 
   private async hasGitWorkspace(sandboxId: string): Promise<boolean> {
@@ -382,7 +387,18 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "checkout", "-B", branch] }, "checkout")
   }
 
-  private async initializeWorkspace(sandboxId: string, branch: string): Promise<void> {
+  private async ensureHead(sandboxId: string, expectedHead: string): Promise<void> {
+    const current = await this.run(
+      sandboxId,
+      { argv: ["git", "-C", REMOTE_DIRECTORY, "rev-parse", "HEAD"] },
+      "checkout",
+    )
+    if (current.stdout.trim() !== expectedHead) {
+      throw new SandboxError("checkout", "existing Cloudflare checkout is at a different revision", "REMOTE_SHA_MISMATCH")
+    }
+  }
+
+  private async initializeWorkspace(sandboxId: string, branch: string): Promise<string> {
     await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "init"] }, "checkout")
     await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "config", "user.email", "opencode@localhost"] }, "checkout")
     await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "config", "user.name", "OpenCode Sandbox"] }, "checkout")
@@ -393,6 +409,9 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       { argv: ["git", "-C", REMOTE_DIRECTORY, "commit", "--allow-empty", "-m", "opencode: initialize sandbox workspace"] },
       "checkout",
     )
+    const head = await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "rev-parse", "HEAD"] }, "checkout")
+    assertSha(head.stdout.trim())
+    return head.stdout.trim()
   }
 
   private async createArchive(baseSha: string): Promise<Uint8Array> {
@@ -678,9 +697,12 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const runtime = runtimeDirectory(workspaceId)
     let failure: unknown
     try {
-      await this.client.exec(sandboxId, {
+      const result = await this.client.exec(sandboxId, {
         argv: ["sh", "-lc", cleanupCommand(runtime)],
       })
+      if (result.exitCode !== 0 || result.signal !== null) {
+        failure = new SandboxError("remove", redactText(result.stderr || result.stdout || "Cloudflare cleanup failed"), "CLOUDFLARE_COMMAND")
+      }
     } catch (error) {
       if (!isNotFound(error)) failure = error
     }
@@ -790,6 +812,12 @@ function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): CloudflareMeta
     assertSha(baseSha)
     metadata.baseSha = baseSha
   }
+  const checkoutHead = field("checkoutHead")
+  if (checkoutHead !== undefined) {
+    if (typeof checkoutHead !== "string") throw new SandboxError("validate", "Cloudflare checkout HEAD is invalid", "GIT_HEAD")
+    assertSha(checkoutHead)
+    metadata.checkoutHead = checkoutHead
+  }
   const tunnelName = field("tunnelName")
   if (tunnelName !== undefined) {
     if (typeof tunnelName !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(tunnelName)) {
@@ -805,6 +833,7 @@ function metadataFor(activation: Activation): Record<string, unknown> {
     sandboxId: activation.sandboxId,
     branch: activation.branch,
     baseSha: activation.baseSha,
+    checkoutHead: activation.checkoutHead,
     tunnelName: activation.tunnelName,
   }
 }

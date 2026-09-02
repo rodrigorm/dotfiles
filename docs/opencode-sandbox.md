@@ -126,7 +126,7 @@ Non-Sandcastle pending states enter `recovery_pending` during plugin startup and
 
 ## Control and trust
 
-The plugin injects a short-lived capability into the shell environment. The capability is scoped to one session generation and either the host or remote role. The CLI blocks direct remote `start` and `delete --force`; the lifecycle currently has a loophole where remote `retry` can repeat a failed start. The control channel accepts only loopback TCP, a private Unix socket, or the provider mailbox transport.
+The plugin injects a short-lived capability into the shell environment. The capability is scoped to one session generation and either the host or remote role. Both the CLI and lifecycle controller block remote `start`; retry cannot bypass that rule. `delete --force` is also host-only. The control channel accepts only loopback TCP, a private Unix socket, or the provider mailbox transport.
 
 State files reject credential-shaped keys, use private permissions, write atomically, and redact errors. Workspace metadata strips secret-shaped fields before it reaches OpenCode. Do not weaken these checks to improve diagnostics; diagnostics must expose evidence without credentials.
 
@@ -191,12 +191,8 @@ The current implementation has documented gaps, not hidden assumptions:
 - Plugin disposal drops Sandcastle handles without closing their sessions.
 - A restarted plugin cannot inspect, adopt, or delete a control-lost runtime through `sandboxctl`.
 - SBX and Cloudflare reuse or destruction do not consistently prove provider-resource ownership.
-- The shared `sbx` control proxy has provider-wide lifetime but workspace-level release paths can close it.
 - `delete`, `retry`, and reconciliation do not hold the record lock across their complete decision and write.
-- Cloudflare cleanup can ignore a non-zero remote exit; reuse does not verify checkout `HEAD`.
-- Workspace creation omits the requested directory, and replay bypasses the injected fetcher.
 - A Sandcastle start failure can leave an OpenCode workspace registration behind, and a missing handle can be marked deleted without proving the provider resource is absent.
-- Remote `retry` can repeat a failed host-only start.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.
 - Default `diagnose` reports only that diagnostics are not configured. Log production is not redacted or bounded before transport.
 - `sandboxctl` advertises a Node fallback file that is not shipped; Bun is currently required.

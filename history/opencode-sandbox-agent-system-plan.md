@@ -170,6 +170,14 @@ Each phase leaves one useful vertical path working. Do not begin the state redes
 
 ### Phase 0: close the existing safety holes
 
+Progress on 2026-09-02:
+
+- Completed: keep the shared SBX control proxy alive until its provider has no active workspace.
+- Completed: enforce host-only start in the lifecycle controller, including retry.
+- Completed: fail Cloudflare cleanup on a non-zero remote exit and verify `HEAD` before reuse.
+- Completed: route workspace creation and replay through the requested directory and injected transport.
+- Remaining: disposal, ownership proof, serialization, failed-start workspace cleanup, bounded diagnostics, and launcher fallback.
+
 Changes:
 
 - Make plugin disposal await an idempotent lifecycle disposal that closes every owned Sandcastle session, rejects target gates, cancels idle work, and closes provider resources at their correct scope.

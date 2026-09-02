@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test"
 import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises"
+import { createConnection, createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -357,6 +358,32 @@ describe("workspace sync contract", () => {
       code: "WORKSPACE_SYNC_RESULT",
     })
   })
+
+  it("routes workspace creation and replay through the requested directory and transport", async () => {
+    const requests: Array<{ url: URL; body: unknown }> = []
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/default",
+      projectId: "prj_1",
+      fetcher: async (input, init) => {
+        const url = new URL(String(input))
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined
+        requests.push({ url, body })
+        if (url.pathname === "/experimental/workspace") {
+          return Response.json({ id: "wrk_1", type: "sbx", name: "sandbox", branch: "opencode/test", directory: "/requested", extra: null, projectID: "prj_1" })
+        }
+        return new Response(null, { status: 204 })
+      },
+      sessionEvents: () => [{ id: "evt_1", aggregateID: "ses_1", seq: 0, type: "session.created", data: {} }],
+    })
+
+    await gateway.create({ type: "sbx", projectId: "prj_1", directory: "/requested", id: "wrk_1", branch: "opencode/test", extra: {} })
+    await gateway.replaySession({ sessionId: "ses_1", directory: "/requested", target: { type: "remote", url: "https://sandbox.example.test" } })
+
+    expect(requests[0]?.url.searchParams.get("directory")).toBe("/requested")
+    expect(requests[1]?.url.href).toBe("https://sandbox.example.test/sync/replay")
+    expect(requests[1]?.body).toMatchObject({ directory: "/requested" })
+  })
 })
 
 describe("control channel", () => {
@@ -621,6 +648,134 @@ describe("lifecycle controller", () => {
     await expect(controller.handle({ operation: "retry", force: false, capability })).resolves.toMatchObject({ state: "deleted" })
     expect(removeCalls).toBe(2)
     expect(destroyCalls).toBe(2)
+  })
+
+  it("does not let a remote capability retry a failed start", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "error" as const, operation: { kind: "start" as const, phase: "provisioning" } }
+    await store.write(record)
+    let created = false
+    const controller = new LifecycleController({
+      store,
+      workspace: {
+        async create() { created = true; throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "retry",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "remote" }),
+    })
+
+    expect(result).toMatchObject({ ok: false, stage: "validate", state: "error" })
+    expect(result.message).toMatch(/host/)
+    expect(created).toBe(false)
+  })
+
+  it("does not let a remote capability retry a failed force delete", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "error" as const,
+      operation: { kind: "delete" as const, phase: "discarding", force: true },
+    }
+    await store.write(record)
+    let destroyed = false
+    const controller = new LifecycleController({
+      store,
+      providerDestroy: async () => { destroyed = true },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { throw new Error("must not warp") },
+        async remove() { throw new Error("must not remove") },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "retry",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "remote" }),
+    })
+
+    expect(result).toMatchObject({ ok: false, stage: "validate", state: "error" })
+    expect(result.message).toMatch(/host/)
+    expect(destroyed).toBe(false)
+    expect((await store.get(record.sessionId))?.state).toBe("error")
+  })
+
+  it("does not let a stale retry overwrite a new start", async () => {
+    let unblock!: () => void
+    let readStarted!: () => void
+    const initialRead = new Promise<void>((resolve) => { readStarted = resolve })
+    const store = new (class extends FileStateStore {
+      private pause = true
+
+      override async get(sessionId: string) {
+        const record = await super.get(sessionId)
+        if (this.pause) {
+          this.pause = false
+          readStarted()
+          await new Promise<void>((resolve) => { unblock = resolve })
+        }
+        return record
+      }
+    })(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "error" as const,
+      operation: { kind: "delete" as const, phase: "destroying", force: false },
+    }
+    await store.write(record)
+    let destroyed = false
+    const controller = new LifecycleController({
+      store,
+      capture: async () => ({ baseSha: record.baseSha, patch: "", untracked: [] }),
+      providerDestroy: async () => { destroyed = true },
+      workspace: {
+        async create(input) {
+          return {
+            id: input.id ?? record.workspaceId,
+            type: input.type,
+            name: "workspace",
+            branch: input.branch,
+            directory: input.directory,
+            projectID: input.projectId,
+            extra: null,
+          }
+        },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    controller.registerContext({
+      sessionId: record.sessionId,
+      projectId: record.projectId,
+      directory: record.directory,
+      worktree: record.directory,
+    })
+
+    const remoteRetry = controller.handle({
+      operation: "retry",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "remote" }),
+    })
+    await initialRead
+    await expect(controller.handle({
+      operation: "start",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })).resolves.toMatchObject({ ok: true, state: "activation_pending" })
+    unblock()
+
+    const result = await remoteRetry
+
+    expect(result).toMatchObject({ ok: false, stage: "validate", state: "activation_pending" })
+    expect(result.message).toMatch(/changed while retry/i)
+    expect(destroyed).toBe(false)
+    expect((await store.get(record.sessionId))?.state).toBe("activation_pending")
   })
 
   it("redacts credentials from diagnostics while keeping recovery metadata", async () => {
@@ -1425,6 +1580,78 @@ describe("Docker Sandbox provider", () => {
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
   })
 
+  it("keeps the shared control proxy alive while another workspace is active", async () => {
+    const root = await temporaryDirectory()
+    const socketPath = join(root, "control.sock")
+    const controlServer = createServer((socket) => socket.end())
+    await new Promise<void>((resolve, reject) => {
+      controlServer.once("error", reject)
+      controlServer.listen(socketPath, resolve)
+    })
+    const baseSha = "0123456789012345678901234567890123456789"
+    const supervisorInputs: string[][] = []
+    const provider = new SbxProvider({
+      worktree: root,
+      deferActivation: true,
+      localControlSocket: socketPath,
+      controlTokenFor: async (sessionId) => `token-${sessionId}`,
+      reservePort: async () => 4101 + supervisorInputs.length,
+      fetcher: (async () => Response.json({ healthy: true })) as unknown as typeof fetch,
+      supervisor: {
+        async start(input) {
+          supervisorInputs.push(input.argv)
+          let finish!: (result: ProcessResult) => void
+          const result = new Promise<ProcessResult>((resolve) => { finish = resolve })
+          return {
+            pid: 100 + supervisorInputs.length,
+            result,
+            terminate: () => finish({ exitCode: null, signal: "SIGTERM", stdout: "", stderr: "" }),
+          }
+        },
+      },
+      runner: {
+        async run(input) {
+          if (input.argv[0] === "sbx" && input.argv.includes("--show-toplevel")) return { exitCode: 0, signal: null, stdout: "/workspace/project\n", stderr: "" }
+          if (input.argv[0] === "sbx" && input.argv.includes("opencode") && input.argv.includes("--version")) return { exitCode: 0, signal: null, stdout: "1.18.23\n", stderr: "" }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
+      },
+    })
+    const info = (id: string) => ({
+      id,
+      type: "sbx",
+      name: id,
+      branch: `opencode/${id}`,
+      directory: root,
+      projectID: "prj_1",
+      extra: { baseSha, sessionId: `ses_${id}`, generation: 1 },
+    })
+    const first = info("first")
+    const second = info("second")
+
+    try {
+      await Promise.all([
+        provider.prepare(first, { OPENCODE_AUTH_CONTENT: "{}" }),
+        provider.prepare(second, { OPENCODE_AUTH_CONTENT: "{}" }),
+      ])
+      await Promise.all([provider.activate(first.id), provider.activate(second.id)])
+      const controlPorts = supervisorInputs.map((argv) => Number((argv[argv.indexOf("-R") + 1] ?? "").split(":").at(-1)))
+      expect(new Set(controlPorts).size).toBe(1)
+      const forwarding = supervisorInputs[0]?.at(supervisorInputs[0]!.indexOf("-R") + 1) ?? ""
+      const controlPort = Number(forwarding.split(":").at(-1))
+
+      await expect(provider.destroy({ ...info("missing"), extra: {} })).rejects.toMatchObject({ code: "SBX_IDENTITY_UNAVAILABLE" })
+      await expect(canConnect(controlPort)).resolves.toBeUndefined()
+
+      await provider.release(first)
+
+      await expect(canConnect(controlPort)).resolves.toBeUndefined()
+    } finally {
+      await provider.dispose().catch(() => undefined)
+      await new Promise<void>((resolve) => controlServer.close(() => resolve()))
+    }
+  })
+
   it("removes a sandbox created before checkout fails", async () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
@@ -1525,6 +1752,7 @@ describe("Cloudflare Sandbox provider", () => {
   it("hydrates a private checkout, starts OpenCode, and syncs captures", async () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
+    const checkoutHead = "fedcba9876543210fedcba9876543210fedcba98"
     const calls: string[] = []
     const client: CloudflareSandboxClient = {
       async createSandbox() {
@@ -1543,6 +1771,9 @@ describe("Cloudflare Sandbox provider", () => {
       },
       async exec(id, input) {
         calls.push(`exec:${id}:${input.argv[0] ?? ""}`)
+        if (input.argv.includes("--is-inside-work-tree")) return { exitCode: 0, signal: null, stdout: "true\n", stderr: "" }
+        if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: `${checkoutHead}\n`, stderr: "" }
+        if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: "opencode/sandbox-cf\n", stderr: "" }
         return { exitCode: 0, signal: null, stdout: "", stderr: "" }
       },
       async putFile(id, path) {
@@ -1604,9 +1835,74 @@ describe("Cloudflare Sandbox provider", () => {
     expect(calls.some((call) => call.endsWith(":/workspace/nested.txt"))).toBe(true)
 
     await provider.release(info)
+    await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
+    expect(calls.filter((call) => call === "create")).toHaveLength(1)
+    await provider.release(info)
     await provider.destroy(info)
     expect(calls).toContain("destroy-tunnel:sandboxa2:4096")
     expect(calls).toContain("destroy:sandboxa2")
+  })
+
+  it("fails cleanup when the remote cleanup command fails", async () => {
+    let tunnelDestroyed = false
+    const provider = new CloudflareProvider({
+      worktree: await temporaryDirectory(),
+      client: {
+        async createSandbox() { return "sandboxa2" },
+        async destroySandbox() {},
+        async destroyTunnel() { tunnelDestroyed = true },
+        async running() { return true },
+        async exec() { return { exitCode: 1, signal: null, stdout: "", stderr: "cleanup failed" } },
+        async putFile() {},
+        async getFile() { return new Uint8Array() },
+        async hydrate() {},
+        async tunnel(_id, port) { return { id: "tunnel_1", port, url: "https://sandbox.example.test" } },
+      },
+    })
+    const info = {
+      id: "wrk_cf_cleanup",
+      type: "cloudflare",
+      name: "workspace",
+      branch: "opencode/cloudflare-cleanup",
+      directory: "/tmp/project",
+      projectID: "prj_1",
+      extra: { providerState: { sandboxId: "sandboxa2", sessionId: "ses_1", generation: 1 } },
+    }
+
+    await expect(provider.release(info)).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
+    expect(tunnelDestroyed).toBe(true)
+  })
+
+  it("does not reuse a Cloudflare checkout at a different revision", async () => {
+    const baseSha = "0123456789012345678901234567890123456789"
+    const provider = new CloudflareProvider({
+      worktree: await temporaryDirectory(),
+      client: {
+        async createSandbox() { throw new Error("must not create") },
+        async destroySandbox() {},
+        async destroyTunnel() {},
+        async running() { return true },
+        async exec(_id, input) {
+          if (input.argv.includes("--is-inside-work-tree")) return { exitCode: 0, signal: null, stdout: "true\n", stderr: "" }
+          if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: "fedcba9876543210fedcba9876543210fedcba98\n", stderr: "" }
+          return { exitCode: 0, signal: null, stdout: "opencode/cloudflare-reuse\n", stderr: "" }
+        },
+        async putFile() {},
+        async getFile() { return new Uint8Array() },
+        async hydrate() {},
+        async tunnel(_id, port) { return { id: "tunnel_1", port, url: "https://sandbox.example.test" } },
+      },
+    })
+
+    await expect(provider.prepare({
+      id: "wrk_cf_reuse",
+      type: "cloudflare",
+      name: "workspace",
+      branch: "opencode/cloudflare-reuse",
+      directory: "/tmp/project",
+      projectID: "prj_1",
+      extra: { providerState: { sandboxId: "sandboxa2", baseSha, checkoutHead: baseSha, branch: "opencode/cloudflare-reuse", sessionId: "ses_1", generation: 1 } },
+    }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
   })
 
   it("routes Cloudflare mailbox control through the local capability channel", async () => {
@@ -1642,6 +1938,9 @@ describe("Cloudflare Sandbox provider", () => {
       async exec(id, input) {
         if (input.argv[0] === "find" && requestVisible) {
           return { exitCode: 0, signal: null, stdout: `${input.argv[1]}/${requestName}\n`, stderr: "" }
+        }
+        if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") {
+          return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
         }
         return { exitCode: 0, signal: null, stdout: "", stderr: "" }
       },
@@ -1714,6 +2013,7 @@ describe("Cloudflare Sandbox provider", () => {
       },
       async exec(id, input) {
         calls.push(`exec:${id}:${input.argv[0] ?? ""}`)
+        if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
         if (input.onLine) {
           input.onLine("first")
           input.onLine("second")
@@ -1951,4 +2251,15 @@ function makeRecord(): SandboxRecord {
 
 function sha256ForTest(value: Uint8Array): string {
   return createHash("sha256").update(value).digest("hex")
+}
+
+function canConnect(port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port })
+    socket.once("connect", () => {
+      socket.end()
+      resolve()
+    })
+    socket.once("error", reject)
+  })
 }

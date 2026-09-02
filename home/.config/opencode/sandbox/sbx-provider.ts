@@ -251,6 +251,8 @@ export class SbxProvider implements WorkspaceProviderBase {
   private readonly active = new Map<string, Activation>()
   private controlProxy: Server | undefined
   private controlProxyPort: number | undefined
+  private controlProxyCreation: Promise<number> | undefined
+  private controlProxyClosing: Promise<void> | undefined
 
   constructor(options: SbxProviderOptions) {
     this.worktree = options.worktree
@@ -415,7 +417,7 @@ export class SbxProvider implements WorkspaceProviderBase {
     const activation = this.active.get(info.id)
     const sandbox = activation?.sandbox ?? readMetadata(info).sandbox
     if (!sandbox) {
-      await this.closeControlProxy()
+      if (this.active.size === 0) await this.closeControlProxy()
       return
     }
     if (activation?.controlToken) this.revokeControlToken?.(activation.controlToken)
@@ -427,7 +429,7 @@ export class SbxProvider implements WorkspaceProviderBase {
       await this.runSbx(["stop", sandbox], "detach")
     } finally {
       this.active.delete(info.id)
-      await this.closeControlProxy()
+      if (this.active.size === 0) await this.closeControlProxy()
     }
   }
 
@@ -435,14 +437,14 @@ export class SbxProvider implements WorkspaceProviderBase {
     const activation = this.active.get(info.id)
     const sandbox = activation?.sandbox ?? readMetadata(info).sandbox
     if (!sandbox) {
-      await this.closeControlProxy()
+      if (this.active.size === 0) await this.closeControlProxy()
       throw new SandboxError("remove", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
     }
     try {
       await this.runSbx(["rm", "--force", sandbox], "remove")
     } finally {
       this.active.delete(info.id)
-      await this.closeControlProxy()
+      if (this.active.size === 0) await this.closeControlProxy()
     }
   }
 
@@ -513,7 +515,7 @@ export class SbxProvider implements WorkspaceProviderBase {
         await waitForProcess(activation.process).catch(() => undefined)
         activation.process = undefined
       }
-      await this.closeControlProxy()
+      if (this.active.size === 1) await this.closeControlProxy()
       throw error
     }
   }
@@ -658,7 +660,20 @@ export class SbxProvider implements WorkspaceProviderBase {
   }
 
   private async ensureControlProxy(): Promise<number> {
+    if (this.controlProxyClosing) await this.controlProxyClosing
     if (this.controlProxyPort !== undefined) return this.controlProxyPort
+    const creation = this.controlProxyCreation ?? this.createControlProxy()
+    this.controlProxyCreation ??= creation
+    try {
+      const port = await creation
+      if (this.controlProxyPort !== port) throw new SandboxError("control_channel", "control proxy was closed during initialization", "CONTROL_PROXY")
+      return port
+    } finally {
+      if (this.controlProxyCreation === creation) this.controlProxyCreation = undefined
+    }
+  }
+
+  private async createControlProxy(): Promise<number> {
     const localControlSocket = this.localControlSocket
     if (!localControlSocket) throw new SandboxError("control_channel", "local control socket is unavailable", "CONTROL_CHANNEL")
 
@@ -702,7 +717,19 @@ export class SbxProvider implements WorkspaceProviderBase {
     }
   }
 
-  private async closeControlProxy(): Promise<void> {
+  private closeControlProxy(): Promise<void> {
+    if (this.controlProxyClosing) return this.controlProxyClosing
+    let closing!: Promise<void>
+    closing = this.finishClosingControlProxy().finally(() => {
+      if (this.controlProxyClosing === closing) this.controlProxyClosing = undefined
+    })
+    this.controlProxyClosing = closing
+    return closing
+  }
+
+  private async finishClosingControlProxy(): Promise<void> {
+    const creation = this.controlProxyCreation
+    if (creation) await creation.catch(() => undefined)
     const server = this.controlProxy
     this.controlProxy = undefined
     this.controlProxyPort = undefined
