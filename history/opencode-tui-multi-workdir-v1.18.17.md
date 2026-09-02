@@ -1,5 +1,7 @@
 # OpenCode TUI e múltiplos workdirs na versão 1.18.17
 
+> Historical version-specific snapshot. The sandbox system now uses OpenCode experimental workspaces and may target newer OpenCode versions. See [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md) for current behavior; retain this document only as evidence about v1.18.17.
+
 Pesquisa realizada em 12 de agosto de 2026 para decidir se o argumento de diretório do wrapper `oc` pode ser removido sem limitar o uso remoto pela TUI.
 
 Foram consultados somente a release, a documentação e o código-fonte oficiais do OpenCode. A auditoria foi feita na tag [`v1.18.17`](https://github.com/anomalyco/opencode/releases/tag/v1.18.17), commit imutável [`02546dfc2e4515a4f90aaf9ceb3890df2ac2b479`](https://github.com/anomalyco/opencode/tree/02546dfc2e4515a4f90aaf9ceb3890df2ac2b479). A instalação local também foi verificada: `opencode --version` retornou `1.18.17`, e `opencode attach --help` apresentou a opção `--dir` como “directory to run in”.
