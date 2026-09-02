@@ -145,6 +145,17 @@ describe("Sandcastle sync barrier", () => {
 })
 
 describe("Sandcastle lifecycle", () => {
+  it("removes the OpenCode workspace when start fails after creation", async () => {
+    const setup = await setupFakeLifecycle({ workspaceMismatch: true })
+
+    const result = await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+
+    expect(result).toMatchObject({ ok: false, state: "error", stage: "provision" })
+    expect(result.message).toMatch(/requested owner/)
+    expect(setup.calls).toContain("workspace:remove")
+    expect(setup.resources.handle?.closed).toBe(true)
+  })
+
   it("starts from dirty input, waits to warp, and stops into a clean branch", async () => {
     const setup = await setupFakeLifecycle()
     const { controller, capability, calls, repository, resources } = setup
@@ -420,7 +431,7 @@ interface FakeSessionResources {
   worktreePath?: string
 }
 
-async function setupFakeLifecycle(options: { syncFailures?: number } = {}): Promise<FakeLifecycleSetup> {
+async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMismatch?: boolean } = {}): Promise<FakeLifecycleSetup> {
   const repository = await createRepository()
   await writeFile(join(repository, "deleted.txt"), "delete me\n")
   await runGit(repository, ["add", "deleted.txt"])
@@ -453,7 +464,7 @@ async function setupFakeLifecycle(options: { syncFailures?: number } = {}): Prom
       async create(input) {
         calls.push("workspace:create")
         return {
-          id: input.id ?? "wrk_1",
+          id: options.workspaceMismatch ? "wrk_wrong" : input.id ?? "wrk_1",
           type: input.type,
           name: "fake-workspace",
           branch: input.branch,

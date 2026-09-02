@@ -658,6 +658,11 @@ export class LifecycleController {
           this.rejectTargetGate(workspaceId, error)
           this.targets.delete(workspaceId)
         }
+        try {
+          await this.removeWorkspace(current)
+        } catch (error) {
+          cleanupError ??= error
+        }
         const failed: SandboxRecord = {
           ...current,
           state: "error",

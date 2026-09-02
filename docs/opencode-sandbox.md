@@ -192,7 +192,7 @@ The current implementation has documented gaps, not hidden assumptions:
 - A restarted plugin cannot inspect, adopt, or delete a control-lost runtime through `sandboxctl`.
 - SBX and Cloudflare reuse or destruction do not consistently prove provider-resource ownership.
 - `delete`, `retry`, and reconciliation do not hold the record lock across their complete decision and write.
-- A Sandcastle start failure can leave an OpenCode workspace registration behind, and a missing handle can be marked deleted without proving the provider resource is absent.
+- A missing Sandcastle handle can be marked deleted without proving the provider resource is absent.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.
 - Default `diagnose` reports only that diagnostics are not configured. Log production is not redacted or bounded before transport.
 - `sandboxctl` advertises a Node fallback file that is not shipped; Bun is currently required.

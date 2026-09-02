@@ -176,7 +176,8 @@ Progress on 2026-09-02:
 - Completed: enforce host-only start in the lifecycle controller, including retry.
 - Completed: fail Cloudflare cleanup on a non-zero remote exit and verify `HEAD` before reuse.
 - Completed: route workspace creation and replay through the requested directory and injected transport.
-- Remaining: disposal, ownership proof, serialization, failed-start workspace cleanup, bounded diagnostics, and launcher fallback.
+- Completed: remove the OpenCode workspace registration when Sandcastle start fails.
+- Remaining: disposal, ownership proof, serialization, bounded diagnostics, and launcher fallback.
 
 Changes:
 
