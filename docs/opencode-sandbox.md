@@ -195,7 +195,6 @@ The current implementation has documented gaps, not hidden assumptions:
 - A missing Sandcastle handle can be marked deleted without proving the provider resource is absent.
 - `status` omits phase, generation, `baseSha`, freshness, last error, observed resources, allowed actions, and a recommended next action.
 - Default `diagnose` reports only that diagnostics are not configured. Log production is not redacted or bounded before transport.
-- `sandboxctl` advertises a Node fallback file that is not shipped; Bun is currently required.
 
 The ordered fix plan and acceptance criteria live in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
 

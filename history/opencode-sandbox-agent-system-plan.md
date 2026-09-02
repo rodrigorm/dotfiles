@@ -177,7 +177,8 @@ Progress on 2026-09-02:
 - Completed: fail Cloudflare cleanup on a non-zero remote exit and verify `HEAD` before reuse.
 - Completed: route workspace creation and replay through the requested directory and injected transport.
 - Completed: remove the OpenCode workspace registration when Sandcastle start fails.
-- Remaining: disposal, ownership proof, serialization, bounded diagnostics, and launcher fallback.
+- Completed: fail explicitly when neither the local Bun source nor the remote Node bundle is available.
+- Remaining: disposal, ownership proof, serialization, and bounded diagnostics.
 
 Changes:
 

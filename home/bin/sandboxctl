@@ -18,4 +18,9 @@ cli_source="$script_dir/../.config/opencode/sandbox/cli.ts"
 if command -v bun >/dev/null 2>&1 && [[ -f "$cli_source" ]]; then
     exec bun "$cli_source" "$@"
 fi
-exec node "$script_dir/../.config/opencode/sandbox/cli.mjs" "$@"
+cli_bundle="$script_dir/../.config/opencode/sandbox/cli.mjs"
+if command -v node >/dev/null 2>&1 && [[ -f "$cli_bundle" ]]; then
+    exec node "$cli_bundle" "$@"
+fi
+printf 'sandboxctl: Bun source or Node bundle is unavailable\n' >&2
+exit 127
