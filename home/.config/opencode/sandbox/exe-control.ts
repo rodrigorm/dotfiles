@@ -1,13 +1,15 @@
-import { isRecord, SandboxError, type CopyVmInput, type CreateVmInput, type ProcessRunner, type VmIdentity, type VmInfo } from "./types"
+import { copyVmIdentity, isRecord, SandboxError, type CopyVmInput, type CreateVmInput, type ProcessRunner, type VmIdentity, type VmInfo } from "./types"
 import { identityMatches, assertSafeComment, assertSafeSshDestination, assertSafeTag, assertSafeVmName, quoteRemoteCommandPart } from "./naming"
 import { nodeProcessRunner, sanitizeEnvironment } from "./process"
 import { redactError } from "./redaction"
 import { DEFAULT_SSH_BIN, fixedSshOptions } from "./remote-runtime"
 
+export const DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS = 600_000
+
 export interface ExeControl {
   create(input: CreateVmInput): Promise<VmInfo>
-  copy(input: CopyVmInput): Promise<VmInfo>
-  list(): Promise<VmInfo[]>
+  copy(input: CopyVmInput, onCreated?: (cleanup: () => Promise<void>) => void): Promise<VmInfo>
+  list(timeoutMs?: number): Promise<VmInfo[]>
   remove(identity: VmIdentity): Promise<void>
   tag(name: string, tags: string[]): Promise<void>
   replaceTags?(identity: VmIdentity, tags: string[]): Promise<void>
@@ -69,7 +71,7 @@ export class SshExeControl implements ExeControl {
     return this.runVmCommand(command)
   }
 
-  async copy(input: CopyVmInput): Promise<VmInfo> {
+  async copy(input: CopyVmInput, onCreated?: (cleanup: () => Promise<void>) => void): Promise<VmInfo> {
     assertSafeVmName(input.name)
     assertSafeVmName(input.baseVm)
     input.tags.forEach(assertSafeTag)
@@ -86,6 +88,8 @@ export class SshExeControl implements ExeControl {
       "--json",
     ]
     const vm = await this.runVmCommand(command)
+    const createdIdentity = copyVmIdentity(vm.identity)
+    onCreated?.(() => this.removeCreatedVm(createdIdentity))
     await this.tag(input.name, input.tags)
     await this.comment(input.name, input.comment)
     return {
@@ -99,19 +103,31 @@ export class SshExeControl implements ExeControl {
     }
   }
 
-  async list(): Promise<VmInfo[]> {
-    const result = await this.runJson(["ls", "--json"])
+  async list(timeoutMs?: number): Promise<VmInfo[]> {
+    const result = await this.runJson(["ls", "--json"], timeoutMs)
     return parseVmList(result)
   }
 
   async remove(identity: VmIdentity): Promise<void> {
     assertSafeVmName(identity.name)
     assertSafeSshDestination(identity.sshDest)
-    const matches = (await this.list()).filter((item) => identityMatches(identity, item.identity))
-    if (matches.length !== 1) {
-    throw new SandboxError("remove", "VM identity did not match exactly one observed VM", "VM_IDENTITY_MISMATCH")
+    const inventory = await this.list()
+    const matches = inventory.filter((item) => identityMatches(identity, item.identity))
+    const sameName = inventory.filter((item) => item.identity.name === identity.name)
+    if (matches.length !== 1 || sameName.length !== 1) {
+      throw new SandboxError("remove", "VM identity did not match exactly one observed VM", "VM_IDENTITY_MISMATCH")
     }
-    await this.runJson(["rm", identity.name, "--json"])
+    await this.runJson(["rm", matches[0]!.identity.name, "--json"])
+  }
+
+  private async removeCreatedVm(identity: VmIdentity): Promise<void> {
+    const inventory = await this.list()
+    const sameName = inventory.filter((item) => item.identity.name === identity.name)
+    const matches = sameName.filter((item) => sameResourceIdentity(identity, item.identity))
+    if (matches.length !== 1 || sameName.length !== 1) {
+      throw new SandboxError("remove", "created VM identity did not match exactly one observed VM", "VM_IDENTITY_MISMATCH")
+    }
+    await this.runJson(["rm", matches[0]!.identity.name, "--json"])
   }
 
   async tag(name: string, tags: string[]): Promise<void> {
@@ -139,10 +155,11 @@ export class SshExeControl implements ExeControl {
     return parseVm(value)
   }
 
-  private async runJson(command: string[]): Promise<unknown> {
+  private async runJson(command: string[], timeoutMs = DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS): Promise<unknown> {
     const result = await this.options.runner.run({
       argv: buildExeDevSshArgv(this.options, command),
       env: sanitizeEnvironment(),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
       maxOutputBytes: 512 * 1024,
     })
     if (result.exitCode !== 0) {
@@ -175,6 +192,9 @@ export function parseVm(value: unknown): VmInfo {
     throw new SandboxError("discover", "exe.dev returned invalid VM tags", "EXEDEV_SCHEMA")
   }
   tags.forEach(assertSafeTag)
+  if (value.comment !== undefined && typeof value.comment !== "string") {
+    throw new SandboxError("discover", "exe.dev returned an invalid VM comment", "EXEDEV_SCHEMA")
+  }
 
   const identity: VmIdentity = {
     name,
@@ -182,24 +202,51 @@ export function parseVm(value: unknown): VmInfo {
     tags: [...tags],
     comment: typeof value.comment === "string" ? value.comment : "",
   }
-  const id = optionalString(value.id ?? value.vm_id)
-  const sshUser = optionalString(value.ssh_user ?? value.sshUser)
-  const sshHost = optionalString(value.ssh_host ?? value.sshHost)
-  const region = optionalString(value.region)
+  const id = optionalString(value, "id", "vm_id")
+  const sshUser = optionalString(value, "ssh_user", "sshUser")
+  const sshHost = optionalString(value, "ssh_host", "sshHost")
+  const region = optionalString(value, "region")
   if (id) identity.id = id
   if (sshUser) identity.sshUser = sshUser
   if (sshHost) identity.sshHost = sshHost
   if (region) identity.region = region
-  return { identity, status: optionalString(value.status) }
+  return { identity, status: optionalString(value, "status") }
 }
 
 function stringField(value: Record<string, unknown>, ...keys: string[]): string {
-  for (const key of keys) {
-    if (typeof value[key] === "string" && value[key].length > 0) return value[key]
+  const values = presentStrings(value, keys)
+  if (values.length === 0) throw new SandboxError("discover", `exe.dev response is missing ${keys[0]}`, "EXEDEV_SCHEMA")
+  if (values.some((candidate) => candidate.length === 0) || new Set(values).size !== 1) {
+    throw new SandboxError("discover", `exe.dev response has an invalid ${keys[0]}`, "EXEDEV_SCHEMA")
   }
-  throw new SandboxError("discover", `exe.dev response is missing ${keys[0]}`, "EXEDEV_SCHEMA")
+  return values[0]!
 }
 
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined
+function optionalString(value: Record<string, unknown>, ...keys: string[]): string | undefined {
+  const present = keys.filter((key) => value[key] !== undefined)
+  if (present.length === 0) return undefined
+  if (present.some((key) => typeof value[key] !== "string" || value[key] === "")) {
+    throw new SandboxError("discover", `exe.dev response has an invalid ${keys[0]}`, "EXEDEV_SCHEMA")
+  }
+  const values = present.map((key) => value[key] as string)
+  if (new Set(values).size !== 1) throw new SandboxError("discover", `exe.dev response has an invalid ${keys[0]}`, "EXEDEV_SCHEMA")
+  return values[0]
+}
+
+function presentStrings(value: Record<string, unknown>, keys: string[]): string[] {
+  const present = keys.filter((key) => value[key] !== undefined)
+  if (present.some((key) => typeof value[key] !== "string")) {
+    throw new SandboxError("discover", `exe.dev response has an invalid ${keys[0]}`, "EXEDEV_SCHEMA")
+  }
+  return present.map((key) => value[key] as string)
+}
+
+function sameResourceIdentity(expected: VmIdentity, observed: VmIdentity): boolean {
+  // Tags and comments may be the operation that failed, so match immutable VM identity only.
+  return expected.id === observed.id &&
+    expected.name === observed.name &&
+    expected.sshDest === observed.sshDest &&
+    expected.sshUser === observed.sshUser &&
+    expected.sshHost === observed.sshHost &&
+    expected.region === observed.region
 }

@@ -33,11 +33,13 @@ import {
 } from "./types"
 
 const REMOTE_DIRECTORY = "/workspace"
+const REMOTE_CHECKOUT_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-worktree`
 const DEFAULT_REMOTE_PORT = 4096
 const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 600_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
+const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
 const TRANSFER_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-sandbox/transfers`
 
 const BOOTSTRAP = (version: string) => `set -eu
@@ -165,7 +167,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       ...info,
       name: `oc-cf-${suffix}`,
       branch: info.branch ?? this.branch(info.id),
-      directory: REMOTE_DIRECTORY,
+      directory: this.checkoutDirectory(),
     }
   }
 
@@ -197,7 +199,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     let controlToken: string | undefined
     let activation: Activation | undefined
     try {
-      await this.ignoreRuntime(workspace.sandboxId)
+      if (!this.deferActivation) await this.ignoreRuntime(workspace.sandboxId)
       await this.bootstrap(workspace.sandboxId)
       if (controlEnabled && (!this.localControlSocket || !this.controlTokenFor)) {
         throw new SandboxError("control_channel", "Cloudflare control transport is unavailable", "CONTROL_CHANNEL")
@@ -223,7 +225,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       this.active.set(info.id, activation)
       if (controlDirectory && controlToken) this.startControlPoller(activation)
       if (!this.deferActivation) await this.activate(info.id)
-      info.directory = REMOTE_DIRECTORY
+      info.directory = this.checkoutDirectory()
       info.extra = {
         ...(isRecord(info.extra) ? info.extra : {}),
         providerState: metadataFor(activation),
@@ -258,6 +260,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     if (capture.baseSha !== activation.baseSha) {
       throw new SandboxError("sync", "working tree capture does not match the Cloudflare checkout", "CAPTURE_SHA_MISMATCH")
     }
+    const checkoutDirectory = this.checkoutDirectory()
 
     if (capture.patch) {
       const patchPath = `${runtimeDirectory(workspaceId)}/capture-${randomBytes(8).toString("hex")}.patch`
@@ -265,7 +268,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       try {
         await this.run(
           activation.sandboxId,
-          { argv: ["git", "-C", REMOTE_DIRECTORY, "apply", "--binary", "--", patchPath] },
+          { argv: ["git", "-C", checkoutDirectory, "apply", "--binary", "--", patchPath] },
           "sync",
         )
       } finally {
@@ -276,7 +279,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     for (const file of capture.untracked) {
       assertRelativePath(file.path)
       if (sha256(file.content) !== file.sha256) throw new SandboxError("sync", `working tree hash mismatch: ${file.path}`, "CAPTURE_HASH")
-      const path = `${REMOTE_DIRECTORY}/${file.path}`
+      const path = `${checkoutDirectory}/${file.path}`
       await this.run(activation.sandboxId, { argv: ["mkdir", "-p", "--", posix.dirname(path)] }, "sync")
       await this.client.putFile(activation.sandboxId, path, file.content)
     }
@@ -304,7 +307,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
 
     let closing: Promise<void> | undefined
     return {
-      worktreePath: REMOTE_DIRECTORY,
+      worktreePath: this.checkoutDirectory(),
       exec: (command, options) => this.execute(activation, command, options),
       copyIn: (hostPath, sandboxPath) => this.copyIn(activation, hostPath, sandboxPath),
       copyFileOut: (sandboxPath, hostPath) => this.copyFileOut(activation, sandboxPath, hostPath),
@@ -395,13 +398,18 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       throw new SandboxError("provision", "owned Cloudflare sandbox is unavailable", "CLOUDFLARE_RESOURCE_UNAVAILABLE")
     }
 
-    const archive = await this.createArchive(baseSha)
     const sandboxId = await this.client.createSandbox()
     this.owned.set(sandboxId, owner)
     let checkoutHead: string
     try {
-      await this.client.hydrate(sandboxId, archive)
-      checkoutHead = await this.initializeWorkspace(sandboxId, branch)
+      if (this.deferActivation) {
+        await this.run(sandboxId, { argv: ["mkdir", "-p", "--", this.checkoutDirectory()] }, "checkout")
+        checkoutHead = baseSha
+      } else {
+        const archive = await this.createArchive(baseSha)
+        await this.client.hydrate(sandboxId, archive)
+        checkoutHead = await this.initializeWorkspace(sandboxId, branch)
+      }
     } catch (error) {
       await this.destroyIfPresent(sandboxId)
       this.owned.delete(sandboxId)
@@ -416,9 +424,13 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     }
   }
 
+  private checkoutDirectory(): string {
+    return this.deferActivation ? REMOTE_CHECKOUT_DIRECTORY : REMOTE_DIRECTORY
+  }
+
   private async hasGitWorkspace(sandboxId: string): Promise<boolean> {
     const result = await this.client.exec(sandboxId, {
-      argv: ["git", "-C", REMOTE_DIRECTORY, "rev-parse", "--is-inside-work-tree"],
+      argv: ["git", "-C", this.checkoutDirectory(), "rev-parse", "--is-inside-work-tree"],
       timeoutMs: this.bootstrapTimeoutMs,
     })
     return result.exitCode === 0 && result.stdout.trim() === "true"
@@ -426,23 +438,23 @@ export class CloudflareProvider implements WorkspaceProviderBase {
 
   private async ensureBranch(sandboxId: string, branch: string): Promise<void> {
     const current = await this.client.exec(sandboxId, {
-      argv: ["git", "-C", REMOTE_DIRECTORY, "symbolic-ref", "--short", "HEAD"],
+      argv: ["git", "-C", this.checkoutDirectory(), "symbolic-ref", "--short", "HEAD"],
       timeoutMs: this.bootstrapTimeoutMs,
     })
     if (current.exitCode === 0 && current.stdout.trim() === branch) return
     const dirty = await this.run(
       sandboxId,
-      { argv: ["git", "-C", REMOTE_DIRECTORY, "status", "--porcelain", "--untracked-files=all"] },
+      { argv: ["git", "-C", this.checkoutDirectory(), "status", "--porcelain", "--untracked-files=all"] },
       "checkout",
     )
     if (dirty.stdout.trim()) throw new SandboxError("checkout", "existing Cloudflare checkout has uncommitted changes", "REMOTE_DIRTY")
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "checkout", "-B", branch] }, "checkout")
+    await this.run(sandboxId, { argv: ["git", "-C", this.checkoutDirectory(), "checkout", "-B", branch] }, "checkout")
   }
 
   private async ensureHead(sandboxId: string, expectedHead: string): Promise<void> {
     const current = await this.run(
       sandboxId,
-      { argv: ["git", "-C", REMOTE_DIRECTORY, "rev-parse", "HEAD"] },
+      { argv: ["git", "-C", this.checkoutDirectory(), "rev-parse", "HEAD"] },
       "checkout",
     )
     if (current.stdout.trim() !== expectedHead) {
@@ -451,17 +463,18 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   }
 
   private async initializeWorkspace(sandboxId: string, branch: string): Promise<string> {
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "init"] }, "checkout")
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "config", "user.email", "opencode@localhost"] }, "checkout")
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "config", "user.name", "OpenCode Sandbox"] }, "checkout")
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "checkout", "-B", branch] }, "checkout")
-    await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "add", "-A"] }, "checkout")
+    const checkoutDirectory = this.checkoutDirectory()
+    await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "init"] }, "checkout")
+    await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "config", "user.email", "opencode@localhost"] }, "checkout")
+    await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "config", "user.name", "OpenCode Sandbox"] }, "checkout")
+    await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "checkout", "-B", branch] }, "checkout")
+    await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "add", "-A"] }, "checkout")
     await this.run(
       sandboxId,
-      { argv: ["git", "-C", REMOTE_DIRECTORY, "commit", "--allow-empty", "-m", "opencode: initialize sandbox workspace"] },
+      { argv: ["git", "-C", checkoutDirectory, "commit", "--allow-empty", "-m", "opencode: initialize sandbox workspace"] },
       "checkout",
     )
-    const head = await this.run(sandboxId, { argv: ["git", "-C", REMOTE_DIRECTORY, "rev-parse", "HEAD"] }, "checkout")
+    const head = await this.run(sandboxId, { argv: ["git", "-C", checkoutDirectory, "rev-parse", "HEAD"] }, "checkout")
     assertSha(head.stdout.trim())
     return head.stdout.trim()
   }
@@ -620,7 +633,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       if (controlTokenPath) await this.client.putFile(activation.sandboxId, controlTokenPath, new TextEncoder().encode(activation.controlToken!))
       await this.run(
         activation.sandboxId,
-        { argv: ["sh", "-lc", serverCommand(runtime, authPath, passwordPath, this.remotePort, activation.workspaceId, activation.controlDirectory, controlTokenPath)], cwd: REMOTE_DIRECTORY },
+        { argv: ["sh", "-lc", serverCommand(runtime, authPath, passwordPath, this.remotePort, activation.workspaceId, activation.controlDirectory, controlTokenPath)], cwd: this.checkoutDirectory() },
         "bootstrap",
       )
     } finally {
@@ -643,7 +656,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await response.json().catch(() => undefined)
+          const value = await readHealthResponse(response).catch(() => undefined)
           if (isRecord(value) && value.healthy === true) return
         }
       } catch {
@@ -673,7 +686,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     command: string,
     options?: { onLine?: (line: string) => void; cwd?: string; sudo?: boolean; stdin?: string },
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    const cwd = options?.cwd ?? REMOTE_DIRECTORY
+    const cwd = options?.cwd ?? this.checkoutDirectory()
     assertRemotePath(cwd, "sandbox working directory")
     const commandLine = `cd -- ${quoteRemoteCommandPart(cwd)} && ${command}`
     const argv = options?.sudo ? ["sudo", "--", "sh", "-lc", commandLine] : ["sh", "-lc", commandLine]
@@ -784,6 +797,32 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   }
 }
 
+async function readHealthResponse(response: Response): Promise<unknown> {
+  if (!response.body) return undefined
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      size += next.value.byteLength
+      if (size > MAX_HEALTH_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        return undefined
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+  } catch {
+    return undefined
+  }
+}
+
 export interface CloudflareSandcastleAdapterOptions extends CloudflareProviderOptions {
   input: SandcastleAdapterInput
   authContent?: string
@@ -797,7 +836,7 @@ export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleA
     type: "cloudflare",
     name: `oc-cf-${shortHash(input.workspaceId)}`,
     branch: input.branch,
-    directory: REMOTE_DIRECTORY,
+    directory: REMOTE_CHECKOUT_DIRECTORY,
     projectID: input.projectId,
     extra: {
       sessionId: input.sessionId,

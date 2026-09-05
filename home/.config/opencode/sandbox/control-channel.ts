@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
-import { randomBytes, timingSafeEqual } from "node:crypto"
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { chmod, unlink } from "node:fs/promises"
 
 import { preparePrivateSocket } from "./secure-fs"
@@ -9,6 +9,7 @@ import {
   isSandboxOperation,
   isRecord,
   type AuthorizedControlRequest,
+  type CapabilityScope,
   type ControlCapability,
   type ControlRequest,
   type SandboxResponse,
@@ -17,6 +18,7 @@ import {
 const DEFAULT_REQUEST_BYTES = 8 * 1024
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 const DEFAULT_CAPABILITY_TTL_MS = 15 * 60 * 1000
+const RESPONSE_LIMIT_BYTES = 64 * 1024
 
 export interface ControlChannelOptions {
   socketPath: string
@@ -30,6 +32,8 @@ export function createCapability(input: {
   sessionId: string
   generation: number
   role: "host" | "remote"
+  scope?: CapabilityScope
+  projectId?: string
   now?: number
   ttlMs?: number
 }): ControlCapability {
@@ -44,11 +48,20 @@ export function createCapability(input: {
   if (!Number.isSafeInteger(ttlMs) || ttlMs < 1) {
     throw new SandboxError("validate", "capability expiry is invalid", "CAPABILITY_EXPIRY")
   }
+  const scope = input.scope ?? "session"
+  if (scope === "project" && input.role !== "host") {
+    throw new SandboxError("validate", "project capabilities are host-only", "CAPABILITY_SCOPE")
+  }
+  if (scope === "project" && (!input.projectId || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.projectId))) {
+    throw new SandboxError("validate", "project capability ID is invalid", "CAPABILITY_PROJECT")
+  }
   return {
     token: randomBytes(32).toString("base64url"),
     sessionId: input.sessionId,
     generation: input.generation,
     role: input.role,
+    scope,
+    ...(input.projectId ? { projectId: input.projectId } : {}),
     expiresAt: now + ttlMs,
   }
 }
@@ -120,20 +133,30 @@ export class ControlChannel {
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const send = (status: number, body: object) => {
-      const text = JSON.stringify(body)
+    const send = (status: number, body: object, operation: ControlRequest["operation"] = "status") => {
+      let text: string
+      try {
+        text = JSON.stringify(body)
+      } catch {
+        status = 500
+        text = JSON.stringify(errorResponse(operation, "control_channel", "control response could not be serialized", "RESPONSE_JSON"))
+      }
+      if (Buffer.byteLength(text) > RESPONSE_LIMIT_BYTES) {
+        status = 500
+        text = JSON.stringify(errorResponse(operation, "control_channel", "control response is too large", "RESPONSE_LIMIT"))
+      }
       response.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text) })
       response.end(text)
     }
 
     if (request.method !== "POST" || request.url !== "/v1/operation") {
-      send(404, { ok: false, message: "control route not found" })
+      send(404, errorResponse("status", "validate", "control route not found", "CONTROL_ROUTE"))
       return
     }
 
     const capability = this.findCapability(request.headers.authorization)
     if (!capability) {
-      send(401, { ok: false, message: "control capability is invalid or expired" })
+      send(401, errorResponse("status", "authenticate", "control capability is invalid or expired", "CONTROL_AUTH"))
       return
     }
 
@@ -141,10 +164,8 @@ export class ControlChannel {
     try {
       body = await readJson(request, this.maxRequestBytes)
     } catch (error) {
-      send(error instanceof SandboxError && error.code === "REQUEST_TOO_LARGE" ? 413 : 400, {
-        ok: false,
-        message: error instanceof Error ? error.message : "invalid control request",
-      })
+      const sandboxError = error instanceof SandboxError ? error : new SandboxError("validate", "invalid control request", "REQUEST_SCHEMA")
+      send(sandboxError.code === "REQUEST_TOO_LARGE" ? 413 : 400, errorResponse("status", sandboxError.stage, sandboxError.message, sandboxError.code))
       return
     }
 
@@ -152,16 +173,18 @@ export class ControlChannel {
     try {
       controlRequest = parseControlRequest(body, capability)
     } catch (error) {
-      send(400, { ok: false, message: error instanceof Error ? error.message : "invalid control request" })
+      const sandboxError = error instanceof SandboxError ? error : new SandboxError("validate", "invalid control request", "REQUEST_SCHEMA")
+      const operation = isRecord(body) && isSandboxOperation(body.operation) ? body.operation : "status"
+      send(400, errorResponse(operation, sandboxError.stage, sandboxError.message, sandboxError.code), operation)
       return
     }
 
     try {
       const result = await this.handler({ ...controlRequest, capability })
-      send(result.ok ? 200 : 409, result)
+      send(result.ok ? 200 : 409, normalizeResponse(result, controlRequest.operation), controlRequest.operation)
     } catch (error) {
-      const message = redactError(error)
-      send(500, { ok: false, operation: controlRequest.operation, state: "error", message })
+      const sandboxError = error instanceof SandboxError ? error : new SandboxError("control_channel", redactError(error), "SANDBOX_ERROR")
+      send(500, errorResponse(controlRequest.operation, sandboxError.stage, sandboxError.message, sandboxError.code), controlRequest.operation)
     }
   }
 
@@ -189,6 +212,13 @@ export function parseControlRequest(value: unknown, capability: ControlCapabilit
     throw new SandboxError("validate", "control force flag is invalid", "REQUEST_FORCE")
   }
   const force = value.force ?? false
+  const scope = capability.scope ?? "session"
+  if (value.operation === "inventory" && (scope !== "project" || capability.role !== "host" || !capability.projectId)) {
+    throw new SandboxError("validate", "inventory requires a host project capability", "REQUEST_INVENTORY")
+  }
+  if (scope === "project" && (capability.role !== "host" || !capability.projectId || value.operation !== "inventory")) {
+    throw new SandboxError("validate", "project capabilities can only request inventory", "REQUEST_SCOPE")
+  }
   if (force && (capability.role !== "host" || value.operation !== "delete")) {
     throw new SandboxError("validate", "force is not authorized for this capability", "REQUEST_FORCE")
   }
@@ -225,12 +255,89 @@ function equalSecret(expected: string, actual: string): boolean {
 
 async function defaultHandler(request: AuthorizedControlRequest): Promise<SandboxResponse> {
   return {
-    ok: true,
-    operation: request.operation,
+    ...emptyResponse(request.operation, true, `${request.operation} accepted`, null),
     state: "local",
     sessionId: request.capability.sessionId,
-    message: `${request.operation} accepted`,
   }
+}
+
+function errorResponse(
+  operation: ControlRequest["operation"],
+  stage: string,
+  message: string,
+  code: string,
+): SandboxResponse {
+  return {
+    ...emptyResponse(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }),
+    state: "error",
+    stage,
+  }
+}
+
+function emptyResponse(
+  operation: ControlRequest["operation"],
+  ok: boolean,
+  message: string,
+  error: SandboxResponse["error"],
+): SandboxResponse {
+  const freshAt = new Date().toISOString()
+  return {
+    schemaVersion: 2,
+    requestId: randomUUID(),
+    ok,
+    operation,
+    message: redactError(message),
+    session: null,
+    intent: { desiredLocation: "local", phase: "idle" },
+    effectiveTarget: null,
+    observations: ["record", "handle", "workspace", "provider", "git"].map((source) => ({
+      source: source as "record" | "handle" | "workspace" | "provider" | "git",
+      observed: false,
+      freshAt,
+      evidence: [],
+    })),
+    classification: "unknown",
+    work: {
+      captureBaseSha: null,
+      runtimeHead: null,
+      sync: "unknown",
+      preservation: "not_needed",
+      preservedWorktreePath: null,
+    },
+    allowedActions: [],
+    recommendedAction: null,
+    error,
+    state: "error",
+    stage: "validate",
+  }
+}
+
+function normalizeResponse(value: SandboxResponse, operation: ControlRequest["operation"]): SandboxResponse {
+  const message = typeof value.message === "string" ? value.message : `${operation} accepted`
+  const normalized: SandboxResponse = {
+    ...emptyResponse(operation, typeof value.ok === "boolean" ? value.ok : false, message, null),
+    ...value,
+    schemaVersion: 2,
+    requestId: typeof value.requestId === "string" ? value.requestId : randomUUID(),
+    operation: typeof value.operation === "string" ? value.operation : operation,
+    ok: typeof value.ok === "boolean" ? value.ok : false,
+    message: redactError(message),
+  }
+  if (!Array.isArray(normalized.observations)) normalized.observations = emptyResponse(operation, false, "", null).observations
+  if (!normalized.intent || typeof normalized.intent !== "object") normalized.intent = { desiredLocation: "local", phase: "idle" }
+  if (!Array.isArray(normalized.allowedActions)) normalized.allowedActions = []
+  if (!normalized.work || typeof normalized.work !== "object") {
+    normalized.work = {
+      captureBaseSha: null,
+      runtimeHead: null,
+      sync: "unknown",
+      preservation: "not_needed",
+      preservedWorktreePath: null,
+    }
+  }
+  if (normalized.error === undefined) normalized.error = null
+  if (normalized.recommendedAction === undefined) normalized.recommendedAction = null
+  return normalized
 }
 
 async function closeServer(server: Server): Promise<void> {

@@ -18,7 +18,14 @@ import {
 import { redactText } from "./redaction"
 
 const RESPONSE_LIMIT_BYTES = 512 * 1024
-const DEFAULT_SYNC_TIMEOUT_MS = 30_000
+export const DEFAULT_WORKSPACE_REQUEST_TIMEOUT_MS = 30_000
+const DEFAULT_SYNC_TIMEOUT_MS = DEFAULT_WORKSPACE_REQUEST_TIMEOUT_MS
+const INSPECTION_TIMEOUT_MS = 5_000
+const REPLAY_BATCH_SIZE = 10
+export const MAX_REPLAY_EVENTS = 10_000
+export const MAX_REPLAY_HISTORY_BYTES = 8 * 1024 * 1024
+export const MAX_REPLAY_REQUEST_BYTES = RESPONSE_LIMIT_BYTES
+export const DEFAULT_REPLAY_TIMEOUT_MS = DEFAULT_WORKSPACE_REQUEST_TIMEOUT_MS
 
 export interface HttpWorkspaceGatewayOptions {
   serverUrl: string | URL
@@ -29,6 +36,8 @@ export interface HttpWorkspaceGatewayOptions {
   syncOut?: (input: WorkspaceSyncOutInput) => Promise<WorkspaceSyncResult>
   runtimeMetadata?: (workspaceId: string) => WorkspaceRuntimeMetadata | undefined
   sessionEvents?: (sessionId: string) => Promise<WorkspaceReplayEvent[]> | WorkspaceReplayEvent[]
+  requestTimeoutMs?: number
+  replayTimeoutMs?: number
 }
 
 export class HttpWorkspaceGateway implements WorkspaceGateway {
@@ -39,6 +48,8 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
   private readonly captureApplier?: (input: { workspaceId: string; capture: WorkingTreeCapture }) => Promise<void>
   private readonly runtimeMetadata?: (workspaceId: string) => WorkspaceRuntimeMetadata | undefined
   private readonly sessionEvents?: HttpWorkspaceGatewayOptions["sessionEvents"]
+  private readonly requestTimeoutMs: number
+  private readonly replayTimeoutMs: number
   readonly syncOut?: (input: WorkspaceSyncOutInput) => Promise<WorkspaceSyncResult>
 
   constructor(options: HttpWorkspaceGatewayOptions) {
@@ -49,6 +60,10 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
     this.captureApplier = options.captureApplier
     this.runtimeMetadata = options.runtimeMetadata
     this.sessionEvents = options.sessionEvents
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_WORKSPACE_REQUEST_TIMEOUT_MS
+    assertTimeout(this.requestTimeoutMs, "workspace request timeout", "WORKSPACE_HTTP_TIMEOUT")
+    this.replayTimeoutMs = options.replayTimeoutMs ?? DEFAULT_REPLAY_TIMEOUT_MS
+    assertTimeout(this.replayTimeoutMs, "workspace replay timeout", "WORKSPACE_REPLAY_TIMEOUT")
     if (options.syncOut) {
       this.syncOut = async (input) => {
         const result = await options.syncOut!(input)
@@ -117,8 +132,17 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
   async replaySession(input: { sessionId: string; directory: string; target: Extract<WorkspaceTarget, { type: "remote" }> }): Promise<void> {
     const events = await this.sessionEvents?.(input.sessionId) ?? []
     if (events.length === 0) throw new SandboxError("sync", "OpenCode session history is empty", "WORKSPACE_HISTORY")
-    for (let index = 0; index < events.length; index += 10) {
-      await this.requestTarget(input.target, "/sync/replay", { directory: input.directory, events: events.slice(index, index + 10) })
+    if (events.length > MAX_REPLAY_EVENTS) {
+      throw replayLimitError()
+    }
+    let historyBytes = 2
+    for (let index = 0; index < events.length; index++) {
+      historyBytes += serializedReplayEventBytes(events[index]!) + (index === 0 ? 0 : 1)
+      if (historyBytes > MAX_REPLAY_HISTORY_BYTES) throw replayLimitError()
+    }
+    for (let index = 0; index < events.length; index += REPLAY_BATCH_SIZE) {
+      const body = serializeReplayRequest(input.directory, events.slice(index, index + REPLAY_BATCH_SIZE))
+      await this.requestTarget(input.target, "/sync/replay", body)
     }
   }
 
@@ -134,13 +158,39 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
     })
   }
 
+  async inspect(input: { workspaceId: string; directory: string }): Promise<WorkspaceInfo | undefined> {
+    try {
+      const value = await this.request("/experimental/workspace", {
+        method: "GET",
+        directory: input.directory,
+        workspace: input.workspaceId,
+        timeoutMs: INSPECTION_TIMEOUT_MS,
+      })
+      if (!Array.isArray(value)) throw new SandboxError("control_channel", "workspace list response is not an array", "WORKSPACE_SCHEMA")
+      return value.map((entry) => parseWorkspaceInfo(entry, this.projectId)).find((info) => info.id === input.workspaceId)
+    } catch (error) {
+      if (error instanceof SandboxError && error.code === "WORKSPACE_HTTP_404") return undefined
+      throw error
+    }
+  }
+
   async waitForSync(input: { workspaceId: string; directory: string; timeoutMs: number }): Promise<void> {
     const deadline = Date.now() + Math.min(input.timeoutMs, DEFAULT_SYNC_TIMEOUT_MS)
     while (Date.now() < deadline) {
-      const value = await this.request("/experimental/workspace/status", {
-        method: "GET",
-        directory: input.directory,
-      })
+      const remaining = deadline - Date.now()
+      let value: unknown
+      try {
+        value = await this.request("/experimental/workspace/status", {
+          method: "GET",
+          directory: input.directory,
+          timeoutMs: remaining,
+        })
+      } catch (error) {
+        if (error instanceof SandboxError && error.code === "WORKSPACE_HTTP_TIMEOUT") {
+          throw new SandboxError("sync", "timed out waiting for workspace synchronization", "WORKSPACE_SYNC_TIMEOUT")
+        }
+        throw error
+      }
       if (Array.isArray(value)) {
         const status = value.find((entry) => isRecord(entry) && entry.workspaceID === input.workspaceId)
         if (isRecord(status) && status.status === "connected") return
@@ -160,6 +210,7 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
       directory?: string
       workspace?: string
       body?: unknown
+      timeoutMs?: number
     },
   ): Promise<unknown> {
     const url = new URL(this.serverUrl)
@@ -171,33 +222,128 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
       }).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     ).toString()
 
-    const response = await this.fetcher(url, {
-      method: options.method,
-      headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    })
-    const text = await readLimitedBody(response)
-    if (!response.ok) {
-      throw new SandboxError("control_channel", redactText(text), `WORKSPACE_HTTP_${response.status}`)
-    }
-    if (response.status === 204 || text.length === 0) return undefined
+    const signal = createTimeoutSignal(options.timeoutMs ?? this.requestTimeoutMs)
     try {
-      return JSON.parse(text)
-    } catch {
-      throw new SandboxError("control_channel", "OpenCode workspace response is not valid JSON", "WORKSPACE_JSON")
+      const response = await waitForAbort(
+        () => this.fetcher(url, {
+          method: options.method,
+          headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
+          body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          signal,
+        }),
+        signal,
+        cancelResponseBody,
+      )
+      const text = await readLimitedBody(response, signal, "control_channel")
+      if (!response.ok) {
+        throw new SandboxError("control_channel", redactText(text), `WORKSPACE_HTTP_${response.status}`)
+      }
+      if (response.status === 204 || text.length === 0) return undefined
+      try {
+        return JSON.parse(text)
+      } catch {
+        throw new SandboxError("control_channel", "OpenCode workspace response is not valid JSON", "WORKSPACE_JSON")
+      }
+    } catch (error) {
+      if (signal?.aborted) throw new SandboxError("control_channel", "workspace request timed out", "WORKSPACE_HTTP_TIMEOUT")
+      throw error
     }
   }
 
-  private async requestTarget(target: Extract<WorkspaceTarget, { type: "remote" }>, path: string, body: unknown): Promise<void> {
+  private async requestTarget(target: Extract<WorkspaceTarget, { type: "remote" }>, path: string, body: string): Promise<void> {
     const url = new URL(target.url)
     url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`
     url.search = ""
     const headers = new Headers(target.headers)
     headers.set("Content-Type", "application/json")
-    const response = await this.fetcher(url, { method: "POST", headers, body: JSON.stringify(body) })
-    const text = await readLimitedBody(response)
-    if (!response.ok) throw new SandboxError("sync", redactText(text), `WORKSPACE_HTTP_${response.status}`)
+    if (Buffer.byteLength(body) > MAX_REPLAY_REQUEST_BYTES) throw replayLimitError()
+    const signal = createTimeoutSignal(this.replayTimeoutMs)
+    try {
+      const response = await waitForAbort(
+        () => this.fetcher(url, { method: "POST", headers, body, signal }),
+        signal,
+        cancelResponseBody,
+      )
+      const text = await readLimitedBody(response, signal, "sync")
+      if (!response.ok) throw new SandboxError("sync", redactText(text), `WORKSPACE_HTTP_${response.status}`)
+    } catch (error) {
+      if (signal.aborted) throw new SandboxError("sync", "workspace replay request timed out", "WORKSPACE_REPLAY_TIMEOUT")
+      throw error
+    }
   }
+}
+
+export function serializedReplayEventBytes(event: WorkspaceReplayEvent): number {
+  return Buffer.byteLength(serializeReplayValue(event))
+}
+
+function serializeReplayRequest(directory: string, events: WorkspaceReplayEvent[]): string {
+  const serialized = serializeReplayValue({ directory, events })
+  if (Buffer.byteLength(serialized) > MAX_REPLAY_REQUEST_BYTES) throw replayLimitError()
+  return serialized
+}
+
+function serializeReplayValue(value: unknown): string {
+  try {
+    const serialized = JSON.stringify(value)
+    if (typeof serialized !== "string") throw new Error("history value is not serializable")
+    return serialized
+  } catch {
+    throw new SandboxError("sync", "OpenCode session history is invalid", "WORKSPACE_HISTORY")
+  }
+}
+
+function replayLimitError(): SandboxError {
+  return new SandboxError("sync", "OpenCode session history exceeds the replay limit", "WORKSPACE_REPLAY_LIMIT")
+}
+
+function assertTimeout(value: number, label: string, code: string): void {
+  if (!Number.isSafeInteger(value) || value < 1) throw new SandboxError("validate", `${label} is invalid`, code)
+}
+
+function createTimeoutSignal(timeoutMs: number): AbortSignal {
+  return AbortSignal.timeout(timeoutMs)
+}
+
+function waitForAbort<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("operation timed out"))
+  return new Promise<T>((resolve, reject) => {
+    let aborted = false
+    const onAbort = () => {
+      aborted = true
+      cleanup()
+      reject(signal.reason ?? new Error("operation timed out"))
+    }
+    const cleanup = () => signal.removeEventListener("abort", onAbort)
+    signal.addEventListener("abort", onAbort, { once: true })
+    let pending: Promise<T>
+    try {
+      pending = operation()
+    } catch (error) {
+      cleanup()
+      reject(error)
+      return
+    }
+    pending.then(
+      (value) => {
+        if (aborted) {
+          void Promise.resolve().then(() => onLateValue?.(value)).catch(() => undefined)
+          return
+        }
+        cleanup()
+        resolve(value)
+      },
+      (error) => {
+        if (aborted) return
+        cleanup()
+        reject(error)
+      },
+    )
+  })
 }
 
 function parseWorkspaceInfo(value: unknown, projectId: string): WorkspaceInfo {
@@ -219,24 +365,62 @@ function parseWorkspaceInfo(value: unknown, projectId: string): WorkspaceInfo {
   }
 }
 
-async function readLimitedBody(response: Response): Promise<string> {
-  if (!response.body) return response.text()
+export async function readLimitedBody(response: Response, signal: AbortSignal, stage: string): Promise<string> {
+  if (!response.body) {
+    const text = await waitForAbort(() => response.text(), signal)
+    if (Buffer.byteLength(text) > RESPONSE_LIMIT_BYTES) {
+      throw new SandboxError(stage, "workspace response is too large", "WORKSPACE_RESPONSE_LIMIT")
+    }
+    return text
+  }
+  if (signal.aborted) {
+    await cancelResponseBody(response)
+    throw signal.reason ?? new Error("operation timed out")
+  }
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
+  let cancellation: Promise<void> | undefined
+  const cancel = (): Promise<void> => {
+    if (!cancellation) {
+      try {
+        cancellation = reader.cancel().then(() => undefined, () => undefined)
+      } catch {
+        cancellation = Promise.resolve()
+      }
+    }
+    return cancellation
+  }
+  const onAbort = () => { void cancel() }
+  signal.addEventListener("abort", onAbort, { once: true })
   try {
     while (true) {
-      const next = await reader.read()
+      const next = await waitForAbort(() => reader.read(), signal)
       if (next.done) break
       size += next.value.byteLength
       if (size > RESPONSE_LIMIT_BYTES) {
-        await reader.cancel()
-        throw new SandboxError("control_channel", "workspace response is too large", "WORKSPACE_RESPONSE_LIMIT")
+        throw new SandboxError(stage, "workspace response is too large", "WORKSPACE_RESPONSE_LIMIT")
       }
       chunks.push(next.value)
     }
+  } catch (error) {
+    await cancel()
+    throw error
   } finally {
-    reader.releaseLock()
+    signal.removeEventListener("abort", onAbort)
+    try {
+      reader.releaseLock()
+    } catch {
+      // The timeout may have interrupted an in-flight stream read.
+    }
   }
   return new TextDecoder().decode(Buffer.concat(chunks, size))
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel()
+  } catch {
+    // The response may already have been consumed or canceled.
+  }
 }

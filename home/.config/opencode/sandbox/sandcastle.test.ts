@@ -19,7 +19,7 @@ import { FileStateStore } from "./state-store"
 import { runSyncBarrier } from "./sync-barrier"
 import { captureWorkingTree } from "./working-tree"
 import type { SandcastleSessionFactory } from "./sandcastle-session"
-import type { SessionContext } from "./types"
+import type { GitWorkingTreeObservation, SandboxRecord, SessionContext } from "./types"
 
 const temporaryDirectories: string[] = []
 
@@ -150,7 +150,7 @@ describe("Sandcastle lifecycle", () => {
 
     const result = await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
 
-    expect(result).toMatchObject({ ok: false, state: "error", stage: "provision" })
+    expect(result).toMatchObject({ ok: false, state: "error", stage: "provision", error: { code: "WORKSPACE_IDENTITY" } })
     expect(result.message).toMatch(/requested owner/)
     expect(setup.calls).toContain("workspace:remove")
     expect(setup.resources.handle?.closed).toBe(true)
@@ -231,6 +231,30 @@ describe("Sandcastle lifecycle", () => {
     expect(calls.filter((call) => call === "workspace:remove")).toHaveLength(2)
   })
 
+  it("preserves and closes an attached runtime before normal deletion", async () => {
+    const setup = await setupFakeLifecycle()
+    const { controller, capability, calls, resources, store } = setup
+
+    await controller.handle({ operation: "start", force: false, capability })
+    await controller.onSessionIdle("ses_1")
+    if (!resources.sandbox) throw new Error("fake sandbox was not created")
+    await execSandbox(resources.sandbox, "printf 'delete me\n' > remote-delete.txt")
+    const branch = (await store.get("ses_1"))?.branch
+    if (!branch) throw new Error("sandbox branch was not recorded")
+
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      state: "delete_pending",
+    })
+    await controller.onSessionIdle("ses_1")
+
+    expect(await store.get("ses_1")).toMatchObject({ state: "deleted" })
+    expect(resources.handle?.closed).toBe(true)
+    expect(calls).toContain("sync")
+    expect(calls).toContain("workspace:remove")
+    expect(await runGit(setup.repository, ["show", `${branch}:remote-delete.txt`])).toBe("delete me")
+  })
+
   it("commits dirty output before removing the Sandcastle worktree", async () => {
     const setup = await setupFakeLifecycle()
     const { controller, capability, repository, resources } = setup
@@ -285,6 +309,50 @@ describe("Sandcastle lifecycle", () => {
     expect(resources.handle?.closed).toBe(true)
   })
 
+  it("persists the preserved worktree when stop cleanup fails", async () => {
+    const setup = await setupFakeLifecycle({ closeFailures: 2 })
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+    if (!setup.resources.sandbox || !setup.resources.worktreePath) throw new Error("fake Sandcastle resources were not created")
+    await writeFile(join(setup.resources.worktreePath, "preserve.txt"), "preserve me\n")
+
+    await setup.controller.handle({ operation: "stop", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+
+    expect(await setup.store.get("ses_1")).toMatchObject({
+      state: "error",
+      preservedWorktreePath: setup.resources.worktreePath,
+    })
+  })
+
+  it("keeps the preserved worktree when workspace removal fails after close", async () => {
+    const setup = await setupFakeLifecycle({ workspaceRemoveFailures: 1 })
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+    if (!setup.resources.worktreePath) throw new Error("fake worktree was not created")
+    await writeFile(join(setup.resources.worktreePath, "preserve.txt"), "preserve me\n")
+
+    await setup.controller.handle({ operation: "stop", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+
+    expect(await setup.store.get("ses_1")).toMatchObject({
+      state: "error",
+      preservedWorktreePath: setup.resources.worktreePath,
+    })
+  })
+
+  it("persists the preserved worktree when disposal closes a dirty session", async () => {
+    const setup = await setupFakeLifecycle()
+    await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+    await setup.controller.onSessionIdle("ses_1")
+    if (!setup.resources.sandbox || !setup.resources.worktreePath) throw new Error("fake Sandcastle resources were not created")
+    await writeFile(join(setup.resources.worktreePath, "preserve.txt"), "preserve me\n")
+
+    await setup.controller.dispose()
+
+    expect(await setup.store.get("ses_1")).toMatchObject({ preservedWorktreePath: setup.resources.worktreePath })
+  })
+
   it("requires explicit host force before discarding a failed sync", async () => {
     const setup = await setupFakeLifecycle({ syncFailures: Number.POSITIVE_INFINITY })
     const { controller, capability, calls, resources } = setup
@@ -324,6 +392,50 @@ describe("Sandcastle lifecycle", () => {
     expect(setup.calls.filter((call) => call === "worktree:create")).toHaveLength(1)
     await setup.controller.onSessionIdle("ses_1")
     expect(await setup.store.get("ses_1")).toMatchObject({ state: "deleted" })
+  })
+
+  it("reports an attached runtime and its structured stop action", async () => {
+    const setup = await setupFakeLifecycle()
+    try {
+      await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+      await setup.controller.onSessionIdle("ses_1")
+
+      const result = await setup.controller.handle({ operation: "inspect", force: false, capability: setup.capability })
+
+      expect(result).toMatchObject({
+        schemaVersion: 2,
+        operation: "inspect",
+        classification: "attached",
+        effectiveTarget: { kind: "remote", resourceId: "fake-ses_1" },
+        recommendedAction: { operation: "stop", reasonCode: "ATTACHED_RUNTIME" },
+      })
+      expect(result.allowedActions).toContainEqual(expect.objectContaining({ operation: "stop", waitFor: "session_idle" }))
+    } finally {
+      await setup.controller.dispose()
+    }
+  })
+
+  it("inspects the live Sandcastle worktree and reports its observed HEAD", async () => {
+    let inspectedPath = ""
+    const runtimeHead = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    const setup = await setupFakeLifecycle({
+      gitInspect: async (_record, worktreePath) => {
+        inspectedPath = worktreePath
+        return { head: runtimeHead, branch: "opencode/runtime", dirty: true, evidence: ["fixture"] }
+      },
+    })
+    try {
+      await setup.controller.handle({ operation: "start", force: false, capability: setup.capability })
+      await setup.controller.onSessionIdle("ses_1")
+
+      const result = await setup.controller.handle({ operation: "inspect", force: false, capability: setup.capability })
+
+      if (!setup.resources.worktreePath) throw new Error("live worktree path was not recorded")
+      expect(inspectedPath).toBe(setup.resources.worktreePath)
+      expect(result.work).toMatchObject({ runtimeHead, sync: "dirty" })
+    } finally {
+      await setup.controller.dispose()
+    }
   })
 
   it("marks active Sandcastle records orphaned after restart", async () => {
@@ -386,6 +498,44 @@ describe("Sandcastle lifecycle", () => {
       recoveryMetadata: { resourceId: "sandbox-1" },
     })
     expect(JSON.stringify(status)).not.toContain("token")
+  })
+
+  it("does not mark a pending deletion complete without its runtime handle", async () => {
+    const setup = await setupFakeLifecycle()
+    await setup.store.write({
+      sessionId: "ses_1",
+      workspaceId: "wrk_missing_handle",
+      projectId: "prj_1",
+      provider: "fake",
+      providerState: {},
+      generation: 1,
+      directory: setup.repository,
+      branch: "opencode/sandbox-missing-handle",
+      baseSha: setup.sourceHead,
+      state: "delete_pending",
+      operation: { kind: "delete", phase: "awaiting_idle" },
+      createdAt: new Date(1000).toISOString(),
+      updatedAt: new Date(1000).toISOString(),
+    })
+    const calls: string[] = []
+    const restarted = new LifecycleController({
+      store: setup.store,
+      providerType: "fake",
+      sandcastle: { createAdapter: async () => { throw new Error("must not create") } },
+      workspace: {
+        async create() { throw new Error("must not create a workspace") },
+        async warp() { calls.push("warp") },
+        async remove() { calls.push("remove") },
+      },
+    })
+
+    await restarted.onSessionIdle("ses_1")
+
+    expect(await setup.store.get("ses_1")).toMatchObject({
+      state: "orphaned",
+      lastError: { code: "SANDCASTLE_HANDLE" },
+    })
+    expect(calls).toEqual([])
   })
 
   it("awaits idempotent disposal and closes every owned session", async () => {
@@ -501,7 +651,13 @@ interface FakeSessionResources {
   worktreePath?: string
 }
 
-async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMismatch?: boolean; closeFailures?: number } = {}): Promise<FakeLifecycleSetup> {
+async function setupFakeLifecycle(options: {
+  syncFailures?: number
+  workspaceMismatch?: boolean
+  workspaceRemoveFailures?: number
+  closeFailures?: number
+  gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
+} = {}): Promise<FakeLifecycleSetup> {
   const repository = await createRepository()
   await writeFile(join(repository, "deleted.txt"), "delete me\n")
   await runGit(repository, ["add", "deleted.txt"])
@@ -530,6 +686,7 @@ async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMis
     capture: (value) => captureWorkingTree(value),
     providerType: "fake",
     sandcastle: createFakeSessionFactory(calls, resources, options),
+    gitInspect: options.gitInspect,
     workspace: {
       async create(input) {
         calls.push("workspace:create")
@@ -557,6 +714,10 @@ async function setupFakeLifecycle(options: { syncFailures?: number; workspaceMis
       },
       async remove() {
         calls.push("workspace:remove")
+        if ((options.workspaceRemoveFailures ?? 0) > 0) {
+          options.workspaceRemoveFailures = (options.workspaceRemoveFailures ?? 0) - 1
+          throw new Error("fake workspace removal failure")
+        }
       },
     },
   })
@@ -655,7 +816,7 @@ function createFakeSessionFactory(calls: string[], resources: FakeSessionResourc
     },
   })
   return {
-    createAdapter: async () => ({
+    createAdapter: async (input) => ({
       provider: fake.provider,
       async applyCapture({ sandbox, capture }) {
         calls.push("capture")
@@ -678,6 +839,15 @@ function createFakeSessionFactory(calls: string[], resources: FakeSessionResourc
       target() {
         if (!fake.handles.at(-1)) throw new Error("fake provider did not create a handle")
         return { type: "remote", url: "https://fake.example.test" }
+      },
+      async inspect() {
+        return {
+          resourceId: `fake-${input.sessionId}`,
+          resource: "present",
+          ownership: "verified",
+          health: "healthy",
+          evidence: ["fake provider inventory"],
+        }
       },
       async close() {
         await fake.handles.at(-1)?.close()

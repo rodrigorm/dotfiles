@@ -9,7 +9,9 @@ import {
   SandboxError,
   isSandboxOperation,
   isRecord,
+  type PublicOperation,
   type SandboxOperation,
+  type SandboxResultV2,
   type SandboxResponse,
 } from "./types"
 
@@ -28,6 +30,9 @@ export function parseCliArgs(argv: readonly string[], remote: boolean): { operat
   if (rest.length > 0) throw new SandboxError("validate", `unexpected argument for ${operation}`, "CLI_ARGUMENT")
   if (remote && operation === "start") {
     throw new SandboxError("validate", "start is only available from the host", "CLI_START")
+  }
+  if (remote && operation === "inventory") {
+    throw new SandboxError("validate", "inventory is only available from the host", "CLI_INVENTORY")
   }
   return { operation, force: false }
 }
@@ -60,6 +65,7 @@ function requestControlHttp(
   timeoutMs: number,
 ): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve, reject) => {
+    const fail = (error: unknown) => reject(error instanceof SandboxError ? error : new SandboxError("control_channel", redactError(error), "CONTROL_CHANNEL"))
     const request = httpRequest(
       {
         ...( "socketPath" in endpoint ? { socketPath: endpoint.socketPath } : endpoint),
@@ -80,7 +86,7 @@ function requestControlHttp(
           if (size <= RESPONSE_LIMIT_BYTES) chunks.push(chunk)
           else request.destroy(new SandboxError("control_channel", "control response is too large", "RESPONSE_LIMIT"))
         })
-        response.once("error", reject)
+        response.once("error", fail)
         response.once("end", () => {
           if (size > RESPONSE_LIMIT_BYTES) return
           const text = Buffer.concat(chunks).toString("utf8")
@@ -92,7 +98,7 @@ function requestControlHttp(
         })
       },
     )
-    request.once("error", reject)
+    request.once("error", fail)
     request.once("timeout", () => request.destroy(new SandboxError("control_channel", "control request timed out", "REQUEST_TIMEOUT")))
     request.end(JSON.stringify(body))
   })
@@ -154,7 +160,7 @@ export async function runCli(
   } catch (error) {
     const message = redactError(error)
     writeStderr(`sandboxctl: ${message}\n`)
-    writeStdout(`${JSON.stringify(validationError(argv, message))}\n`)
+    writeJson(writeStdout, validationError(argv, message, error), isSandboxOperation(argv[0]) ? argv[0] : "status")
     return 2
   }
 
@@ -163,11 +169,16 @@ export async function runCli(
   const mailboxPath = env.SANDBOX_CONTROL_MAILBOX
   const controlHost = env.SANDBOX_CONTROL_HOST
   const controlPort = env.SANDBOX_CONTROL_PORT === undefined ? undefined : Number(env.SANDBOX_CONTROL_PORT)
-  const token = env.SANDBOX_CONTROL_TOKEN
+  const token = operation === "inventory" ? env.SANDBOX_CONTROL_PROJECT_TOKEN : env.SANDBOX_CONTROL_TOKEN
   const hasTcpEndpoint = controlHost !== undefined || env.SANDBOX_CONTROL_PORT !== undefined
-  if ((!socketPath && !mailboxPath && !hasTcpEndpoint) || !token) {
-    const response = errorResponse(operation, "control_channel", "sandboxctl is not running inside an OpenCode session")
-    writeStdout(`${JSON.stringify(response)}\n`)
+  if (!socketPath && !mailboxPath && !hasTcpEndpoint) {
+    const response = errorResponse(operation, new SandboxError("control_channel", "sandboxctl is not running inside an OpenCode session", "CONTROL_ENDPOINT"))
+    writeJson(writeStdout, response, operation)
+    return 1
+  }
+  if (!token) {
+    const response = errorResponse(operation, new SandboxError("authenticate", "sandbox control token is unavailable", "CONTROL_TOKEN"))
+    writeJson(writeStdout, response, operation)
     return 1
   }
 
@@ -186,19 +197,24 @@ export async function runCli(
             operation,
             ...(parsed.force ? { force: true } : {}),
           })
-    if (!isRecord(response.body)) throw new SandboxError("control_channel", "control response has invalid shape", "RESPONSE_SCHEMA")
+    if (!isV2Response(response.body)) throw new SandboxError("control_channel", "control response has invalid shape", "RESPONSE_SCHEMA")
     const result = response.body as unknown as SandboxResponse
-    writeStdout(`${JSON.stringify(result)}\n`)
+    writeJson(writeStdout, result, operation)
     return response.status >= 200 && response.status < 300 && result.ok ? 0 : 1
   } catch (error) {
-    const result = errorResponse(operation, "control_channel", redactError(error))
-    writeStdout(`${JSON.stringify(result)}\n`)
+    const result = errorResponse(operation, error)
+    writeJson(writeStdout, result, operation)
     return 1
   }
 }
 
-function errorResponse(operation: SandboxOperation, stage: string, message: string): SandboxResponse {
+function errorResponse(operation: SandboxOperation, error: unknown): SandboxResponse {
+  const sandboxError = error instanceof SandboxError ? error : undefined
+  const stage = sandboxError?.stage ?? "control_channel"
+  const code = sandboxError?.code ?? "CONTROL_CHANNEL"
+  const message = redactError(error)
   return {
+    ...emptyResult(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }, stage),
     ok: false,
     operation,
     state: "error",
@@ -208,15 +224,100 @@ function errorResponse(operation: SandboxOperation, stage: string, message: stri
   }
 }
 
-function validationError(argv: readonly string[], message: string): Record<string, unknown> {
+function validationError(argv: readonly string[], message: string, error: unknown): SandboxResultV2 & { state: "error"; stage: string } {
   const operation = isSandboxOperation(argv[0]) ? argv[0] : undefined
+  return emptyResult(operation ?? "status", false, message, {
+    code: error instanceof SandboxError ? error.code : "CLI_USAGE",
+    stage: error instanceof SandboxError ? error.stage : "validate",
+    retryable: false,
+  }, error instanceof SandboxError ? error.stage : "validate")
+}
+
+function emptyResult(
+  operation: PublicOperation,
+  ok: boolean,
+  message: string,
+  error: { code: string; stage: string; retryable: boolean } | null,
+  stage = error?.stage ?? "validate",
+): SandboxResultV2 & { state: "error"; stage: string } {
+  const sources = ["record", "handle", "workspace", "provider", "git"] as const
   return {
-    ok: false,
-    ...(operation ? { operation } : {}),
+    schemaVersion: 2,
+    requestId: randomUUID(),
+    ok,
+    operation,
+    message: redactError(message),
+    session: null,
+    intent: { desiredLocation: "local", phase: "idle" },
+    effectiveTarget: null,
+     observations: sources.map((source) => ({
+      source,
+      observed: false,
+      freshAt: new Date().toISOString(),
+      evidence: [],
+    })),
+    classification: "unknown",
+    work: {
+      captureBaseSha: null,
+      runtimeHead: null,
+      sync: "unknown",
+      preservation: "not_needed",
+      preservedWorktreePath: null,
+    },
+    allowedActions: [],
+    recommendedAction: null,
+    error,
     state: "error",
-    stage: "validate",
-    message,
+    stage,
   }
+}
+
+function writeJson(write: (text: string) => void, value: unknown, operation: SandboxOperation): void {
+  let text: string
+  try {
+    text = JSON.stringify(value)
+  } catch {
+    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response could not be serialized", "RESPONSE_JSON")))
+  }
+  if (Buffer.byteLength(text) > RESPONSE_LIMIT_BYTES) {
+    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response is too large", "RESPONSE_LIMIT")))
+  }
+  write(`${text}\n`)
+}
+
+function isV2Response(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false
+  return (
+    value.schemaVersion === 2 &&
+    typeof value.requestId === "string" &&
+    typeof value.ok === "boolean" &&
+    isPublicOperation(value.operation) &&
+    typeof value.message === "string" &&
+    isRecord(value.intent) &&
+    Array.isArray(value.observations) &&
+    (value.effectiveTarget === null || isRecord(value.effectiveTarget)) &&
+    typeof value.classification === "string" &&
+    isRecord(value.work) &&
+    Array.isArray(value.allowedActions) &&
+    (value.recommendedAction === null || isRecord(value.recommendedAction)) &&
+    (value.error === null || isRecord(value.error))
+  )
+}
+
+function isPublicOperation(value: unknown): value is PublicOperation {
+  return typeof value === "string" && [
+    "start",
+    "stop",
+    "status",
+    "inspect",
+    "inventory",
+    "delete",
+    "logs",
+    "diagnose",
+    "retry",
+    "recover",
+    "repair",
+  ].includes(value)
 }
 
 function assertMailboxPath(value: string): void {

@@ -5,10 +5,12 @@ agent: build
 
 Execute the requested sandbox lifecycle operation.
 
-Supported operations are exactly: `start`, `stop`, `status`, `delete`, `logs`, `diagnose`, and `retry`. The only optional argument is `--force` for `delete`.
+Supported operations are exactly: `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, and `retry`. The only optional argument is `--force` for `delete`. `inventory` is host-only and project-scoped.
 
-Run `retry` from the host. A remote capability must not retry a failed `start`; report that host recovery is required instead.
+`recover`, `adopt`, and `repair` are deferred; never synthesize them from a result.
 
-Run `sandboxctl $ARGUMENTS` exactly once. Treat its single JSON document on stdout as authoritative. Present `message`, `operation`, `state`, `stage`, and non-secret `details` when present. Mark omitted facts as unknown; do not infer provider health, resource existence, ownership, or completed cleanup from the persisted state alone.
+Run `retry` using the role listed in `allowedActions`. A remote capability must not retry a failed `start` or a forced delete; report that host recovery is required instead.
 
-Never run provider infrastructure commands, access a control socket directly, construct infrastructure commands, or retry an operation yourself. If the JSON contains `diagnosticOperation: "diagnose"`, run `sandboxctl diagnose` exactly once and present that result.
+Run `sandboxctl $ARGUMENTS` exactly once. Treat its single JSON document on stdout as authoritative. Present `schemaVersion`, `requestId`, `ok`, `operation`, `message`, `session`, `intent`, `effectiveTarget`, `observations`, `classification`, `work`, `allowedActions`, `recommendedAction`, and `error`, plus legacy `state`, `stage`, and non-secret `details` when present. Preserve every `observations` entry, including `observed: false`; do not infer provider health, resource existence, ownership, target, or completed cleanup from persisted state or prose. Do not automatically execute a recommended action; report its role, preconditions, and wait behavior.
+
+Never infer or execute provider infrastructure commands (`sbx`, exe.dev/SSH, Cloudflare, or other provider tools), access a control socket directly, construct infrastructure commands, or retry an operation yourself. If the JSON contains `diagnosticOperation: "diagnose"`, run only `sandboxctl diagnose` exactly once and present that result.

@@ -1,5 +1,5 @@
 import { isAbsolute, join } from "node:path"
-import { readFile } from "node:fs/promises"
+import { open, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { Database } from "bun:sqlite"
 
@@ -15,8 +15,14 @@ import { createCloudflareSandcastleAdapter } from "./cloudflare-provider"
 import { redactError } from "./redaction"
 import { FileStateStore } from "./state-store"
 import type { SandcastleAdapterInput, SandcastleSessionFactory } from "./sandcastle-session"
-import { captureWorkingTree } from "./working-tree"
-import { HttpWorkspaceGateway } from "./workspace-http"
+import { captureWorkingTree, inspectWorkingTree } from "./working-tree"
+import {
+  HttpWorkspaceGateway,
+  MAX_REPLAY_EVENTS,
+  MAX_REPLAY_HISTORY_BYTES,
+  serializedReplayEventBytes,
+} from "./workspace-http"
+import { MAX_REMOTE_FRAME_BYTES } from "./remote-runtime"
 import {
   isNodeError,
   isRecord,
@@ -89,6 +95,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
     const controlSocket = join(runtimeRoot, `oe-${shortHash(`${process.pid}:${input.project.id}`)}`, "c.sock")
     const store = new FileStateStore(config.stateDirectory)
     const capabilities = new Map<string, ControlCapability>()
+    let projectCapability: ControlCapability | undefined
     let disposing = false
     const controllerRef: { current?: LifecycleController } = {}
     let controlChannel: ControlChannel | undefined
@@ -185,6 +192,15 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
           controllerRef,
           getControlChannel: () => controlChannel,
         })
+    const inspectionProvider = provider ?? (!options.sandcastle ? createInspectionProvider(config.provider, {
+      config,
+      worktree: input.worktree,
+      control: exeControl,
+      controlSocket,
+      supervisor: options.supervisor,
+      fetcher: options.fetcher,
+      ensureHostKey,
+    }) : undefined)
     const clientFetch = (input.client as { _client?: { getConfig?: () => { fetch?: typeof fetch } } } | undefined)?._client?.getConfig?.().fetch
     const gateway = new HttpWorkspaceGateway({
       serverUrl: input.serverUrl,
@@ -208,6 +224,14 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
       capture: (context) => captureWorkingTree(context),
       providerType: sandcastle?.type ?? provider?.type,
       branchForWorkspace: provider?.branch?.bind(provider),
+      providerInspect: inspectionProvider?.inspect
+        ? (record) => inspectionProvider.inspect!(workspaceInfoForRecord(record))
+        : undefined,
+      providerTarget: provider?.target
+        ? (record) => provider.target(workspaceInfoForRecord(record))
+        : undefined,
+      providerInventory: inspectionProvider?.inventory?.bind(inspectionProvider),
+      gitInspect: (record, worktreePath) => inspectWorkingTree(worktreePath),
       providerRelease: provider?.release
         ? (record) => provider.release!(workspaceInfoForRecord(record))
         : undefined,
@@ -217,9 +241,11 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
       sandcastle,
       infrastructure: options.infrastructure ?? {
         remove: async (record) => {
+          if (record.provider !== "exedev" || inspectionProvider?.type !== "exedev" || !inspectionProvider.destroy) {
+            throw new SandboxError("remove", "verified exe.dev cleanup is unavailable", "EXEDEV_CLEANUP_UNAVAILABLE")
+          }
           await ensureHostKey()
-          if (!record.vmIdentity) throw new SandboxError("remove", "VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
-          await exeControl.remove(record.vmIdentity)
+          await inspectionProvider.destroy(workspaceInfoForRecord(record))
         },
       },
     })
@@ -268,13 +294,25 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
       channel.revoke(capability.token)
       capabilities.delete(sessionId)
     }
+    const capabilityForInventory = async (): Promise<ControlCapability> => {
+      const current = projectCapability
+      if (current && current.expiresAt > Date.now()) return current
+      if (current) channel?.revoke(current.token)
+      const next = await controller.projectCapabilityFor(input.project.id)
+      channel?.register(next)
+      projectCapability = next
+      return next
+    }
     let disposal: Promise<void> | undefined
 
     return {
       dispose() {
         disposal ??= (async () => {
           disposing = true
+          for (const capability of capabilities.values()) channel?.revoke(capability.token)
+          if (projectCapability) channel?.revoke(projectCapability.token)
           capabilities.clear()
+          projectCapability = undefined
           let failure: unknown
           try {
             await controller.dispose()
@@ -332,8 +370,10 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
         if (!sessionID) return
         contextFor(sessionID, cwd)
         const capability = await capabilityFor(sessionID)
+        const project = await capabilityForInventory()
         output.env.SANDBOX_CONTROL_SOCKET = channel.socketPath
         output.env.SANDBOX_CONTROL_TOKEN = capability.token
+        output.env.SANDBOX_CONTROL_PROJECT_TOKEN = project.token
         output.env.SANDBOX_CONTROL_ROLE = "host"
       },
     }
@@ -347,9 +387,55 @@ function openCodeDatabasePath(env: Record<string, string | undefined>): string {
   return join(env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "opencode.db")
 }
 
+function createInspectionProvider(
+  provider: "exedev" | "sbx" | "cloudflare",
+  options: {
+    config: ReturnType<typeof parseConfig>
+    worktree: string
+    control: ExeControl
+    controlSocket: string
+    supervisor?: import("./types").ProcessSupervisor
+    fetcher?: typeof fetch
+    ensureHostKey: () => Promise<void>
+  },
+): WorkspaceProviderBase | undefined {
+  if (provider === "sbx") {
+    return new SbxProvider({
+      worktree: options.worktree,
+      remotePort: options.config.remotePort,
+      healthTimeoutMs: options.config.healthTimeoutMs,
+      bootstrapTimeoutMs: options.config.bootstrapTimeoutMs,
+      supervisor: options.supervisor,
+      fetcher: options.fetcher,
+      openCodeVersion: options.config.openCodeVersion,
+    })
+  }
+  if (provider === "exedev") {
+    return new ExedevProvider({
+      config: options.config,
+      control: options.control,
+      worktree: options.worktree,
+      localControlSocket: options.controlSocket,
+      supervisor: options.supervisor,
+      fetcher: options.fetcher,
+      ensureHostKey: options.ensureHostKey,
+    })
+  }
+  return undefined
+}
+
 export function readSessionEvents(databasePath: string, sessionId: string): WorkspaceReplayEvent[] {
   const database = new Database(databasePath, { readonly: true })
   try {
+    const summary = database.query<{
+      count: number
+      bytes: number
+    }, [string]>(
+      "SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(data AS BLOB))), 0) AS bytes FROM event WHERE aggregate_id = ?",
+    ).get(sessionId)
+    if (!summary || summary.count > MAX_REPLAY_EVENTS || summary.bytes > MAX_REPLAY_HISTORY_BYTES) {
+      throw replayLimitError()
+    }
     const rows = database.query<{
       id: string
       aggregateID: string
@@ -357,14 +443,26 @@ export function readSessionEvents(databasePath: string, sessionId: string): Work
       type: string
       data: string
     }, [string]>(
-      "SELECT id, aggregate_id AS aggregateID, seq, type, data FROM event WHERE aggregate_id = ? ORDER BY seq",
+      `SELECT id, aggregate_id AS aggregateID, seq, type, data FROM event WHERE aggregate_id = ? ORDER BY seq LIMIT ${MAX_REPLAY_EVENTS + 1}`,
     ).all(sessionId)
+    if (rows.length > MAX_REPLAY_EVENTS) {
+      throw replayLimitError()
+    }
+    let serializedBytes = 2
     return rows.map((row, index) => {
-      const data: unknown = JSON.parse(row.data)
+      let data: unknown
+      try {
+        data = JSON.parse(row.data)
+      } catch {
+        throw new SandboxError("sync", "OpenCode session history contains invalid event JSON", "WORKSPACE_HISTORY")
+      }
       if (row.seq !== index || !isRecord(data)) {
         throw new SandboxError("sync", "OpenCode session history is invalid", "WORKSPACE_HISTORY")
       }
-      return { ...row, data }
+      const event = { ...row, data }
+      serializedBytes += serializedReplayEventBytes(event) + (index === 0 ? 0 : 1)
+      if (serializedBytes > MAX_REPLAY_HISTORY_BYTES) throw replayLimitError()
+      return event
     })
   } finally {
     database.close()
@@ -372,16 +470,49 @@ export function readSessionEvents(databasePath: string, sessionId: string): Work
 }
 
 export async function resolveAuthContent(env: Record<string, string | undefined>): Promise<string | undefined> {
-  if (env.OPENCODE_AUTH_CONTENT) return env.OPENCODE_AUTH_CONTENT
+  if (env.OPENCODE_AUTH_CONTENT) {
+    assertAuthContentSize(env.OPENCODE_AUTH_CONTENT)
+    return env.OPENCODE_AUTH_CONTENT
+  }
   const dataDirectory = env.XDG_DATA_HOME ?? (env.HOME ? join(env.HOME, ".local", "share") : undefined)
   if (!dataDirectory || !isAbsolute(dataDirectory)) return undefined
   try {
-    const content = await readFile(join(dataDirectory, "opencode", "auth.json"), "utf8")
+    const content = await readLimitedText(join(dataDirectory, "opencode", "auth.json"), MAX_REMOTE_FRAME_BYTES)
     JSON.parse(content)
     return content
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return undefined
+    if (error instanceof SandboxError) throw error
     throw new SandboxError("bootstrap", "OpenCode auth content could not be loaded", "AUTH_UNAVAILABLE")
+  }
+}
+
+function replayLimitError(): SandboxError {
+  return new SandboxError("sync", "OpenCode session history exceeds the replay limit", "WORKSPACE_REPLAY_LIMIT")
+}
+
+function assertAuthContentSize(content: string): void {
+  if (Buffer.byteLength(content) > MAX_REMOTE_FRAME_BYTES) {
+    throw new SandboxError("bootstrap", "OpenCode auth content is too large", "AUTH_LIMIT")
+  }
+}
+
+async function readLimitedText(path: string, maxBytes: number): Promise<string> {
+  const file = await open(path, "r")
+  const chunks: Buffer[] = []
+  let size = 0
+  try {
+    while (size <= maxBytes) {
+      const chunk = Buffer.alloc(Math.min(64 * 1024, maxBytes - size + 1))
+      const { bytesRead } = await file.read(chunk, 0, chunk.length, null)
+      if (bytesRead === 0) break
+      size += bytesRead
+      if (size > maxBytes) throw new SandboxError("bootstrap", "OpenCode auth content is too large", "AUTH_LIMIT")
+      chunks.push(chunk.subarray(0, bytesRead))
+    }
+    return Buffer.concat(chunks, size).toString("utf8")
+  } finally {
+    await file.close()
   }
 }
 
@@ -435,13 +566,22 @@ function createProvider(
 }
 
 function workspaceInfoForRecord(record: SandboxRecord): WorkspaceInfo {
+  const providerState = record.providerState
+  const providerStateVmIdentity = isRecord(providerState) && isRecord(providerState.vmIdentity) ? providerState.vmIdentity : undefined
+  const providerStateName = isRecord(providerState) && typeof providerState.vmName === "string"
+    ? providerState.vmName
+    : typeof providerStateVmIdentity?.name === "string"
+      ? providerStateVmIdentity.name
+      : undefined
   return {
     id: record.workspaceId,
     type: record.provider,
-    name: record.vmName ?? record.workspaceId,
+    name: record.vmName ?? record.vmIdentity?.name ?? providerStateName ?? record.workspaceId,
     branch: record.branch,
     directory: record.directory,
     extra: {
+      sessionId: record.sessionId,
+      generation: record.generation,
       providerState: record.providerState,
       ...(record.vmName ? { vmName: record.vmName } : {}),
       ...(record.vmIdentity ? { vmIdentity: record.vmIdentity } : {}),

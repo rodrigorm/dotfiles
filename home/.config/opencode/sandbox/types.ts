@@ -2,6 +2,8 @@ export const SANDBOX_OPERATIONS = [
   "start",
   "stop",
   "status",
+  "inspect",
+  "inventory",
   "delete",
   "logs",
   "diagnose",
@@ -9,6 +11,11 @@ export const SANDBOX_OPERATIONS = [
 ] as const
 
 export type SandboxOperation = (typeof SANDBOX_OPERATIONS)[number]
+
+export type PublicOperation =
+  | SandboxOperation
+  | "recover"
+  | "repair"
 
 export const SANDBOX_STATES = [
   "local",
@@ -82,12 +89,14 @@ export interface SandboxRecord {
     kind: SandboxOperation
     phase: string
     force?: boolean
+    providerDestroyed?: boolean
   }
   createdAt: string
   updatedAt: string
   lastError?: {
     stage: string
     message: string
+    code?: string
   }
 }
 
@@ -112,6 +121,22 @@ export interface WorkspaceRuntimeMetadata {
   providerState?: Record<string, unknown>
   vmName?: string
   vmIdentity?: VmIdentity
+}
+
+export interface ProviderResourceObservation {
+  resourceId: string
+  projectId?: string
+  resource: "present" | "absent" | "unknown"
+  ownership: "verified" | "unknown" | "conflict"
+  health: "healthy" | "degraded" | "unknown"
+  evidence: string[]
+}
+
+export interface GitWorkingTreeObservation {
+  head: string | null
+  branch: string | null
+  dirty: boolean | null
+  evidence: string[]
 }
 
 export type WorkspaceProviderId = "exedev" | "sbx" | "cloudflare"
@@ -145,6 +170,8 @@ export interface WorkspaceProviderBase {
   target(info: WorkspaceInfo): WorkspaceTarget | Promise<WorkspaceTarget>
   release(info: WorkspaceInfo): Promise<void>
   destroy?(info: WorkspaceInfo): Promise<void>
+  inspect?(info: WorkspaceInfo): Promise<ProviderResourceObservation>
+  inventory?(): Promise<ProviderResourceObservation[]>
   branch?(workspaceId: string): string
   runtimeMetadata?(workspaceId: string): WorkspaceRuntimeMetadata | undefined
   dispose?(): Promise<void>
@@ -193,6 +220,7 @@ export interface WorkspaceGateway {
   remove(input: { workspaceId: string; directory: string }): Promise<void>
   waitForSync?(input: { workspaceId: string; directory: string; timeoutMs: number }): Promise<void>
   syncOut?(input: WorkspaceSyncOutInput): Promise<WorkspaceSyncResult>
+  inspect?(input: { workspaceId: string; directory: string }): Promise<WorkspaceInfo | undefined>
 }
 
 export interface WorkingTreeFile {
@@ -207,9 +235,70 @@ export interface WorkingTreeCapture {
   untracked: WorkingTreeFile[]
 }
 
-export interface SandboxResponse {
+export type SandboxDesiredLocation = "local" | "remote" | "deleted"
+
+export type SandboxIntentPhase =
+  | "idle"
+  | "capturing"
+  | "provisioning"
+  | "activating"
+  | "syncing"
+  | "detaching"
+  | "deleting"
+
+export interface SandboxObservation {
+  source: "record" | "handle" | "workspace" | "provider" | "git"
+  observed: boolean
+  freshAt: string
+  resource?: "present" | "absent" | "unknown"
+  ownership?: "verified" | "unknown" | "conflict"
+  health?: "healthy" | "degraded" | "unknown"
+  evidence: string[]
+}
+
+export interface SandboxAllowedAction {
+  operation: PublicOperation
+  role: "host" | "remote"
+  arguments: string[]
+  preconditions: string[]
+  waitFor: "none" | "session_idle" | "operation_completion"
+}
+
+export interface SandboxResultV2 {
+  schemaVersion: 2
+  requestId: string
   ok: boolean
-  operation: SandboxOperation
+  operation: PublicOperation
+  message: string
+  session: null | {
+    projectId: string
+    sessionId: string
+    workspaceId: string
+    generation: number
+    provider: WorkspaceProviderId
+  }
+  intent: {
+    desiredLocation: SandboxDesiredLocation
+    phase: SandboxIntentPhase
+  }
+  effectiveTarget: null | { kind: "local"; directory: string } | { kind: "remote"; resourceId: string }
+  observations: SandboxObservation[]
+  classification: "clean" | "attached" | "control_lost" | "orphan" | "stale_record" | "leaked_resource" | "conflict" | "work_at_risk" | "unknown"
+  work: {
+    captureBaseSha: string | null
+    runtimeHead: string | null
+    sync: "clean" | "dirty" | "failed" | "unknown"
+    preservation: "not_needed" | "preserved" | "at_risk" | "discard_authorized"
+    preservedWorktreePath: string | null
+  }
+  allowedActions: SandboxAllowedAction[]
+  recommendedAction: null | { operation: PublicOperation; reasonCode: string }
+  error: null | { code: string; stage: string; retryable: boolean }
+}
+
+export interface SandboxResponse extends Partial<SandboxResultV2> {
+  ok: boolean
+  operation: PublicOperation
   state: SandboxState
   sessionId?: string
   workspaceId?: string
@@ -226,12 +315,15 @@ export interface ControlRequest {
 }
 
 export type CapabilityRole = "host" | "remote"
+export type CapabilityScope = "session" | "project"
 
 export interface ControlCapability {
   token: string
   sessionId: string
   generation: number
   role: CapabilityRole
+  scope?: CapabilityScope
+  projectId?: string
   expiresAt: number
 }
 

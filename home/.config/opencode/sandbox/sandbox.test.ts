@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, truncate, utimes, writeFile } from "node:fs/promises"
 import { createConnection, createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -10,22 +10,28 @@ import { createWorktree, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 
 import { DEFAULT_CONFIG, parseConfig } from "./config"
 import { ControlChannel, createCapability, parseControlRequest } from "./control-channel"
-import { buildExeDevSshArgv } from "./exe-control"
+import { buildExeDevSshArgv, DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS, SshExeControl } from "./exe-control"
 import { canTransition } from "./state"
 import { FileStateStore } from "./state-store"
 import { buildRemoteCommandArgv, buildSupervisorArgv } from "./remote-runtime"
 import { parseCliArgs, requestControl, requestControlMailbox, runCli } from "./cli"
-import { identityMatches, makeVmPlan } from "./naming"
+import { identityMatches, makeVmPlan, shortHash } from "./naming"
 import { redactText } from "./redaction"
 import { LifecycleController } from "./lifecycle"
 import { createSandboxPlugin, readSessionEvents, resolveAuthContent, type WorkspaceAdapterLike } from "./plugin-runtime"
-import { nodeProcessRunner } from "./process"
+import { nodeProcessRunner, nodeProcessSupervisor } from "./process"
 import { createExedevSandcastleAdapter, ExedevProvider, remoteWorkspaceDirectory } from "./exedev-provider"
 import { createSbxSandcastleAdapter, SbxProvider } from "./sbx-provider"
 import { CloudflareBridgeClient, type CloudflareSandboxClient } from "./cloudflare-bridge"
 import { CloudflareProvider, createCloudflareSandcastleAdapter } from "./cloudflare-provider"
-import { captureWorkingTree } from "./working-tree"
-import { HttpWorkspaceGateway } from "./workspace-http"
+import { captureWorkingTree, inspectWorkingTree } from "./working-tree"
+import {
+  HttpWorkspaceGateway,
+  MAX_REPLAY_EVENTS,
+  MAX_REPLAY_HISTORY_BYTES,
+  MAX_REPLAY_REQUEST_BYTES,
+  readLimitedBody,
+} from "./workspace-http"
 import { runSyncBarrier } from "./sync-barrier"
 import type { ExeControl } from "./exe-control"
 import { isWorkspaceSyncResult } from "./types"
@@ -65,6 +71,35 @@ describe("sandboxctl parser", () => {
     expect(code).toBe(2)
     expect(stdout).toHaveLength(1)
     expect(() => JSON.parse(stdout[0] ?? "")).not.toThrow()
+  })
+
+  it("preserves the validation error code in its JSON response", async () => {
+    const cases = [
+      { argv: ["unknown"], env: {}, code: "CLI_OPERATION" },
+      { argv: ["delete", "--force"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_FORCE" },
+      { argv: ["start"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_START" },
+      { argv: ["inventory"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_INVENTORY" },
+      { argv: ["status", "unexpected"], env: {}, code: "CLI_ARGUMENT" },
+    ] as const
+
+    for (const testCase of cases) {
+      const stdout: string[] = []
+      await expect(runCli(testCase.argv, testCase.env, { stdout: (text) => stdout.push(text) })).resolves.toBe(2)
+      expect(JSON.parse(stdout[0] ?? "")).toMatchObject({ error: { code: testCase.code, stage: "validate" } })
+    }
+  })
+
+  it("reports stable V2 endpoint and project-auth errors", async () => {
+    const cases = [
+      { argv: ["status"], env: {}, code: "CONTROL_ENDPOINT" },
+      { argv: ["inventory"], env: { SANDBOX_CONTROL_SOCKET: "/tmp/control.sock", SANDBOX_CONTROL_TOKEN: "session-token" }, code: "CONTROL_TOKEN" },
+    ] as const
+
+    for (const testCase of cases) {
+      const stdout: string[] = []
+      await expect(runCli(testCase.argv, testCase.env, { stdout: (text) => stdout.push(text) })).resolves.toBe(1)
+      expect(JSON.parse(stdout[0] ?? "")).toMatchObject({ schemaVersion: 2, error: { code: testCase.code } })
+    }
   })
 
   it("uses a mailbox transport when the remote sandbox has no socket route", async () => {
@@ -154,6 +189,44 @@ describe("redaction", () => {
     expect(text).not.toContain("private")
     expect(text).not.toContain("abc123")
     expect(text).toContain("[REDACTED]")
+  })
+
+  it("redacts camelCase credential keys without matching benign fields", () => {
+    const text = redactText(JSON.stringify({
+      controlToken: "control-secret",
+      serverPassword: "password-secret",
+      authContent: "auth-secret",
+      author: "keep-author",
+      tokenCount: 3,
+      passwordHint: "keep-hint",
+    }))
+
+    expect(text).not.toContain("control-secret")
+    expect(text).not.toContain("password-secret")
+    expect(text).not.toContain("auth-secret")
+    expect(text).toContain('"author":"keep-author"')
+    expect(text).toContain('"tokenCount":3')
+    expect(text).toContain('"passwordHint":"keep-hint"')
+  })
+
+  it("redacts escaped JSON credential keys without parsing the whole value", () => {
+    const text = redactText(String.raw`{"pass\u0077ord":"escaped-password","\u0074oken":"escaped-token","author":"keep-author"} trailing text`)
+
+    expect(text).not.toContain("escaped-password")
+    expect(text).not.toContain("escaped-token")
+    expect(text).toContain(String.raw`"pass\u0077ord":"[REDACTED]"`)
+    expect(text).toContain(String.raw`"\u0074oken":"[REDACTED]"`)
+    expect(text).toContain(String.raw`"author":"keep-author"`)
+  })
+
+  it("redacts quoted credential assignments without consuming adjacent fields", () => {
+    const cases = [
+      ['password="foo bar" adjacent="keep this"', 'password=[REDACTED] adjacent="keep this"'],
+      ["password='foo bar' adjacent='keep this'", "password=[REDACTED] adjacent='keep this'"],
+      ['{"password":"foo bar","message":"keep this"}', '{"password":"[REDACTED]","message":"keep this"}'],
+    ] as const
+
+    for (const [input, expected] of cases) expect(redactText(input)).toBe(expected)
   })
 })
 
@@ -246,6 +319,45 @@ describe("SSH argv", () => {
   })
 })
 
+describe("exe.dev control", () => {
+  it("applies one bounded default timeout to every VM command", async () => {
+    const vm = {
+      name: "oc-0123456789",
+      sshDest: "vm.exe.xyz",
+      tags: ["opencode-sandbox"],
+      comment: "opencode-test",
+      status: "running",
+    }
+    const inputs: Array<{ timeoutMs?: number }> = []
+    const control = new SshExeControl({
+      lobby: "exe.dev",
+      knownHostsFile: "/tmp/known_hosts",
+      runner: {
+        async run(input) {
+          inputs.push({ timeoutMs: input.timeoutMs })
+          return {
+            exitCode: 0,
+            signal: null,
+            stdout: JSON.stringify(input.argv.includes("ls") ? [vm] : vm),
+            stderr: "",
+          }
+        },
+      },
+    })
+
+    await control.create({ name: vm.name, cpu: 2, memory: "8GB", tags: vm.tags, comment: vm.comment })
+    await control.copy({ baseVm: vm.name, name: vm.name, cpu: 2, memory: "8GB", tags: vm.tags, comment: vm.comment })
+    await control.list()
+    await control.remove({ ...vm, tags: [...vm.tags] })
+    await control.tag(vm.name, vm.tags)
+    await control.comment(vm.name, vm.comment)
+    await control.replaceTags?.({ ...vm, tags: [...vm.tags] }, ["opencode-sandbox"])
+
+    expect(inputs.length).toBeGreaterThan(0)
+    expect(inputs.every((input) => input.timeoutMs === DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS)).toBe(true)
+  })
+})
+
 describe("process runner", () => {
   it("streams complete stdout lines before returning", async () => {
     const lines: string[] = []
@@ -256,6 +368,51 @@ describe("process runner", () => {
 
     expect(result.exitCode).toBe(0)
     expect(lines).toEqual(["first", "second", "last"])
+  })
+
+  it("terminates a child when an unterminated line exceeds the output limit", async () => {
+    const lines: string[] = []
+    const handle = await nodeProcessSupervisor.start({
+      argv: [globalThis.process.execPath, "-e", "process.stdout.write('x'.repeat(2049)); setInterval(() => {}, 1000)"],
+      maxOutputBytes: 1024,
+      onLine: (line) => lines.push(line),
+    })
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timeoutTimer = setTimeout(() => reject(new Error("process was not terminated")), 1_000)
+    })
+
+    try {
+      await expect(Promise.race([
+        handle.result,
+        timeout,
+      ])).rejects.toMatchObject({ code: "OUTPUT_LIMIT" })
+      expect(lines).toEqual([])
+    } finally {
+      if (timeoutTimer) clearTimeout(timeoutTimer)
+      handle.terminate()
+    }
+  })
+
+  it("cleans spawn-error timers and abort listeners", async () => {
+    const listeners = new Set<unknown>()
+    const signal = {
+      aborted: false,
+      addEventListener(_type: string, listener: unknown) {
+        listeners.add(listener)
+      },
+      removeEventListener(_type: string, listener: unknown) {
+        listeners.delete(listener)
+      },
+    } as unknown as AbortSignal
+
+    await expect(nodeProcessRunner.run({
+      argv: ["/definitely/missing/opencode-sandbox-process"],
+      timeoutMs: 1_000,
+      signal,
+    })).rejects.toMatchObject({ code: "PROCESS_START" })
+
+    expect(listeners.size).toBe(0)
   })
 })
 
@@ -340,6 +497,24 @@ describe("workspace sync contract", () => {
     ])
   })
 
+  it("maps malformed stored event JSON to a stable redacted history error", async () => {
+    const databasePath = join(await temporaryDirectory(), "opencode.db")
+    const database = new Database(databasePath)
+    database.run("CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL)")
+    database.run("INSERT INTO event VALUES (?, ?, ?, ?, ?)", ["evt_bad", "ses_bad", 0, "session.updated.1", '{"password":"private"'])
+    database.close()
+
+    let error: unknown
+    try {
+      readSessionEvents(databasePath, "ses_bad")
+    } catch (value) {
+      error = value
+    }
+
+    expect(error).toMatchObject({ code: "WORKSPACE_HISTORY", stage: "sync" })
+    expect(String((error as Error).message)).not.toContain("private")
+  })
+
   it("accepts only control-plane or isolated branch results", () => {
     expect(isWorkspaceSyncResult({ kind: "control-plane", baseSha })).toBe(true)
     expect(isWorkspaceSyncResult({ kind: "branch", baseSha, branch: "opencode/1" })).toBe(true)
@@ -385,6 +560,225 @@ describe("workspace sync contract", () => {
     expect(requests[1]?.url.href).toBe("https://sandbox.example.test/sync/replay")
     expect(requests[1]?.body).toMatchObject({ directory: "/requested" })
   })
+
+  it("aborts a never-resolving sync status request at its deadline", async () => {
+    let aborted = false
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      fetcher: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) {
+          reject(new Error("missing abort signal"))
+          return
+        }
+        signal.addEventListener("abort", () => {
+          aborted = true
+          reject(new Error("request aborted"))
+        }, { once: true })
+      }),
+    })
+
+    await expect(gateway.waitForSync({ workspaceId: "wrk_1", directory: "/project", timeoutMs: 20 })).rejects.toMatchObject({
+      code: "WORKSPACE_SYNC_TIMEOUT",
+    })
+    expect(aborted).toBe(true)
+  })
+
+  it("bounds a fetch that ignores the abort signal", async () => {
+    let aborted = false
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      requestTimeoutMs: 20,
+      fetcher: async (_input, init) => {
+        init?.signal?.addEventListener("abort", () => { aborted = true }, { once: true })
+        return new Promise<Response>(() => {})
+      },
+    })
+
+    await expect(gateway.create({
+      type: "sbx",
+      projectId: "prj_1",
+      directory: "/project",
+      id: "wrk_1",
+      branch: "opencode/test",
+      extra: {},
+    })).rejects.toMatchObject({ code: "WORKSPACE_HTTP_TIMEOUT" })
+    expect(aborted).toBe(true)
+  })
+
+  it("cancels an already-aborted response body without starting a reader", async () => {
+    let cancelStarted!: () => void
+    let releaseCancel!: () => void
+    let readStarted = false
+    const cancelCalled = new Promise<void>((resolve) => { cancelStarted = resolve })
+    const cancelFinished = new Promise<void>((resolve) => { releaseCancel = resolve })
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        readStarted = true
+      },
+      cancel() {
+        cancelStarted()
+        return cancelFinished
+      },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    const pending = readLimitedBody(new Response(body), controller.signal, "control_channel")
+
+    await cancelCalled
+    let settled = false
+    const observed = pending.then(() => { settled = true }, () => { settled = true })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    expect(readStarted).toBe(false)
+    releaseCancel()
+    await expect(pending).rejects.toBeDefined()
+    await observed
+  })
+
+  it("rejects replay history beyond its explicit event cap", async () => {
+    let requests = 0
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      sessionEvents: () => Array.from({ length: MAX_REPLAY_EVENTS + 1 }, (_, seq) => ({
+        id: `evt_${seq}`,
+        aggregateID: "ses_1",
+        seq,
+        type: "session.updated.1",
+        data: {},
+      })),
+      fetcher: async () => {
+        requests++
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    await expect(gateway.replaySession({ sessionId: "ses_1", directory: "/project", target: { type: "remote", url: "https://sandbox.example.test" } })).rejects.toMatchObject({
+      code: "WORKSPACE_REPLAY_LIMIT",
+    })
+    expect(requests).toBe(0)
+  })
+
+  it("rejects an oversized replay event before sending it", async () => {
+    let requests = 0
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      sessionEvents: () => [{
+        id: "evt_large",
+        aggregateID: "ses_1",
+        seq: 0,
+        type: "session.updated.1",
+        data: { payload: "x".repeat(MAX_REPLAY_REQUEST_BYTES) },
+      }],
+      fetcher: async () => {
+        requests++
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    await expect(gateway.replaySession({ sessionId: "ses_1", directory: "/project", target: { type: "remote", url: "https://sandbox.example.test" } })).rejects.toMatchObject({
+      code: "WORKSPACE_REPLAY_LIMIT",
+    })
+    expect(requests).toBe(0)
+  })
+
+  it("rejects replay history beyond its aggregate byte cap", async () => {
+    let requests = 0
+    const payload = "x".repeat(40_000)
+    const events = Array.from({ length: Math.ceil(MAX_REPLAY_HISTORY_BYTES / 40_000) + 1 }, (_, seq) => ({
+      id: `evt_${seq}`,
+      aggregateID: "ses_1",
+      seq,
+      type: "session.updated.1",
+      data: { payload },
+    }))
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      sessionEvents: () => events,
+      fetcher: async () => {
+        requests++
+        return new Response(null, { status: 204 })
+      },
+    })
+
+    await expect(gateway.replaySession({ sessionId: "ses_1", directory: "/project", target: { type: "remote", url: "https://sandbox.example.test" } })).rejects.toMatchObject({
+      code: "WORKSPACE_REPLAY_LIMIT",
+    })
+    expect(requests).toBe(0)
+  })
+
+  it("aborts a never-resolving replay request at its target timeout", async () => {
+    let aborted = false
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      replayTimeoutMs: 20,
+      sessionEvents: () => [{ id: "evt_1", aggregateID: "ses_1", seq: 0, type: "session.created.1", data: {} }],
+      fetcher: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal
+        if (!signal) {
+          reject(new Error("missing abort signal"))
+          return
+        }
+        signal.addEventListener("abort", () => {
+          aborted = true
+          reject(new Error("request aborted"))
+        }, { once: true })
+      }),
+    })
+
+    await expect(gateway.replaySession({ sessionId: "ses_1", directory: "/project", target: { type: "remote", url: "https://sandbox.example.test" } })).rejects.toMatchObject({
+      code: "WORKSPACE_REPLAY_TIMEOUT",
+    })
+    expect(aborted).toBe(true)
+  })
+
+  it("inspects a workspace through the filtered list route and validates the list response", async () => {
+    const requests: Array<{ method: string; url: URL }> = []
+    const gateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      fetcher: async (input, init) => {
+        const url = new URL(String(input))
+        requests.push({ method: init?.method ?? "GET", url })
+        return Response.json([{
+          id: "wrk_1",
+          type: "sbx",
+          name: "sandbox",
+          branch: "opencode/test",
+          directory: "/project",
+          extra: null,
+          projectID: "prj_1",
+          timeUsed: 0,
+        }])
+      },
+    })
+
+    await expect(gateway.inspect({ workspaceId: "wrk_1", directory: "/project" })).resolves.toMatchObject({ id: "wrk_1", projectID: "prj_1" })
+    expect(requests[0]).toMatchObject({ method: "GET" })
+    expect(requests[0]?.url.pathname).toBe("/experimental/workspace")
+    expect(requests[0]?.url.searchParams.get("workspace")).toBe("wrk_1")
+
+    const invalidGateway = new HttpWorkspaceGateway({
+      serverUrl: "http://127.0.0.1:4096",
+      directory: "/project",
+      projectId: "prj_1",
+      fetcher: async () => Response.json({ id: "wrk_1" }),
+    })
+    await expect(invalidGateway.inspect({ workspaceId: "wrk_1", directory: "/project" })).rejects.toMatchObject({ code: "WORKSPACE_SCHEMA" })
+  })
 })
 
 describe("control channel", () => {
@@ -414,9 +808,710 @@ describe("control channel", () => {
       await channel.close()
     }
   })
+
+  it("limits inventory to a host project capability", () => {
+    const project = createCapability({ sessionId: "project_prj_1", generation: 1, role: "host", scope: "project", projectId: "prj_1" })
+    expect(parseControlRequest({ operation: "inventory" }, project)).toEqual({ operation: "inventory", force: false })
+    expect(() => parseControlRequest({ operation: "status" }, project)).toThrow()
+    expect(() => parseControlRequest({ operation: "inventory" }, createCapability({ sessionId: "ses_1", generation: 1, role: "host" }))).toThrow()
+    expect(() => parseControlRequest({ operation: "inventory" }, createCapability({ sessionId: "ses_1", generation: 1, role: "remote" }))).toThrow()
+  })
+
+  it("returns bounded V2 envelopes with stable transport and handler codes", async () => {
+    const root = await temporaryDirectory()
+    const channel = new ControlChannel({
+      socketPath: join(root, "control.sock"),
+      handler: async (request) => {
+        if (request.operation === "diagnose") throw new SandboxError("diagnose", "handler failed", "HANDLER_FAILURE")
+        if (request.operation === "logs") return { ok: true, operation: request.operation, state: "local", message: "large", details: { output: "x".repeat(70 * 1024) } }
+        return { ok: true, operation: request.operation, state: "local", message: "handled" }
+      },
+    })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+    channel.register(capability)
+    await channel.start()
+
+    try {
+      const unauthorized = await requestControl(channel.socketPath, "wrong", { operation: "status" })
+      expect(unauthorized.body).toMatchObject({ schemaVersion: 2, error: { code: "CONTROL_AUTH" } })
+
+      const invalid = await requestControl(channel.socketPath, capability.token, { operation: "status", extra: true })
+      expect(invalid.body).toMatchObject({ schemaVersion: 2, error: { code: "REQUEST_FIELDS" } })
+
+      const failed = await requestControl(channel.socketPath, capability.token, { operation: "diagnose" })
+      expect(failed.body).toMatchObject({ schemaVersion: 2, error: { code: "HANDLER_FAILURE" } })
+
+      const oversized = await requestControl(channel.socketPath, capability.token, { operation: "logs" })
+      expect(oversized.body).toMatchObject({ schemaVersion: 2, error: { code: "RESPONSE_LIMIT" } })
+      expect(Buffer.byteLength(JSON.stringify(oversized.body))).toBeLessThan(64 * 1024)
+    } finally {
+      await channel.close()
+    }
+  })
 })
 
 describe("lifecycle controller", () => {
+  it("reports structured classifications and selects only allowed actions", async () => {
+    const cases = [
+      { state: "local", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "clean", action: "start" },
+      { state: "local", provider: { resource: "present", ownership: "unknown", health: "unknown" }, workspace: false, classification: "unknown", action: "inspect" },
+      { state: "remote", provider: { resource: "unknown", ownership: "unknown", health: "unknown" }, workspace: false, classification: "control_lost", action: "inspect" },
+      { state: "remote", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "inspect" },
+      { state: "remote", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, classification: "orphan", action: "inspect" },
+      { state: "detached", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, preservedWorktreePath: "/tmp/preserved", classification: "leaked_resource", action: "delete" },
+      { state: "detached", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, classification: "leaked_resource", action: "inspect" },
+      { state: "recovery_pending", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "inspect", retryable: true },
+      { state: "remote", provider: { resource: "present", ownership: "conflict", health: "unknown" }, workspace: false, classification: "conflict", action: "inspect" },
+      { state: "sync_failed", provider: { resource: "unknown", ownership: "unknown", health: "unknown" }, workspace: false, classification: "work_at_risk", action: "retry" },
+    ] as const
+
+    for (const scenario of cases) {
+      const root = await temporaryDirectory()
+      const store = new FileStateStore(root)
+      const preservedWorktreePath = "preservedWorktreePath" in scenario ? scenario.preservedWorktreePath : undefined
+      const record = {
+        ...makeRecord(),
+        state: scenario.state,
+        ...(scenario.action === "retry" || "retryable" in scenario ? { operation: { kind: "start" as const, phase: "provisioning" as const } } : {}),
+        ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
+      }
+      await store.write(record)
+      let providerCalls = 0
+      const controller = new LifecycleController({
+        store,
+        capture: async () => ({ baseSha: record.baseSha, patch: "", untracked: [] }),
+        providerInspect: async () => {
+          providerCalls++
+          return { resourceId: "resource-1", ...scenario.provider, evidence: ["fixture"] }
+        },
+        providerTarget: async () => undefined,
+        gitInspect: async () => ({ head: record.baseSha, branch: record.branch, dirty: false, evidence: ["fixture"] }),
+        workspace: {
+          async create() { throw new Error("must not create") },
+          async warp() {},
+          async remove() {},
+          async inspect() {
+            return scenario.workspace
+              ? { id: record.workspaceId, type: record.provider, name: "workspace", branch: record.branch, directory: record.directory, extra: null, projectID: record.projectId }
+              : undefined
+          },
+        },
+      })
+      const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+      controller.registerContext({ sessionId: record.sessionId, projectId: record.projectId, directory: record.directory, worktree: record.directory })
+
+      const status = await controller.handle({ operation: "status", force: false, capability })
+      expect(providerCalls).toBe(0)
+      expect(status.observations?.find((observation) => observation.source === "provider")?.observed).toBe(false)
+
+      const result = await controller.handle({ operation: "inspect", force: false, capability })
+      expect(result.schemaVersion).toBe(2)
+      expect(result.classification).toBe(scenario.classification)
+      const action = result.recommendedAction
+      expect(action?.operation).toBe(scenario.action)
+      expect(result.allowedActions?.some((allowed) => allowed.operation === action?.operation && allowed.role === "host")).toBe(true)
+      if ("retryable" in scenario) expect(result.allowedActions?.some((allowed) => allowed.operation === "retry")).toBe(true)
+      if (scenario.classification !== "leaked_resource") {
+        expect(result.allowedActions?.some((allowed) => allowed.operation === "delete")).toBe(false)
+      }
+      expect(providerCalls).toBe(1)
+    }
+  })
+
+  it("classifies a live direct provider only when its target is observed", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "remote" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => ({ type: "remote", url: "https://remote.example.test" }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { throw new Error("must not warp") },
+        async remove() { throw new Error("must not remove") },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inspect",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result).toMatchObject({
+      classification: "attached",
+      effectiveTarget: { kind: "remote", resourceId: "resource-1" },
+    })
+    expect(result.observations?.find((observation) => observation.source === "handle")).toMatchObject({
+      resource: "present",
+      evidence: ["direct provider runtime target"],
+    })
+  })
+
+  it("does not classify a detached resource as leaked when target inspection fails", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "detached" as const, preservedWorktreePath: "/tmp/preserved" }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({
+        resourceId: "resource-1",
+        resource: "present",
+        ownership: "verified",
+        health: "healthy",
+        evidence: ["fixture"],
+      }),
+      providerTarget: async () => {
+        throw new SandboxError("tunnel", "runtime target is unavailable", "TARGET_UNAVAILABLE")
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { throw new Error("must not warp") },
+        async remove() { throw new Error("must not remove") },
+        async inspect() { return undefined },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inspect",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result).toMatchObject({
+      ok: false,
+      classification: "unknown",
+      recommendedAction: { operation: "inspect" },
+      error: { code: "TARGET_UNAVAILABLE" },
+    })
+    expect(result.observations?.find((observation) => observation.source === "handle")).toMatchObject({
+      observed: true,
+      resource: "unknown",
+      evidence: ["runtime target inspection failed:TARGET_UNAVAILABLE"],
+    })
+    expect(result.allowedActions?.some((action) => action.operation === "delete")).toBe(false)
+  })
+
+  it("does not infer an absent runtime handle when target inspection is unavailable", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "detached" as const, preservedWorktreePath: "/tmp/preserved" }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      gitInspect: async () => ({ head: record.baseSha, branch: record.branch, dirty: false, evidence: ["fixture"] }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async inspect() { return undefined },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inspect",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result.classification).toBe("unknown")
+    expect(result.observations?.find((observation) => observation.source === "handle")).toMatchObject({
+      observed: false,
+      evidence: ["runtime target inspection is unavailable"],
+    })
+    expect(result.allowedActions?.some((action) => action.operation === "delete")).toBe(false)
+  })
+
+  it("blocks clean and start when local or deleted state lacks observed workspace absence", async () => {
+    for (const state of ["local", "deleted"] as const) {
+      for (const workspaceState of ["present", "unavailable"] as const) {
+        const store = new FileStateStore(await temporaryDirectory())
+        const record = { ...makeRecord(), state }
+        await store.write(record)
+        const controller = new LifecycleController({
+          store,
+          providerInspect: async () => ({
+            resourceId: "resource-1",
+            resource: "absent",
+            ownership: "unknown",
+            health: "unknown",
+            evidence: ["fixture"],
+          }),
+          workspace: {
+            async create() { throw new Error("must not create") },
+            async warp() { throw new Error("must not warp") },
+            async remove() { throw new Error("must not remove") },
+            ...(workspaceState === "present" ? {
+              async inspect() {
+                return {
+                  id: record.workspaceId,
+                  type: record.provider,
+                  name: "workspace",
+                  branch: record.branch,
+                  directory: record.directory,
+                  extra: null,
+                  projectID: record.projectId,
+                }
+              },
+            } : {}),
+          },
+        })
+
+        const result = await controller.handle({
+          operation: "inspect",
+          force: false,
+          capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+        })
+
+        expect(result.classification).toBe("unknown")
+        expect(result.recommendedAction).toMatchObject({ operation: "inspect" })
+        expect(result.allowedActions?.some((action) => action.operation === "start")).toBe(false)
+      }
+    }
+  })
+
+  it("keeps record-only local and deleted status unknown without provider calls", async () => {
+    for (const state of ["local", "deleted"] as const) {
+      const store = new FileStateStore(await temporaryDirectory())
+      const record = { ...makeRecord(), state }
+      await store.write(record)
+      let providerCalls = 0
+      const controller = new LifecycleController({
+        store,
+        providerInspect: async () => {
+          providerCalls++
+          throw new Error("status must not inspect")
+        },
+        workspace: {
+          async create() { throw new Error("status must not create") },
+          async warp() { throw new Error("status must not warp") },
+          async remove() { throw new Error("status must not remove") },
+          async inspect() { throw new Error("status must not inspect") },
+        },
+      })
+
+      const result = await controller.handle({
+        operation: "status",
+        force: false,
+        capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+      })
+
+      expect(providerCalls).toBe(0)
+      expect(result.classification).toBe("unknown")
+      expect(result.recommendedAction).toMatchObject({ operation: "inspect" })
+      expect(result.allowedActions?.some((action) => action.operation === "start" || action.operation === "delete")).toBe(false)
+      for (const source of ["workspace", "provider", "handle", "git"] as const) {
+        expect(result.observations?.find((observation) => observation.source === source)?.observed).toBe(false)
+      }
+    }
+  })
+
+  it("does not advertise retry when a failed record has no operation", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "error" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const inspection = await controller.handle({ operation: "inspect", force: false, capability })
+    expect(inspection.allowedActions?.some((action) => action.operation === "retry")).toBe(false)
+    expect(inspection.recommendedAction).toMatchObject({ operation: "inspect" })
+
+    await expect(controller.handle({ operation: "retry", force: false, capability })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "RETRY_UNAVAILABLE" },
+    })
+  })
+
+  it("does not advertise start when capture is unavailable", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "local" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      providerTarget: async () => undefined,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async inspect() { return undefined },
+      },
+    })
+    controller.registerContext({ sessionId: record.sessionId, projectId: record.projectId, directory: record.directory, worktree: record.directory })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const result = await controller.handle({ operation: "inspect", force: false, capability })
+
+    expect(result.classification).toBe("clean")
+    expect(result.allowedActions?.some((action) => action.operation === "start")).toBe(false)
+    expect(result.recommendedAction).toBeNull()
+  })
+
+  it("does not advertise start without session context", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "local" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      capture: async () => ({ baseSha: record.baseSha, patch: "", untracked: [] }),
+      providerTarget: async () => undefined,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async inspect() { return undefined },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inspect",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result.classification).toBe("clean")
+    expect(result.allowedActions?.some((action) => action.operation === "start")).toBe(false)
+    expect(result.recommendedAction).toBeNull()
+  })
+
+  it("reports a local effective target only from an observed workspace route", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "local" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async inspect() {
+          return {
+            id: record.workspaceId,
+            type: record.provider,
+            name: "workspace",
+            branch: record.branch,
+            directory: record.directory,
+            extra: null,
+            projectID: record.projectId,
+          }
+        },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const result = await controller.handle({ operation: "inspect", force: false, capability })
+
+    expect(result.effectiveTarget).toEqual({ kind: "local", directory: record.directory })
+  })
+
+  it("replays a persisted recovery operation instead of leaving recovery_pending stranded", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "recovery_pending" as const,
+      operation: { kind: "stop" as const, phase: "remote" },
+    }
+    await store.write(record)
+    const calls: string[] = []
+    const controller = new LifecycleController({
+      store,
+      providerRelease: async () => { calls.push("release") },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async syncOut(input) {
+          calls.push("sync")
+          return { kind: "control-plane", baseSha: input.baseSha }
+        },
+        async warp() { calls.push("warp") },
+        async remove() { calls.push("remove") },
+      },
+    })
+
+    await controller.reconcile("prj_1")
+
+    expect(calls).toEqual(["sync", "warp", "release", "remove"])
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached", operation: { kind: "stop", phase: "detached" } })
+  })
+
+  it("replays Sandcastle recovery when its in-memory session handle is still available", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "recovery_pending" as const,
+      operation: { kind: "stop" as const, phase: "remote" },
+    }
+    await store.write(record)
+    const calls: string[] = []
+    const controller = new LifecycleController({
+      store,
+      sandcastle: { createAdapter: async () => { throw new Error("must not create") } },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { calls.push("warp") },
+        async remove() { calls.push("remove") },
+      },
+    })
+    const session = {
+      workspaceId: record.workspaceId,
+      branch: record.branch,
+      worktree: { worktreePath: "/tmp/worktree" },
+      sandbox: {},
+      target: { type: "remote", url: "https://sandbox.example.test" },
+      recoveryMetadata: {},
+      async sync() { calls.push("sync"); return {} },
+      async applyCapture() {},
+      async close() { calls.push("close"); return {} },
+    }
+    const sessions = (controller as unknown as { sessions: Map<string, typeof session> }).sessions
+    sessions.set(record.sessionId, session)
+
+    await controller.reconcile("prj_1")
+
+    expect(calls).toEqual(["sync", "warp", "close", "remove"])
+    expect(await store.get(record.sessionId)).toMatchObject({
+      state: "detached",
+      operation: { kind: "stop", phase: "detached", providerDestroyed: true },
+    })
+  })
+
+  it("does not destroy a preserved path until Git preservation is verified", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "detached" as const, preservedWorktreePath: "/tmp/not-verified" }
+    await store.write(record)
+    let destroyed = false
+    const controller = new LifecycleController({
+      store,
+      providerDestroy: async () => { destroyed = true },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "delete",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result).toMatchObject({ ok: false, error: { code: "PRESERVATION_UNVERIFIED" } })
+    expect(destroyed).toBe(false)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached", preservedWorktreePath: record.preservedWorktreePath })
+  })
+
+  it("does not complete Sandcastle deletion without persisted destruction evidence", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "detached" as const }
+    await store.write(record)
+    const controller = new LifecycleController({
+      store,
+      sandcastle: { createAdapter: async () => { throw new Error("must not create") } },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({ state: "delete_pending" })
+    await controller.onSessionIdle(record.sessionId)
+
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "orphaned", lastError: { code: "SANDCASTLE_HANDLE" } })
+  })
+
+  it("allows Sandcastle deletion after a stopped session recorded provider destruction", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "detached" as const,
+      operation: { kind: "stop" as const, phase: "detached", providerDestroyed: true },
+    }
+    await store.write(record)
+    let removed = 0
+    const controller = new LifecycleController({
+      store,
+      sandcastle: { createAdapter: async () => { throw new Error("must not create") } },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() { removed++ },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({ state: "delete_pending" })
+    await controller.onSessionIdle(record.sessionId)
+
+    expect(removed).toBe(1)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "deleted", operation: { kind: "delete", providerDestroyed: true } })
+  })
+
+  it("uses a preserved worktree for Git evidence and leaves runtime HEAD unknown without one", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "detached" as const, preservedWorktreePath: "/tmp/preserved-worktree" }
+    await store.write(record)
+    const inspectedPaths: string[] = []
+    const runtimeHead = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    const controller = new LifecycleController({
+      store,
+      gitInspect: async (_record, worktreePath) => {
+        inspectedPaths.push(worktreePath)
+        return { head: runtimeHead, branch: "opencode/preserved", dirty: false, evidence: ["fixture"] }
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const preserved = await controller.handle({ operation: "inspect", force: false, capability })
+
+    expect(inspectedPaths).toEqual([record.preservedWorktreePath])
+    expect(preserved.work).toMatchObject({ runtimeHead, sync: "clean", preservation: "preserved" })
+
+    await store.write({ ...record, state: "local", preservedWorktreePath: undefined })
+    const local = await controller.handle({ operation: "inspect", force: false, capability })
+
+    expect(inspectedPaths).toHaveLength(1)
+    expect(local.work).toMatchObject({ runtimeHead: null })
+    expect(local.observations?.find((observation) => observation.source === "git")).toMatchObject({
+      observed: false,
+      evidence: ["runtime worktree is unavailable"],
+    })
+  })
+
+  it("inventories only the project records and provider listing", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write(makeRecord())
+    await store.write({ ...makeRecord(), sessionId: "ses_other", projectId: "prj_other" })
+    let inventoryCalls = 0
+    const controller = new LifecycleController({
+      store,
+      providerInventory: async () => {
+        inventoryCalls++
+        return [{ resourceId: "resource-1", projectId: "prj_1", resource: "present", ownership: "unknown", health: "unknown", evidence: ["fixture"] }]
+      },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inventory",
+      force: false,
+      capability: createCapability({ sessionId: "project_prj_1", generation: 1, role: "host", scope: "project", projectId: "prj_1" }),
+    })
+
+    expect(inventoryCalls).toBe(1)
+    expect(result).toMatchObject({ operation: "inventory", state: "local", classification: "unknown", recommendedAction: null })
+    expect(result.observations?.find((observation) => observation.source === "provider")?.health).toBe("unknown")
+    expect(result.allowedActions).toEqual([expect.objectContaining({ operation: "inventory", role: "host" })])
+    expect(result.details).toMatchObject({
+      records: [expect.objectContaining({ sessionId: "ses_1", projectId: "prj_1" })],
+      providerResources: [expect.objectContaining({ resourceId: "resource-1" })],
+    })
+  })
+
+  it("keeps provider inventory scope unknown when any resource lacks project metadata", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const controller = new LifecycleController({
+      store,
+      providerInventory: async () => [
+        { resourceId: "resource-project", projectId: "prj_1", resource: "present", ownership: "unknown", health: "healthy", evidence: ["fixture"] },
+        { resourceId: "resource-unscoped", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] },
+      ],
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inventory",
+      force: false,
+      capability: createCapability({ sessionId: "project_prj_1", generation: 1, role: "host", scope: "project", projectId: "prj_1" }),
+    })
+
+    expect(result.classification).toBe("unknown")
+    expect(result.observations?.find((observation) => observation.source === "provider")).toMatchObject({
+      resource: "unknown",
+      ownership: "unknown",
+      health: "unknown",
+    })
+    expect(result.details?.providerResources).toEqual([expect.objectContaining({ resourceId: "resource-project" })])
+  })
+
+  it("keeps aggregate provider health unknown when one resource is unknown", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const controller = new LifecycleController({
+      store,
+      providerInventory: async () => [
+        { resourceId: "resource-healthy", projectId: "prj_1", resource: "present", ownership: "unknown", health: "healthy", evidence: ["fixture"] },
+        { resourceId: "resource-unknown", projectId: "prj_1", resource: "present", ownership: "unknown", health: "unknown", evidence: ["fixture"] },
+      ],
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inventory",
+      force: false,
+      capability: createCapability({ sessionId: "project_prj_1", generation: 1, role: "host", scope: "project", projectId: "prj_1" }),
+    })
+
+    expect(result.observations?.find((observation) => observation.source === "provider")?.health).toBe("unknown")
+  })
+
+  it("bounds inventory details before returning the control response", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const controller = new LifecycleController({
+      store,
+      providerInventory: async () => Array.from({ length: 1_000 }, (_, index) => ({
+        resourceId: `resource-${index}`,
+        projectId: "prj_1",
+        resource: "present" as const,
+        ownership: "unknown" as const,
+        health: "healthy" as const,
+        evidence: ["x".repeat(1_000)],
+      })),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "inventory",
+      force: false,
+      capability: createCapability({ sessionId: "project_prj_1", generation: 1, role: "host", scope: "project", projectId: "prj_1" }),
+    })
+
+    expect(result.details).toMatchObject({ truncated: true })
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(64 * 1024)
+  })
+
   it("keeps start and stop responses on their source side before warping", async () => {
     const root = await temporaryDirectory()
     const store = new FileStateStore(root)
@@ -744,7 +1839,7 @@ describe("lifecycle controller", () => {
 
   it("holds the record lock through reconciliation effects", async () => {
     const store = new FileStateStore(await temporaryDirectory())
-    await store.write({ ...makeRecord(), state: "remote" })
+    await store.write({ ...makeRecord(), state: "remote", operation: { kind: "stop", phase: "remote" } })
     let unblockRelease!: () => void
     let releaseStarted!: () => void
     const started = new Promise<void>((resolve) => { releaseStarted = resolve })
@@ -757,6 +1852,7 @@ describe("lifecycle controller", () => {
       workspace: {
         async create() { throw new Error("must not create") },
         async warp() {},
+        async syncOut(input) { return { kind: "control-plane", baseSha: input.baseSha } },
         async remove() {},
       },
     })
@@ -771,6 +1867,30 @@ describe("lifecycle controller", () => {
     expect(concurrent).toMatchObject({ ok: false, stage: "validate" })
     expect(concurrent.message).toMatch(/locked/)
     expect(await store.get("ses_1")).toMatchObject({ state: "detached" })
+  })
+
+  it("fails closed when restart recovery has no operation proving preservation", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write({ ...makeRecord(), state: "remote" })
+    const calls: string[] = []
+    const controller = new LifecycleController({
+      store,
+      providerRelease: async () => { calls.push("release") },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async syncOut() { calls.push("sync"); return { kind: "control-plane", baseSha: makeRecord().baseSha } },
+        async warp() { calls.push("warp") },
+        async remove() { calls.push("remove") },
+      },
+    })
+
+    await controller.reconcile("prj_1")
+
+    expect(calls).toEqual([])
+    expect(await store.get("ses_1")).toMatchObject({
+      state: "error",
+      lastError: { code: "RECOVERY_PRESERVATION_UNVERIFIED" },
+    })
   })
 
   it("reconciles the latest record instead of a stale list snapshot", async () => {
@@ -963,7 +2083,7 @@ describe("lifecycle controller", () => {
 
   it("redacts and bounds logs and diagnostics before returning them", async () => {
     const store = new FileStateStore(await temporaryDirectory())
-    const record = { ...makeRecord(), state: "orphaned" as const }
+    const record = { ...makeRecord(), state: "orphaned" as const, providerState: { metadata: "y".repeat(100_000) } }
     await store.write(record)
     const controller = new LifecycleController({
       store,
@@ -984,8 +2104,8 @@ describe("lifecycle controller", () => {
 
     expect(logs.details).toMatchObject({ truncated: true })
     expect(diagnostics.details).toMatchObject({ truncated: true })
-    expect(Buffer.byteLength(JSON.stringify(logs))).toBeLessThan(140_000)
-    expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThan(70_000)
+    expect(Buffer.byteLength(JSON.stringify(logs))).toBeLessThan(64 * 1024)
+    expect(Buffer.byteLength(JSON.stringify(diagnostics))).toBeLessThan(64 * 1024)
     expect(`${JSON.stringify(logs)}${JSON.stringify(diagnostics)}`).not.toContain("private")
   })
 
@@ -1066,6 +2186,7 @@ describe("plugin runtime", () => {
 
     expect(shellEnv.env.SANDBOX_CONTROL_SOCKET).toContain("/c.sock")
     expect(shellEnv.env.SANDBOX_CONTROL_TOKEN).toHaveLength(43)
+    expect(shellEnv.env.SANDBOX_CONTROL_PROJECT_TOKEN).toHaveLength(43)
     expect(shellEnv.env.SANDBOX_CONTROL_ROLE).toBe("host")
     expect(adapter.name).toBe("exe.dev")
     await expect(adapter.create({} as never, {})).resolves.toBeUndefined()
@@ -1181,6 +2302,151 @@ describe("plugin runtime", () => {
 })
 
 describe("exe.dev provisioner", () => {
+  it("reports verified, absent, and ambiguous live VM states", async () => {
+    const root = await temporaryDirectory()
+    const identity = {
+      name: "oc-0123456789",
+      sshDest: "owned.exe.xyz",
+      tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_1:wrk_1:1")}`],
+      comment: "opencode-test",
+    }
+    const foreign = { ...identity, sshDest: "foreign.exe.xyz" }
+    let inventory: unknown[] = [{ identity, status: "running" }]
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { throw new Error("must not create") },
+        async copy() { throw new Error("must not copy") },
+        async list() { return inventory as VmInfo[] },
+        async remove() { throw new Error("must not remove") },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+    })
+    const info = {
+      id: "wrk_1",
+      type: "exedev",
+      name: identity.name,
+      branch: "opencode/sandbox-0123456789",
+      directory: remoteWorkspaceDirectory("wrk_1"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_1", generation: 1, vmIdentity: identity },
+    }
+
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "verified", health: "healthy" })
+    inventory = [{ identity }, { identity: foreign, status: "running" }]
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "conflict", health: "unknown" })
+    inventory = []
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "absent", ownership: "unknown", health: "unknown" })
+  })
+
+  it("fails closed for malformed ExeDev workspace and inventory data", async () => {
+    const root = await temporaryDirectory()
+    const identity = {
+      name: "oc-0123456789",
+      sshDest: "owned.exe.xyz",
+      tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_1:wrk_1:1")}`],
+      comment: "opencode-test",
+    }
+    let inventory: unknown[] = [{ identity, status: "running" }]
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { throw new Error("must not create") },
+        async copy() { throw new Error("must not copy") },
+        async list() { return inventory as VmInfo[] },
+        async remove() { throw new Error("must not remove") },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+    })
+    const info = {
+      id: "wrk_1",
+      type: "exedev",
+      name: identity.name,
+      branch: "opencode/sandbox-0123456789",
+      directory: remoteWorkspaceDirectory("wrk_1"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_1", generation: 1, vmIdentity: identity },
+    }
+
+    await expect(provider.inspect({ ...info, name: 42 } as never)).rejects.toMatchObject({ code: "EXEDEV_WORKSPACE_INVALID" })
+    inventory = [{ identity: { ...identity, sshDest: 42 }, status: "running" }]
+    await expect(provider.inspect(info)).rejects.toMatchObject({ code: "EXEDEV_SCHEMA" })
+    inventory = [{ identity, status: 42 }]
+    await expect(provider.inspect(info)).rejects.toMatchObject({ code: "EXEDEV_SCHEMA" })
+    await expect(provider.inspect({ ...info, extra: { ...info.extra, vmIdentity: null, providerState: { vmIdentity: identity } } })).rejects.toMatchObject({ code: "VM_IDENTITY_INVALID" })
+  })
+
+  it("reports a same-name foreign VM as an ownership conflict", async () => {
+    const root = await temporaryDirectory()
+    const expected = {
+      name: "oc-0123456789",
+      sshDest: "owned.exe.xyz",
+      tags: ["opencode-sandbox"],
+      comment: "opencode-test",
+    }
+    const foreign = { ...expected, sshDest: "foreign.exe.xyz" }
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { throw new Error("must not create") },
+        async copy() { throw new Error("must not copy") },
+        async list() { return [{ identity: foreign, status: "running" }] },
+        async remove() { throw new Error("must not remove") },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+    })
+
+    await expect(provider.inspect({
+      id: "wrk_1",
+      type: "exedev",
+      name: expected.name,
+      branch: "opencode/sandbox-0123456789",
+      directory: remoteWorkspaceDirectory("wrk_1"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_1", generation: 1, vmIdentity: expected },
+    })).resolves.toMatchObject({ resource: "present", ownership: "conflict" })
+  })
+
+  it("does not destroy a same-name foreign VM from persisted metadata", async () => {
+    const root = await temporaryDirectory()
+    const foreign = {
+      name: "oc-0123456789",
+      sshDest: "foreign.exe.xyz",
+      tags: ["opencode-sandbox", "opencode-owner-foreign"],
+      comment: "opencode-foreign",
+    }
+    let removed = false
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { throw new Error("must not create") },
+        async copy() { throw new Error("must not copy") },
+        async list() { return [{ identity: foreign, status: "running" }] },
+        async remove() { removed = true },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+    })
+
+    await expect(provider.destroy({
+      id: "wrk_1",
+      type: "exedev",
+      name: foreign.name,
+      branch: "opencode/sandbox-0123456789",
+      directory: remoteWorkspaceDirectory("wrk_1"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_1", generation: 1, vmIdentity: foreign },
+    })).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
+    expect(removed).toBe(false)
+  })
+
   it("creates a VM, checks out the local revision, starts the target, and preserves untracked files", async () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
@@ -1225,7 +2491,7 @@ describe("exe.dev provisioner", () => {
       identity: {
         name: "oc-0123456789",
         sshDest: "vm.exe.xyz",
-        tags: ["opencode-sandbox"],
+        tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_1:wrk_1:1")}`],
         comment: "opencode-test",
       },
       status: "running",
@@ -1286,6 +2552,18 @@ describe("exe.dev provisioner", () => {
     expect(supervisorInput?.argv).toContain("127.0.0.1:4100:127.0.0.1:4096")
     expect(supervisorInput?.argv.join(" ")).not.toContain("control-token")
     expect(JSON.parse(String(supervisorInput?.stdin))).toMatchObject({ authContent: "{}", controlToken: "remote-token" })
+
+    const foreignInfo = {
+      ...info,
+      extra: {
+        ...info.extra,
+        vmIdentity: { ...vm.identity, sshDest: "foreign.exe.xyz" },
+      },
+    }
+    await expect(provisioner.release(foreignInfo)).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
+    await expect(provisioner.destroy(foreignInfo)).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
+    expect(removedVm).toBe(false)
+
     await expect(provisioner.target(info)).resolves.toMatchObject({
       type: "remote",
       url: "http://127.0.0.1:4100",
@@ -1330,7 +2608,7 @@ describe("exe.dev provisioner", () => {
     const baseSha = "0123456789012345678901234567890123456789"
     let removed = false
     const vm: VmInfo = {
-      identity: { name: "oc-0123456789", sshDest: "vm.exe.xyz", tags: ["opencode-sandbox"], comment: "opencode-test" },
+      identity: { name: "oc-0123456789", sshDest: "vm.exe.xyz", tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:wrk_failed:wrk_failed:1")}`], comment: "opencode-test" },
       status: "running",
     }
     const runner: ProcessRunner = {
@@ -1346,7 +2624,7 @@ describe("exe.dev provisioner", () => {
       control: {
         async create() { return vm },
         async copy() { return vm },
-        async list() { return [] },
+        async list() { return [vm] },
         async remove() { removed = true },
         async tag() {},
       },
@@ -1361,7 +2639,7 @@ describe("exe.dev provisioner", () => {
     await expect(provider.prepare({
       id: "wrk_failed",
       type: "exedev",
-      name: "workspace",
+      name: vm.identity.name,
       branch: "opencode/sandbox-failed",
       directory: remoteWorkspaceDirectory("wrk_failed"),
       projectID: "prj_1",
@@ -1369,6 +2647,125 @@ describe("exe.dev provisioner", () => {
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_COMMAND" })
     expect(removed).toBe(true)
   })
+
+  it("removes a VM when identity verification fails immediately after creation", async () => {
+    const root = await temporaryDirectory()
+    const baseSha = "0123456789012345678901234567890123456789"
+    const vm: VmInfo = {
+      identity: {
+        name: "oc-0123456789",
+        sshDest: "vm.exe.xyz",
+        tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:wrk_verify:wrk_verify:1")}`],
+        comment: "opencode-test",
+      },
+      status: "running",
+    }
+    let listCalls = 0
+    let removed: VmInfo["identity"] | undefined
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv[0] === "git" && input.argv.includes("remote")) return { exitCode: 0, signal: null, stdout: "https://github.com/owner/repo.git\n", stderr: "" }
+        if (input.argv[0] === "git" && input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    }
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { return vm },
+        async copy() { return vm },
+        async list() {
+          listCalls++
+          return listCalls === 1 ? [] : [vm]
+        },
+        async remove(identity) { removed = identity },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+      runner,
+      ensureHostKey: async () => {},
+      ensureVmHostKey: async () => {},
+      reservePort: async () => 4100,
+    })
+
+    await expect(provider.prepare({
+      id: "wrk_verify",
+      type: "exedev",
+      name: vm.identity.name,
+      branch: "opencode/sandbox-verify",
+      directory: remoteWorkspaceDirectory("wrk_verify"),
+      projectID: "prj_1",
+      extra: {},
+    }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
+    expect(listCalls).toBe(2)
+    expect(removed).toEqual(vm.identity)
+  })
+
+  for (const failure of ["tag", "comment"] as const) {
+    it(`removes the exact VM when copy ${failure} fails`, async () => {
+      const root = await temporaryDirectory()
+      const baseSha = "0123456789012345678901234567890123456789"
+      const vmName = "oc-0123456789"
+      const created = { name: vmName, sshDest: "vm.exe.xyz", tags: [] as string[], comment: "" }
+      const foreign = { name: "oc-foreign", sshDest: "foreign.exe.xyz", tags: ["foreign"], comment: "foreign" }
+      let inventory = [foreign, created]
+      let removedTarget: string | undefined
+      const commands: string[][] = []
+      const runner: ProcessRunner = {
+        async run(input) {
+          commands.push(input.argv)
+          if (input.argv[0] === "git" && input.argv.includes("remote")) {
+            return { exitCode: 0, signal: null, stdout: "https://github.com/owner/repo.git\n", stderr: "" }
+          }
+          if (input.argv[0] === "git" && input.argv.includes("rev-parse")) {
+            return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+          }
+          if (input.argv.includes("cp")) return { exitCode: 0, signal: null, stdout: JSON.stringify(created), stderr: "" }
+          if (input.argv.includes("tag")) {
+            if (failure === "tag") return { exitCode: 1, signal: null, stdout: "", stderr: "tag failed" }
+            const tags = input.argv.slice(input.argv.indexOf("tag") + 2, -1)
+            inventory = inventory.map((vm) => vm.name === vmName ? { ...vm, tags } : vm)
+            return { exitCode: 0, signal: null, stdout: "{}", stderr: "" }
+          }
+          if (input.argv.includes("comment")) {
+            if (failure === "comment") return { exitCode: 1, signal: null, stdout: "", stderr: "comment failed" }
+            return { exitCode: 0, signal: null, stdout: "{}", stderr: "" }
+          }
+          if (input.argv.includes("ls")) return { exitCode: 0, signal: null, stdout: JSON.stringify(inventory), stderr: "" }
+          if (input.argv.includes("rm")) {
+            removedTarget = input.argv[input.argv.indexOf("rm") + 1]
+            return { exitCode: 0, signal: null, stdout: "{}", stderr: "" }
+          }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
+      }
+      const provider = new ExedevProvider({
+        config: parseConfig({ baseVm: "base-vm" }, { HOME: root }),
+        control: new SshExeControl({ lobby: "exe.dev", knownHostsFile: join(root, "known_hosts"), runner }),
+        worktree: root,
+        localControlSocket: join(root, "control.sock"),
+        runner,
+        ensureHostKey: async () => {},
+        ensureVmHostKey: async () => {},
+        reservePort: async () => 4100,
+      })
+
+      await expect(provider.prepare({
+        id: "wrk_copy_failure",
+        type: "exedev",
+        name: vmName,
+        branch: "opencode/sandbox-copy-failure",
+        directory: remoteWorkspaceDirectory("wrk_copy_failure"),
+        projectID: "prj_1",
+        extra: { sessionId: "ses_copy_failure", generation: 1, baseSha, tags: ["opencode-sandbox"], comment: "opencode-test" },
+      }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "EXEDEV_COMMAND" })
+
+      expect(removedTarget).toBe(vmName)
+      expect(commands.filter((argv) => argv.includes("rm"))).toHaveLength(1)
+      expect(commands.some((argv) => argv.includes("comment"))).toBe(failure === "comment")
+    })
+  }
 
   it("exposes Exe.dev as an isolated Sandcastle provider with streaming exec", async () => {
     const root = await temporaryDirectory()
@@ -1382,7 +2779,7 @@ describe("exe.dev provisioner", () => {
     const head = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })
     const baseSha = head.stdout.trim()
     const vm: VmInfo = {
-      identity: { name: "oc-0123456789", sshDest: "vm.exe.xyz", tags: ["opencode-sandbox"], comment: "opencode-test" },
+      identity: { name: `oc-${shortHash("wrk_adapter")}`, sshDest: "vm.exe.xyz", tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_adapter:wrk_adapter:1")}`], comment: "opencode-test" },
       status: "running",
     }
     let removed = 0
@@ -1822,6 +3219,66 @@ describe("Docker Sandbox provider", () => {
     expect(commands).toHaveLength(1)
   })
 
+  it("observes SBX presence, health, and durable ownership without starting it", async () => {
+    const ownershipId = "x".repeat(43)
+    const sandbox = "oc-sbx-observed"
+    const owner = {
+      provider: "sbx",
+      ownershipId,
+      sessionId: "ses_observed",
+      generation: 2,
+      workspaceId: "wrk_observed",
+      projectId: "prj_observed",
+    }
+    let sandboxes: unknown[] = [{ name: sandbox, status: "running" }]
+    let marker: unknown = owner
+    const calls: string[][] = []
+    const provider = new SbxProvider({
+      worktree: await temporaryDirectory(),
+      runner: {
+        async run(input) {
+          calls.push(input.argv)
+          if (input.argv[1] === "ls") {
+            expect(input.timeoutMs).toBe(5_000)
+            return { exitCode: 0, signal: null, stdout: JSON.stringify({ sandboxes }), stderr: "" }
+          }
+          if (input.argv[1] === "cp") {
+            expect(input.timeoutMs).toBe(5_000)
+            await writeFile(input.argv.at(-1)!, JSON.stringify(marker))
+            return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+          }
+          throw new Error(`unexpected command: ${input.argv.join(" ")}`)
+        },
+      },
+    })
+    const info = {
+      id: owner.workspaceId,
+      type: "sbx",
+      name: sandbox,
+      branch: "opencode/sbx-observed",
+      directory: "/tmp/project",
+      projectID: owner.projectId,
+      extra: { providerState: { ...owner, sandbox } },
+    }
+
+    await expect(provider.inspect(info)).resolves.toEqual({
+      resourceId: sandbox,
+      resource: "present",
+      ownership: "verified",
+      health: "healthy",
+      evidence: [`sbx inventory:${sandbox}`, `sbx owner marker:${sandbox}`],
+    })
+    sandboxes = [{ name: sandbox, status: "running" }, { name: sandbox, status: "stopped" }]
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "conflict", health: "unknown" })
+    marker = { ...owner, sessionId: "ses_other" }
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "conflict" })
+    sandboxes = []
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "absent", ownership: "unknown", health: "unknown" })
+    sandboxes = [{ status: "running" }]
+    await expect(provider.inspect(info)).rejects.toMatchObject({ code: "SBX_INVENTORY_INVALID" })
+    expect(calls.some((argv) => argv.includes("exec"))).toBe(false)
+  })
+
   it("keeps the shared control proxy alive while another workspace is active", async () => {
     const root = await temporaryDirectory()
     const socketPath = join(root, "control.sock")
@@ -1989,6 +3446,71 @@ describe("Cloudflare Sandbox bridge", () => {
     streamController?.enqueue(new TextEncoder().encode('event: exit\ndata: {"exit_code":0}\n\n'))
     streamController?.close()
     await expect(result).resolves.toMatchObject({ exitCode: 0, stdout: "hello\n" })
+  })
+
+  it("bounds an unterminated SSE line", async () => {
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 1_000,
+      fetcher: (async () => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Buffer.alloc(512 * 1024 + 1, "x"))
+          controller.close()
+        },
+      }), { status: 200, headers: { "Content-Type": "text/event-stream" } })) as unknown as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"] })).rejects.toMatchObject({ code: "CLOUDFLARE_RESPONSE_LIMIT" })
+  })
+})
+
+describe("provider health responses", () => {
+  it("bounds oversized health response bodies for every provider", async () => {
+    const root = await temporaryDirectory()
+    const sbxHealth = oversizedHealthFetcher()
+    const exedevHealth = oversizedHealthFetcher()
+    const cloudflareHealth = oversizedHealthFetcher()
+    const providers = [
+      {
+        provider: new SbxProvider({ worktree: root, healthTimeoutMs: 1, fetcher: sbxHealth.fetcher }),
+        activation: { hostPort: 4101, password: "private" },
+        health: sbxHealth,
+      },
+      {
+        provider: new ExedevProvider({
+          config: parseConfig({ healthTimeoutMs: 1 }, { HOME: root }),
+          control: {} as ExeControl,
+          worktree: root,
+          localControlSocket: join(root, "control.sock"),
+          fetcher: exedevHealth.fetcher,
+        }),
+        activation: { localPort: 4101, password: "private" },
+        health: exedevHealth,
+      },
+      {
+        provider: new CloudflareProvider({
+          worktree: root,
+          client: {} as CloudflareSandboxClient,
+          healthTimeoutMs: 1,
+          fetcher: cloudflareHealth.fetcher,
+        }),
+        activation: { tunnel: { id: "tunnel_1", port: 4096, url: "https://sandbox.example.test" }, password: "private" },
+        health: cloudflareHealth,
+      },
+    ]
+
+    for (const testCase of providers) {
+      let error: unknown
+      try {
+        await invokeHealthCheck(testCase.provider, testCase.activation)
+      } catch (value) {
+        error = value
+      }
+      expect(error).toMatchObject({ code: "REMOTE_HEALTH_TIMEOUT" })
+      expect(String((error as Error).message)).not.toContain("private")
+      expect(testCase.health.cancelled()).toBe(true)
+    }
   })
 })
 
@@ -2361,6 +3883,80 @@ describe("Cloudflare Sandbox provider", () => {
     expect(calls).toContain("destroy:sandboxa2")
     expect(calls).toContain("revoke:private")
   })
+
+  it("keeps Cloudflare control assets when Sandcastle recreates the checkout", async () => {
+    const root = await temporaryDirectory()
+    await runGit(root, ["init", "-q"])
+    await runGit(root, ["config", "user.email", "test@example.invalid"])
+    await runGit(root, ["config", "user.name", "Sandbox Test"])
+    await writeFile(join(root, "tracked.txt"), "base\n")
+    await runGit(root, ["add", "tracked.txt"])
+    await runGit(root, ["commit", "-q", "-m", "initial"])
+    const head = await nodeProcessRunner.run({ argv: ["git", "-C", root, "rev-parse", "HEAD"], cwd: root })
+    const baseSha = head.stdout.trim()
+    const remoteFiles = new Set<string>()
+    const client: CloudflareSandboxClient = {
+      async createSandbox() { return "sandboxa2" },
+      async destroySandbox() {},
+      async destroyTunnel() {},
+      async running() { return true },
+      async exec(_id, input) {
+        const command = input.argv.at(-1) ?? ""
+        const removedPath = command.match(/rm -rf(?: --)? ["']([^"']+)["']/)?.[1]
+        if (removedPath) {
+          for (const path of remoteFiles) {
+            if (path === removedPath || path.startsWith(`${removedPath}/`)) remoteFiles.delete(path)
+          }
+        }
+        const exactRemovedPath = input.argv[0] === "rm" && input.argv[1] === "-f" ? input.argv.at(-1) : undefined
+        if (exactRemovedPath) remoteFiles.delete(exactRemovedPath)
+        if (command.includes("rev-parse HEAD") || input.argv.at(-1) === "HEAD") {
+          return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        }
+        if (command.includes("symbolic-ref")) {
+          return { exitCode: 0, signal: null, stdout: "opencode/cloudflare-sandcastle\n", stderr: "" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+      async putFile(_id, path) { remoteFiles.add(path) },
+      async getFile() { return new Uint8Array() },
+      async hydrate() {},
+      async tunnel(_id, port, name) { return { id: "tunnel_1", port, url: `https://${name}.example.test` } },
+    }
+    const adapter = createCloudflareSandcastleAdapter({
+      input: {
+        sessionId: "ses_cf",
+        projectId: "prj_1",
+        workspaceId: "wrk_cf_path",
+        generation: 1,
+        branch: "opencode/cloudflare-sandcastle",
+        baseSha,
+        context: { sessionId: "ses_cf", projectId: "prj_1", directory: root, worktree: root },
+      },
+      worktree: root,
+      client,
+      authContent: "{}",
+      localControlSocket: join(root, "control.sock"),
+      controlTokenFor: async () => "private",
+      fetcher: (async () => new Response(JSON.stringify({ healthy: true }), { status: 200 })) as unknown as typeof fetch,
+    })
+    const worktree = await createWorktree({
+      cwd: root,
+      branchStrategy: { type: "branch", branch: "opencode/cloudflare-sandcastle", baseBranch: baseSha },
+    })
+
+    let sandbox: Awaited<ReturnType<typeof worktree.createSandbox>> | undefined
+    const assetPath = () => [...remoteFiles].find((path) => path.endsWith("/.config/opencode/sandbox/cli.ts"))
+    try {
+      sandbox = await worktree.createSandbox({ sandbox: adapter.provider })
+      expect(assetPath()).toBeDefined()
+      await adapter.applyCapture({ sandbox, capture: { baseSha, patch: "", untracked: [] } })
+      expect(assetPath()).toBeDefined()
+    } finally {
+      await sandbox?.close()
+      await worktree.close()
+    }
+  })
 })
 
 describe("provider-owned deletion", () => {
@@ -2394,6 +3990,36 @@ describe("provider-owned deletion", () => {
 })
 
 describe("working tree capture", () => {
+  it("does not count porcelain branch headers as changes", async () => {
+    const root = await temporaryDirectory()
+    await runGit(root, ["init", "-q"])
+    await runGit(root, ["config", "user.email", "test@example.invalid"])
+    await runGit(root, ["config", "user.name", "Test"])
+    await writeFile(join(root, "tracked.txt"), "base\n")
+    await runGit(root, ["add", "tracked.txt"])
+    await runGit(root, ["commit", "-q", "-m", "initial"])
+
+    await expect(inspectWorkingTree(root)).resolves.toMatchObject({ dirty: false })
+  })
+
+  it("inspects Git state without reading untracked file contents", async () => {
+    const root = await temporaryDirectory()
+    await runGit(root, ["init", "-q"])
+    await runGit(root, ["config", "user.email", "test@example.invalid"])
+    await runGit(root, ["config", "user.name", "Test"])
+    await writeFile(join(root, "tracked.txt"), "base\n")
+    await runGit(root, ["add", "tracked.txt"])
+    await runGit(root, ["commit", "-q", "-m", "initial"])
+    await writeFile(join(root, "tracked.txt"), "changed\n")
+    await writeFile(join(root, "untracked.txt"), "new\n")
+
+    const result = await inspectWorkingTree(root)
+
+    expect(result.head).toMatch(/^[a-f0-9]{40}$/)
+    expect(result.branch).toBeTruthy()
+    expect(result.dirty).toBe(true)
+  })
+
   it("ignores Sandcastle worktrees while capturing user files", async () => {
     const root = await temporaryDirectory()
     await runGit(root, ["init", "-q"])
@@ -2442,7 +4068,145 @@ describe("working tree capture", () => {
     expect(capture.untracked[0]?.path).toBe("untracked.txt")
     expect(new TextDecoder().decode(capture.untracked[0]?.content)).toBe("new\n")
   })
+
+  it("rejects untracked content beyond the aggregate capture limit", async () => {
+    const root = await temporaryDirectory()
+    const first = join(root, "first.bin")
+    const second = join(root, "second.bin")
+    const third = join(root, "third.bin")
+    await writeFile(first, "")
+    await writeFile(second, "")
+    await writeFile(third, "x")
+    await truncate(first, 32 * 1024 * 1024)
+    await truncate(second, 32 * 1024 * 1024)
+
+    const baseSha = "0123456789012345678901234567890123456789"
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        if (input.argv.includes("ls-files")) return { exitCode: 0, signal: null, stdout: "first.bin\0second.bin\0third.bin\0", stderr: "" }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    }
+
+    await expect(captureWorkingTree({
+      sessionId: "ses_1",
+      projectId: "prj_1",
+      directory: root,
+      worktree: root,
+    }, runner)).rejects.toMatchObject({ code: "GIT_CAPTURE_LIMIT" })
+  })
+
+  it("bounds a file read when an untracked file grows after it is checked", async () => {
+    const root = await temporaryDirectory()
+    const path = join(root, "growing.bin")
+    await writeFile(path, "x")
+    await truncate(path, 1)
+    let grow!: Promise<void>
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${"0".repeat(40)}\n`, stderr: "" }
+        if (input.argv.includes("ls-files")) {
+          grow = new Promise<void>((resolve) => {
+            setImmediate(async () => {
+              await truncate(path, 32 * 1024 * 1024 + 1)
+              resolve()
+            })
+          })
+          return { exitCode: 0, signal: null, stdout: "growing.bin\0", stderr: "" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    }
+
+    await expect(captureWorkingTree({
+      sessionId: "ses_1",
+      projectId: "prj_1",
+      directory: root,
+      worktree: root,
+    }, runner)).rejects.toMatchObject({ code: "GIT_UNTRACKED_SIZE" })
+    await grow
+  })
+
+  it("aborts a capture that exceeds its total deadline", async () => {
+    const root = await temporaryDirectory()
+    let aborted = false
+    const runner: ProcessRunner = {
+      async run(input) {
+        input.signal?.addEventListener("abort", () => { aborted = true }, { once: true })
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        return { exitCode: 0, signal: null, stdout: "0123456789012345678901234567890123456789\n", stderr: "" }
+      },
+    }
+
+    await expect(captureWorkingTree({
+      sessionId: "ses_1",
+      projectId: "prj_1",
+      directory: root,
+      worktree: root,
+    }, runner, 10)).rejects.toMatchObject({ code: "GIT_CAPTURE_TIMEOUT" })
+    expect(aborted).toBe(true)
+  })
+
+  it("waits for capture cancellation cleanup before returning its timeout", async () => {
+    const root = await temporaryDirectory()
+    let cleanupFinished = false
+    const runner: ProcessRunner = {
+      async run(input) {
+        await new Promise<void>((resolve) => {
+          input.signal?.addEventListener("abort", () => {
+            setTimeout(() => {
+              cleanupFinished = true
+              resolve()
+            }, 5)
+          }, { once: true })
+        })
+        return { exitCode: 0, signal: null, stdout: "0123456789012345678901234567890123456789\n", stderr: "" }
+      },
+    }
+
+    await expect(captureWorkingTree({
+      sessionId: "ses_1",
+      projectId: "prj_1",
+      directory: root,
+      worktree: root,
+    }, runner, 10)).rejects.toMatchObject({ code: "GIT_CAPTURE_TIMEOUT" })
+    expect(cleanupFinished).toBe(true)
+  })
 })
+
+function oversizedHealthFetcher(): { fetcher: typeof fetch; cancelled: () => boolean } {
+  let cancelled = false
+  let closeTimer: ReturnType<typeof setTimeout> | undefined
+  const body = Buffer.concat([
+    Buffer.from('{"healthy":true,"version":"1.18.23","password":"private","padding":"'),
+    Buffer.alloc(512 * 1024, "x"),
+    Buffer.from('"}'),
+  ])
+  return {
+    fetcher: (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(body)
+        closeTimer = setTimeout(() => {
+          try {
+            controller.close()
+          } catch {
+            // The bounded reader may have already canceled the stream.
+          }
+        }, 10)
+      },
+      cancel() {
+        cancelled = true
+        if (closeTimer) clearTimeout(closeTimer)
+      },
+    }), { status: 200 })) as unknown as typeof fetch,
+    cancelled: () => cancelled,
+  }
+}
+
+function invokeHealthCheck(provider: unknown, activation: unknown): Promise<void> {
+  return (provider as { waitForHealth(activation: unknown): Promise<void> }).waitForHealth(activation)
+}
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
   const result = await nodeProcessRunner.run({ argv: ["git", "-C", cwd, ...args], cwd })

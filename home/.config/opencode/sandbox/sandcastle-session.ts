@@ -9,12 +9,13 @@ import {
 
 import { redactError, redactText } from "./redaction"
 import { runSyncBarrier } from "./sync-barrier"
-import { SandboxError, type SessionContext, type WorkspaceTarget, type WorkingTreeCapture } from "./types"
+import { SandboxError, type ProviderResourceObservation, type SessionContext, type WorkspaceTarget, type WorkingTreeCapture } from "./types"
 
 export interface OpenCodeSandboxAdapter {
   readonly provider: SandboxProvider
   applyCapture(input: { sandbox: Sandbox; capture: WorkingTreeCapture }): Promise<void>
   target(): WorkspaceTarget | Promise<WorkspaceTarget>
+  inspect?(): Promise<ProviderResourceObservation>
   recoveryMetadata?(): Record<string, unknown>
   close?(): Promise<void>
 }
@@ -50,6 +51,7 @@ export interface SandcastleSession {
   readonly sandbox: Sandbox
   readonly target: Extract<WorkspaceTarget, { type: "remote" }>
   readonly recoveryMetadata: Record<string, unknown>
+  inspect?(): Promise<ProviderResourceObservation>
   applyCapture(capture: WorkingTreeCapture): Promise<void>
   sync(): Promise<SandboxRunResult>
   close(): Promise<CloseResult>
@@ -101,6 +103,7 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
       get recoveryMetadata() {
         return { ...(adapter.recoveryMetadata?.() ?? {}) }
       },
+      ...(adapter.inspect ? { inspect: () => adapter.inspect!() } : {}),
       async applyCapture(capture) {
         if (capture.baseSha !== input.baseSha) {
           throw new SandboxError("sync", "working tree capture does not match the Sandcastle worktree", "CAPTURE_SHA_MISMATCH")
@@ -169,6 +172,9 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
           if (failure) throw failure
           return closeResult
         })().catch((error) => {
+          if (closeResult.preservedWorktreePath && error instanceof Error) {
+            Object.assign(error, { preservedWorktreePath: closeResult.preservedWorktreePath })
+          }
           closing = undefined
           throw error
         })

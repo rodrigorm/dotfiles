@@ -4,19 +4,38 @@ Use this runbook to establish what exists, who owns it, whether work is preserve
 
 ## Normal agent path
 
-Inside an OpenCode session, use `/sandbox <operation>`. The command delegates to `sandboxctl` with a session-scoped capability. Treat the JSON result as authoritative for the lifecycle record.
+Inside an OpenCode session, use `/sandbox <operation>`. The command delegates to `sandboxctl` with a session-scoped capability, or the host project capability for `inventory`. Treat the JSON result as authoritative for the lifecycle record and use its structured action fields for decisions.
 
 | Intent | Command | Completion criterion |
 |---|---|---|
-| Inspect persisted session state | `/sandbox status` | State, provider, branch, and any recovery metadata are visible; missing phase, generation, and error data are treated as unknown |
+| Inspect persisted session state | `/sandbox status` | Record-only intent, freshness, and explicit unobserved external sources are visible; classification is `unknown` |
+| Inspect one session | `/sandbox inspect` | Classification, effective target, work risk, ownership, and safe next action are returned from bounded probes |
+| Inventory this project | `/sandbox inventory` from the host | Project lifecycle records and provider resources are listed without mutation when a provider inventory adapter exists |
 | Move execution to a runtime | `/sandbox start` | Response says activation is pending or remote; the next message confirms the remote target |
 | Return execution to the host | `/sandbox stop` | A later status is `detached`, and preserved worktree details are reported if present |
-| Inspect a failure | `/sandbox diagnose` | Provider-safe details are captured when diagnostics are configured; `{ "configured": false }` means provider inspection remains manual |
-| Repeat the recorded failed operation | `/sandbox retry` from the host | State leaves `error`, `sync_failed`, or `recovery_pending`; do not retry a failed start from a remote capability |
+| Inspect a failure | `/sandbox diagnose` | Provider-safe details are captured when diagnostics are configured; `{ "configured": false }` means no diagnostics hook is configured |
+| Repeat the recorded failed operation | `/sandbox retry` using the role in `allowedActions` | State leaves `error`, `sync_failed`, or `recovery_pending`; start and force-delete retries require the host |
 | Preserve changes and remove | `/sandbox delete` | State becomes `deleted` after the idle transition |
 | Discard a `sync_failed` or detached runtime | `/sandbox delete --force` from host | State becomes `deleted`; unknown ownership remains blocked even with force |
 
-The current `/sandbox status` is record-only. It does not query provider inventory. Do not read "remote" as proof that a resource is healthy, or "orphaned" as proof that it stopped.
+`/sandbox status` remains record-only and does not query provider, workspace, runtime-target, or Git sources. Use `/sandbox inspect` for one session or `/sandbox inventory` for the project. Do not read `intent.desiredLocation`, `remote`, or `orphaned` state as proof that a resource is healthy or stopped.
+
+## Decision fields
+
+Every result is `SandboxResultV2` with `schemaVersion: 2`. Read `effectiveTarget` for the proved execution target; `null` means no target was proved. Read `observations` for the five sources (`record`, `handle`, `workspace`, `provider`, and `git`); an `observed: false` entry is not evidence of absence. Read `classification` for the situation, `work` for preservation risk, `allowedActions` for the complete permitted action set, `recommendedAction` for the controller's recommendation, and `error` for a stable failure code, stage, and retryability.
+
+The result also includes `requestId`, `ok`, `operation`, `message`, `session`, and `intent`. Compatibility fields `state`, `stage`, and non-secret `details` may also be present. The desired location is intent, not a target proof, and prose never overrides `allowedActions`.
+
+## Observation budget
+
+| Operation | Calls | Deadline and fallback |
+|---|---|---|
+| `status` | Lifecycle record read only | File-read latency; external sources are `observed: false`. |
+| Session `inspect` | One controller probe each for workspace, provider, Git, and runtime target, run in parallel | 5 seconds per probe. Timeout or unavailable provider evidence stays unknown and cannot authorize a new start or ownership-based destruction. There is no separate 15-second aggregate budget. |
+| Project `inventory` | One record scan and one configured-provider listing; no per-resource deep probes | 10 seconds for provider inventory. Records remain reportable when provider inventory fails or cannot be scoped to the project. |
+| `diagnose` | Configured diagnostics only | No generic controller probe-count or wall-clock budget. Returned details are redacted and capped at 48 KiB; an unconfigured hook returns `{ "configured": false }`. |
+
+Provider resource inspection and inventory are implemented for exe.dev and SBX. The Cloudflare adapter has neither in Phase 1, so its provider observation is unavailable or unknown; do not infer Cloudflare resource presence, health, or ownership.
 
 ## Situation report
 
@@ -24,36 +43,46 @@ Before mutating provider resources, collect this minimal report:
 
 1. Run `/sandbox status` or read the private lifecycle record when the session command is unavailable.
 2. Record `sessionId`, `workspaceId`, `generation`, `provider`, branch, `baseSha`, operation phase, and last error.
-3. Inspect the OpenCode workspace association.
-4. Inspect the matching provider resource and its creation/runtime metadata.
-5. Inspect the Git branch and `.sandcastle/worktrees/` path for unpreserved changes.
-6. Classify the result using the table below.
+3. Run `/sandbox inspect` for the session and retain all five observation entries.
+4. Inspect the Git branch and `.sandcastle/worktrees/` path for unpreserved changes when the result names a worktree or preservation risk.
+5. Classify the result using the table below.
 
 Completion means every known resource is assigned to an ownership tuple or marked unknown. A provider name match by itself does not complete the report.
 
+Treat a present or unavailable workspace registration, and a failed runtime-target probe, as unknown evidence. Do not classify the session as clean or recommend starting it until provider, runtime handle, and workspace absence are all observed. A provider inventory result with unscoped resources is also unknown for this project.
+
 ## Drift classification
 
-| Record | Handle | Provider resource | Classification | Safe default |
-|---|---|---|---|---|
-| absent/deleted | absent | absent | clean | No action |
-| remote/pending | present | healthy | attached | Continue the lifecycle operation |
-| remote/pending | absent | unknown | control lost | Inspect the provider before classifying or mutating |
-| remote/pending | absent | present, ownership verified | orphan | Preserve or recover, then remove through an explicit operator action |
-| remote/pending | absent | absent | stale record | Repair the record only after checking workspace and Git evidence |
-| detached | absent | present | leaked resource | Verify ownership and preservation, then destroy |
-| any | any | present, ownership conflicts | conflict | Stop automation and require a human decision |
-| sync_failed | present | present | work at risk | Preserve first; discard only on explicit host request |
+| Classification | Required evidence | Safe default |
+|---|---|---|
+| `clean` | Provider, handle, and workspace are observed absent for a local, detached, or deleted record | Start only when `allowedActions` advertises host `start` with context and capture available; otherwise inspect |
+| `attached` | Handle present; provider present, ownership verified, and health known | Follow `recommendedAction` (`stop`); normal stop or delete waits for session idle and preserves work |
+| `control_lost` | Non-local record with no handle and unavailable or unknown provider state | Inspect; do not infer resource absence or health |
+| `orphan` | Handle absent; provider present with verified ownership; desired location remote | Read-only inspect in Phase 1; recovery, adoption, and destruction are deferred |
+| `stale_record` | Non-local record with observed absence of provider, handle, and workspace | Inspect; `repair` is deferred |
+| `leaked_resource` | Desired location local or deleted; handle absent; provider present with verified ownership | Delete only when `allowedActions` includes host delete and preservation is verified or explicit discard is recorded |
+| `conflict` | Any ownership evidence conflicts | Read-only actions; require a human decision |
+| `work_at_risk` | Recorded state is `sync_failed` | Retry the recorded operation when listed; preserve work before discard |
+| `unknown` | Required evidence is missing, unavailable, or inconsistent | Inspect again or require an operator; take no inferred provider action |
+
+`allowedActions` is authoritative. Each action carries its role, arguments, preconditions, and `waitFor` behavior. Use `recommendedAction` only when it is present in that list. A `null` recommendation means the controller has no safe next action to automate.
+
+## Restart boundary
+
+Phase 1 is read-only for recovery. `recover`, `adopt`, and `repair` are not available through `sandboxctl`. After a plugin restart, an active Sandcastle record can lose its in-memory handle and become `orphaned`; inspection may verify an SBX or exe.dev resource, but the controller still cannot reacquire, stop, or destroy that control-lost runtime. A detached leaked resource may be deleted only through its separately verified preservation and ownership path; that is not recovery.
+
+The Cloudflare path has no provider inspection or inventory adapter. Its provider observation remains unavailable or unknown, and no Cloudflare command is implied by an `allowedActions` or recommendation field.
 
 ## Current SBX orphan procedure
 
-This section is a temporary, human operator-only escape hatch. Do not execute it from the `/sandbox` command agent. `sandboxctl` cannot recover an orphan yet. An operator may clean one manually only after observing the resource and matching the state record to it. The current `orphaned` state alone is not that proof.
+This section is a temporary, human operator-only escape hatch. Do not execute it from the `/sandbox` command agent. `sandboxctl` can inspect an orphan but cannot recover, adopt, or destroy it yet. An operator may clean one manually only after observing the resource and matching the state record to it. The current `orphaned` state alone is not that proof.
 
 ```bash
 sbx ls
 ps -o pid,lstart,etime,command -ax | rg '(/usr/bin/ssh|sbx ssh proxy).*oc-sbx-'
 ```
 
-Match the exact sandbox name from `providerState`, the repository workspace, session generation, worktree, and branch. Inspect or preserve changes before removal. Then stop and remove only that exact resource:
+Match the exact sandbox name and ownership tuple from `providerState`, the repository workspace, session generation, worktree, and branch. New SBX resources also carry that tuple in an external marker, which `/sandbox inspect` verifies when available. Legacy fingerprint-only markers do not prove ownership after a restart. Inspect or preserve changes before removal. Then stop and remove only that exact resource:
 
 ```bash
 sbx stop <exact-sandbox-name>
@@ -62,6 +91,13 @@ sbx ls
 ```
 
 The final `sbx ls` must show that the named resource is absent. Remove no sibling resource merely because it belongs to OpenCode.
+
+## Output bounds
+
+- The control response stays below the 64 KiB transport limit. Oversized details are replaced by a redacted `truncated` preview; an irreducibly oversized response returns `RESPONSE_LIMIT` with minimal structured fields.
+- Inventory includes at most 1,000 project records and 1,000 provider resources, with bounded detail buckets and a `truncated` marker when needed.
+- Logs, diagnostics, and persisted provider metadata are redacted and capped at 48 KiB. Evidence is limited to eight entries, 256 bytes per entry, and 4 KiB total; resource IDs are capped at 128 bytes.
+- Provider and process output is capped before it becomes public evidence. Credentials, headers, URLs, and unbounded logs stay out of the result.
 
 ## Evidence locations
 

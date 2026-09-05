@@ -1,10 +1,10 @@
 # Plan: make the OpenCode sandbox agent-native
 
-Status: active plan, proposed on 2026-09-02. It lives in `history/` because this repository stores agent-generated plans there, and `AGENTS.md` links it explicitly while active. Publish its delivery phases as tracer tickets when `tk` is available. Current behavior remains documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
+Status: Phase 1 completed on 2026-09-02; Phase 2 and later work remains deferred. This file lives in `history/` for the remaining proposal and its concise delivery record. Current behavior is documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
 
 ## Outcome
 
-An agent should be able to answer five questions from one bounded inspection:
+For providers with observation adapters, an agent should be able to answer five questions from one bounded inspection:
 
 1. Where will the next tool call execute?
 2. Which resources exist, and who owns each one?
@@ -40,74 +40,7 @@ ownership: verified | unknown | conflict
 
 Keep the last operation and stable error code beside these dimensions. Persist `schemaVersion` and migrate existing records because they already exist outside the repository.
 
-Derive situation labels such as attached, orphan, stale record, leaked resource, and conflict from those facts. A verified orphan can be adopted, preserved and removed, or explicitly discarded. Control loss without provider observation remains unknown. A conflict remains blocked.
-
-## Target result contract
-
-The current response has no schema version and remains the compatibility contract until Phase 1. Version 2 is normative:
-
-```ts
-type PublicOperation =
-  | "start"
-  | "stop"
-  | "status"
-  | "inspect"
-  | "inventory"
-  | "logs"
-  | "diagnose"
-  | "retry"
-  | "recover"
-  | "repair"
-  | "delete"
-
-type SandboxResultV2 = {
-  schemaVersion: 2
-  requestId: string
-  ok: boolean
-  operation: PublicOperation
-  message: string
-  session: null | {
-    projectId: string
-    sessionId: string
-    workspaceId: string
-    generation: number
-    provider: "sbx" | "exedev" | "cloudflare"
-  }
-  intent: {
-    desiredLocation: "local" | "remote" | "deleted"
-    phase: "idle" | "capturing" | "provisioning" | "activating" | "syncing" | "detaching" | "deleting"
-  }
-  effectiveTarget: null | { kind: "local"; directory: string } | { kind: "remote"; resourceId: string }
-  observations: Array<{
-    source: "record" | "handle" | "workspace" | "provider" | "git"
-    observed: boolean
-    freshAt: string
-    resource?: "present" | "absent" | "unknown"
-    ownership?: "verified" | "unknown" | "conflict"
-    health?: "healthy" | "degraded" | "unknown"
-    evidence: string[]
-  }>
-  classification: "clean" | "attached" | "control_lost" | "orphan" | "stale_record" | "leaked_resource" | "conflict" | "work_at_risk" | "unknown"
-  work: {
-    captureBaseSha: string | null
-    runtimeHead: string | null
-    sync: "clean" | "dirty" | "failed" | "unknown"
-    preservation: "not_needed" | "preserved" | "at_risk" | "discard_authorized"
-    preservedWorktreePath: string | null
-  }
-  allowedActions: Array<{
-    operation: PublicOperation
-    role: "host" | "remote"
-    arguments: string[]
-    preconditions: string[]
-    waitFor: "none" | "session_idle" | "operation_completion"
-  }>
-  recommendedAction: null | { operation: PublicOperation; reasonCode: string }
-  error: null | { code: string; stage: string; retryable: boolean }
-}
-```
-
-`status` sets `observed: false` for provider, workspace, handle, and Git sources it did not query. `inspect` fills those observations. `effectiveTarget` is non-null only when the workspace route or live handle proves it. URLs, headers, capabilities, and credentials stay out of the response. `/sandbox` presents classification, effective target, work risk, error, recommended action, and the chosen action's preconditions and wait behavior; it does not dump empty fields.
+Derive situation labels such as attached, orphan, stale record, leaked resource, and conflict from those facts. A verified orphan can be adopted, preserved and removed, or explicitly discarded only after the deferred recovery work exists. Control loss without provider observation remains unknown. A conflict remains blocked.
 
 ## Target module seams
 
@@ -144,13 +77,13 @@ Build a read-only view by joining the lifecycle record, workspace registry, runt
 
 | Layer | Verbs | Meaning |
 |---|---|---|
-| Current public commands | `start`, `stop`, `status`, `delete`, `logs`, `diagnose`, `retry` | Preserve compatibility while safety work lands |
-| Proposed public session commands | `inspect`, `recover`, `repair` | Observe the current ownership tuple, reacquire a verified runtime, or reconcile stale records |
-| Proposed public host command | `inventory` | Compare all lifecycle records with provider resources without mutation |
-| Controller operations | current verbs plus inspect/recover/repair/inventory | Authorize roles, serialize decisions, and return the result contract |
-| Provider methods | `create`, `inspect`, `adopt`, `sync`, `close`, `destroy` | Implement provider behavior; never appear in `/sandbox` output as user actions |
+| Current public commands | `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, `retry` | Lifecycle operations plus the Phase 1 read paths |
+| Deferred public session command | `recover` | Reacquire a verified runtime; not accepted by the current CLI |
+| Deferred public host command | `repair` | Reconcile stale control-plane records; not accepted by the current CLI |
+| Controller operations | Current verbs; future `recover` and `repair` | Authorize roles, serialize decisions, and return the versioned result contract |
+| Provider methods | `create`, `inspect`, future `adopt`, `sync`, `close`, `destroy` | Implement provider behavior; provider methods never appear in `/sandbox` output as user actions |
 
-`adopt` is provider vocabulary. The public intent is `recover`. `inventory` is host-only and read-only. `repair` is also host-only and changes control-plane records only after inspection proves the external situation. `delete` remains the sole public destruction verb.
+`adopt` is provider vocabulary. The deferred public intent is `recover`. `inventory` is host-only and read-only. The deferred `repair` operation is also host-only and may change control-plane records only after inspection proves the external situation. `delete` remains the sole public destruction verb.
 
 The capability gains `scope: "session" | "project"`. Normal commands use session scope. Host `inventory` requires project scope and remains read-only. No remote capability receives project scope.
 
@@ -161,89 +94,40 @@ The capability gains `scope: "session" | "project"`. Normal commands use session
 | `stop` | host or remote | session | yes | Existing control channel |
 | `retry` | role required by the recorded operation | session | yes | Existing control channel |
 | `delete` | host or remote without force; host with force | session | yes | Existing control channel |
-| `recover`, `repair` | host | session | yes | Existing control channel |
 | `inventory` | host | project | no | Existing control channel with project capability |
 
 ## Delivery sequence
 
 Each phase leaves one useful vertical path working. Do not begin the state redesign before resource cleanup is safe.
 
-### Phase 0: close the existing safety holes
+### Phase 0: close the existing safety holes (completed 2026-09-02)
 
-Progress on 2026-09-02:
+- Kept the shared SBX control proxy alive across active workspaces and made plugin disposal idempotent and awaited.
+- Enforced host-only start, including retry, and serialized delete, retry, reconciliation, and final state writes.
+- Added provider ownership checks, Cloudflare cleanup/checkout validation, correct workspace directory and replay transport, and failed-start workspace cleanup.
+- Removed the unshipped Node fallback and bounded/redacted logs, diagnostics, and recovery metadata.
 
-- Completed: keep the shared SBX control proxy alive until its provider has no active workspace.
-- Completed: enforce host-only start in the lifecycle controller, including retry.
-- Completed: fail Cloudflare cleanup on a non-zero remote exit and verify `HEAD` before reuse.
-- Completed: route workspace creation and replay through the requested directory and injected transport.
-- Completed: remove the OpenCode workspace registration when Sandcastle start fails.
-- Completed: fail explicitly when neither the local Bun source nor the remote Node bundle is available.
-- Completed: redact and bound logs, diagnostics, and recovery metadata before response serialization.
-- Completed: require the exact ownership tuple observed by the current SBX or Cloudflare provider instance before reuse, stop, or destruction.
-- Completed: await idempotent plugin disposal, cancel idle work, and close every owned Sandcastle session.
-- Completed: hold the session record lock across delete, retry, and reconciliation effects and final writes.
-- Phase 0 complete.
+### Phase 1: make inspection decision-ready (completed 2026-09-02)
 
-Changes:
+The completed vertical path is recorded here; its current contract and operating limits live in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md) and [`docs/opencode-sandbox-operations.md`](../docs/opencode-sandbox-operations.md).
 
-- Make plugin disposal await an idempotent lifecycle disposal that closes every owned Sandcastle session, rejects target gates, cancels idle work, and closes provider resources at their correct scope.
-- Clean up an OpenCode workspace registration when start fails after workspace creation, without claiming the provider resource is absent unless inspection proves it.
-- Give the SBX control proxy provider lifetime or explicit reference counting; releasing one workspace must not break another.
-- Hold the session record lock across the full `delete`, `retry`, and reconciliation decision and write.
-- Centralize role authorization in the lifecycle controller so remote `retry` cannot invoke host-only start or destructive paths.
-- Verify provider ownership before SBX or Cloudflare reuse, stop, or destruction. Force may waive preservation, never ownership.
-- Treat non-zero Cloudflare cleanup commands as failures and verify checkout `HEAD` before reuse.
-- Send the requested directory during workspace creation and use the injected fetcher for replay.
-- Redact and bound logs and diagnostics before the control channel serializes them.
-- Remove the broken Node fallback from `sandboxctl`, or ship and test the fallback artifact.
+- Added versioned `SandboxResultV2` responses with effective target, five-source observations, work preservation state, classifications, allowed actions, recommendations, and stable errors.
+- Added read-only session `inspect` and host-only project `inventory`; `status` remains a provider-free record read with explicit freshness and `observed: false` markers.
+- Added bounded parallel workspace, provider, runtime-target, and Git probes, a 5-second per-probe inspection deadline, and a 10-second provider inventory deadline.
+- Added exe.dev identity/owner-tag inspection and SBX inventory/ownership-marker inspection. Provider inventory remains a listing, not session ownership proof.
+- Added session/project capability authorization, redaction, response bounds, and inventory bounds.
+- Deferred recovery, adoption, repair, and destructive control of a post-restart control-lost runtime to Phase 2. Cloudflare has no Phase 1 provider inspection or inventory adapter and remains unknown-safe.
 
-Completion criteria:
-
-- A disposal regression leaves no owned runtime handle or supervisor process.
-- A failure after workspace creation removes the workspace and reports unknown provider state until observed.
-- Two concurrent SBX workspaces survive releasing either one.
-- Concurrent delete, retry, and reconciliation tests prove one serialized outcome.
-- A complete role matrix proves remote capabilities cannot reach host-only behavior through retry or another indirect operation.
-- Name collisions and stale resource IDs block reuse and destruction until ownership is verified.
-- Cloudflare cleanup and reuse tests fail on non-zero exit or mismatched `HEAD`.
-- Workspace gateway tests assert directory and injected transport use.
-- Oversized or secret-bearing diagnostics are bounded and redacted at the producer.
-
-### Phase 1: make inspection decision-ready
+### Phase 2: close the recovery loop (deferred)
 
 Changes:
 
-- Add a read-only `inspect` operation that returns the target result contract.
-- Keep `status` as a cheap record read and include freshness plus an explicit `observed: false` marker.
-- Add host-only inventory across lifecycle records and provider resources.
-- Return effective target, observations with freshness, resource ownership, `allowedActions`, `recommendedAction`, stable error code, and preservation status from every operation.
-- Include exact evidence references, not raw secrets or unbounded logs.
-
-Completion criteria:
-
-- One command distinguishes healthy attachment, control loss with unknown resource state, stale record, verified orphan, leak, and ownership conflict in tests.
-- The command performs no provider calls in cheap status mode.
-- An agent test chooses the safe next action using structured fields only.
-
-Provider observation budget:
-
-| Mode | Calls | Deadline | Unsupported ownership behavior |
-|---|---|---|---|
-| `status` | No provider calls | File-read latency only | Report `observed: false` |
-| Session `inspect` | One provider inventory call plus at most two targeted probes | 5 seconds per call, 15 seconds total | Return `ownership: unknown`; permit no destructive action |
-| Project `inventory` | One listing call per configured provider, in parallel | 10 seconds total | List lifecycle records and mark provider side unknown |
-| `diagnose` | At most five targeted probes | 30 seconds total | Return partial observations and evidence for the failed probe |
-
-SBX must expose inspectable owner metadata beyond its generated name. exe.dev must match durable VM identity and owner metadata. Cloudflare must expose a resource lookup that returns owner metadata. Until an adapter can prove ownership, inspection returns unknown and destruction stays blocked.
-
-### Phase 2: close the recovery loop
-
-Changes:
-
-- Add `inspect` and `adopt` behavior to each provider adapter.
-- Permit deletion of a verified orphan through the lifecycle controller.
+- Add durable lookup and `adopt` behavior where a provider cannot yet reacquire a runtime; expose it only through host-only `recover`.
+- Add a Cloudflare resource lookup with owner metadata before claiming Cloudflare inspection or recovery support.
+- Permit deletion of a verified orphan through the lifecycle controller only after preservation and ownership checks are available.
 - Preserve or name the worktree before destroying any recoverable runtime.
 - Add a host-only repair path for stale records and workspace registrations.
+- Add destructive post-restart control only after recovery and ownership proof are durable; control-lost/orphaned resources remain read-only until then.
 - Make reconciliation produce a plan first; apply only actions allowed by ownership and preservation checks.
 
 Completion criteria:
@@ -252,6 +136,8 @@ Completion criteria:
 - Restart an active session with a missing provider resource and repair the stale record.
 - Present a conflicting resource and prove that reconciliation performs no mutation.
 - Remove a verified orphan without invoking provider commands outside the controller.
+
+No Phase 2 behavior is exposed by the current `sandboxctl` command set.
 
 ### Phase 3: separate state dimensions
 
@@ -327,17 +213,13 @@ Completion criteria:
 
 ## Command vocabulary decision
 
-Keep current verbs during the safety work. Add `inspect` only when it can observe providers. Use `retry` for repeating an unchanged failed operation. Use `recover` only for reacquiring a verified external resource. Use `repair` only for reconciling stale control-plane records. These verbs describe different actions and should not be aliases.
+Phase 1 adds `inspect` where an adapter can observe a provider and `inventory` as a host-only project read. Use `retry` for repeating an unchanged failed operation. Add `recover` only for reacquiring a verified external resource and `repair` only for reconciling stale control-plane records. These verbs describe different actions and should not be aliases.
 
-System-wide inventory and repair must be host-only. Remote capabilities remain session-scoped and cannot start, force-delete, adopt, or repair resources.
+System-wide inventory and future repair must be host-only. Remote capabilities remain session-scoped and cannot start, force-delete, adopt, recover, or repair resources.
 
 ## Resource budget
 
-- `status`: file read only.
-- `inspect`: bounded concurrent probes for one ownership tuple.
-- `inventory`: one state scan plus provider listings, with no per-resource deep probe by default.
-- `diagnose`: deeper health and log checks, explicit and bounded.
-- `start`, `stop`, `delete`, `recover`, `repair`: serialized mutation with before-and-after inspection.
+The implemented Phase 1 read budgets and output bounds are maintained in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md). Future recovery and repair must retain bounded, read-before-mutate behavior.
 
 Do not poll when an operation can wait on an existing event or process result. Do not retain provider clients after their owning lifecycle scope closes. Do not copy full logs into state; retain references and stable result codes.
 
@@ -346,7 +228,7 @@ Do not poll when an operation can wait on an existing event or process result. D
 - `CONTEXT.md` owns terminology only.
 - `docs/opencode-sandbox.md` owns current architecture and invariants.
 - `docs/opencode-sandbox-operations.md` owns live diagnosis and cleanup procedure.
-- This file owns the proposed delivery sequence until the work is ticketed and completed.
+- This file owns the remaining proposed delivery sequence and concise completion records.
 - Tests own detailed behavioral examples.
 - Historical research keeps its original conclusions with a superseded notice.
 

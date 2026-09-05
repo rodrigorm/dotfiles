@@ -22,6 +22,7 @@ import {
   type ProcessResult,
   type ProcessRunner,
   type ProcessSupervisor,
+  type ProviderResourceObservation,
   type WorkspaceInfo,
   type WorkspaceProviderBase,
   type WorkspaceRuntimeMetadata,
@@ -38,7 +39,9 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
+const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
 const OWNERSHIP_FILE = "/tmp/opencode-sandbox-owner"
+const INSPECTION_TIMEOUT_MS = 5_000
 const START_SERVER = String.raw`import json, os, shutil, signal, subprocess, sys, time
 
 frame = json.load(sys.stdin)
@@ -450,6 +453,49 @@ export class SbxProvider implements WorkspaceProviderBase {
     return activation ? { providerState: metadataFor(activation) } : undefined
   }
 
+  async inspect(info: WorkspaceInfo): Promise<ProviderResourceObservation> {
+    const metadata = readMetadata(info)
+    const sandbox = metadata.sandbox
+    if (!sandbox) throw new SandboxError("inspect", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
+    const expected = ownerFromMetadata(metadata)
+    const inventory = await this.runSbx(["ls", "--json"], "inspect", undefined, { timeoutMs: INSPECTION_TIMEOUT_MS })
+    const items = parseSbxInventory(inventory.stdout).filter((candidate) => candidate.name === sandbox)
+    const evidence = [`sbx inventory:${sandbox}`]
+    if (items.length === 0) {
+      return { resourceId: sandbox, resource: "absent", ownership: "unknown", health: "unknown", evidence }
+    }
+    if (items.length !== 1) {
+      return { resourceId: sandbox, resource: "present", ownership: "conflict", health: "unknown", evidence: [...evidence, "sbx inventory is ambiguous"] }
+    }
+    const item = items[0]!
+
+    const marker = this.readOwnershipOverride
+      ? await this.readOwnershipOverride(sandbox)
+      : await this.readOwnership(sandbox, INSPECTION_TIMEOUT_MS)
+    evidence.push(`sbx owner marker:${sandbox}`)
+    return {
+      resourceId: sandbox,
+      resource: "present",
+      ownership: classifyOwnership(marker, this.owned.get(sandbox), expected),
+      health: classifySbxHealth(item.status),
+      evidence,
+    }
+  }
+
+  async inventory(): Promise<ProviderResourceObservation[]> {
+    const inventory = await this.runSbx(["ls", "--json"], "inspect", undefined, { timeoutMs: INSPECTION_TIMEOUT_MS })
+    const items = parseSbxInventory(inventory.stdout)
+    const names = new Map<string, number>()
+    for (const item of items) names.set(item.name, (names.get(item.name) ?? 0) + 1)
+    return items.map((item) => ({
+      resourceId: item.name,
+      resource: "present" as const,
+      ownership: (names.get(item.name) ?? 0) > 1 ? "conflict" as const : "unknown" as const,
+      health: (names.get(item.name) ?? 0) > 1 ? "unknown" as const : classifySbxHealth(item.status),
+      evidence: [`sbx inventory:${item.name}`],
+    }))
+  }
+
   async release(info: WorkspaceInfo): Promise<void> {
     const activation = this.active.get(info.id)
     const metadata = readMetadata(info)
@@ -583,7 +629,7 @@ export class SbxProvider implements WorkspaceProviderBase {
     )
     if (create.exitCode === 0) {
       try {
-        await this.writeOwnership(sandbox, owner.ownershipId)
+        await this.writeOwnership(sandbox, owner)
       } catch (error) {
         await this.runSbxRaw(["rm", "--force", sandbox], "remove").catch(() => undefined)
         throw error
@@ -610,26 +656,27 @@ export class SbxProvider implements WorkspaceProviderBase {
   }
 
   private async assertOwned(sandbox: string, expected: SbxOwner): Promise<void> {
-    const ownershipId = this.readOwnershipOverride
+    const marker = this.readOwnershipOverride
       ? await this.readOwnershipOverride(sandbox)
       : await this.readOwnership(sandbox)
-    if (!sameOwner(this.owned.get(sandbox), expected) || ownershipId !== expected.ownershipId) {
+    const markerMatches = typeof marker === "string" ? marker === expected.ownershipId : sameOwner(marker, expected)
+    if (!sameOwner(this.owned.get(sandbox), expected) || !markerMatches) {
       throw ownershipError()
     }
   }
 
-  private async writeOwnership(sandbox: string, ownershipId: string): Promise<void> {
-    if (this.writeOwnershipOverride) return this.writeOwnershipOverride(sandbox, ownershipId)
-    await this.runSbx(["exec", "-i", sandbox, "python3", "-c", REMOTE_WRITE_PATH, OWNERSHIP_FILE], "provision", `${ownershipId}\n`)
+  private async writeOwnership(sandbox: string, owner: SbxOwner): Promise<void> {
+    if (this.writeOwnershipOverride) return this.writeOwnershipOverride(sandbox, owner.ownershipId)
+    await this.runSbx(["exec", "-i", sandbox, "python3", "-c", REMOTE_WRITE_PATH, OWNERSHIP_FILE], "provision", `${JSON.stringify(owner)}\n`)
   }
 
-  private async readOwnership(sandbox: string): Promise<string | undefined> {
+  private async readOwnership(sandbox: string, timeoutMs?: number): Promise<string | SbxOwner | undefined> {
     const directory = await mkdtemp(join(tmpdir(), "opencode-sbx-owner-"))
     const path = join(directory, "owner")
     try {
-      const result = await this.runSbxRaw(["cp", `${sandbox}:${OWNERSHIP_FILE}`, path], "validate")
+      const result = await this.runSbxRaw(["cp", `${sandbox}:${OWNERSHIP_FILE}`, path], "validate", undefined, { timeoutMs })
       if (result.exitCode !== 0) return undefined
-      return (await readFile(path, "utf8")).trim()
+      return parseSbxOwner((await readFile(path, "utf8")).trim())
     } catch {
       return undefined
     } finally {
@@ -936,7 +983,7 @@ export class SbxProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await response.json().catch(() => undefined)
+          const value = await readHealthResponse(response).catch(() => undefined)
           if (isRecord(value) && value.healthy === true) return
         }
       } catch {
@@ -949,20 +996,20 @@ export class SbxProvider implements WorkspaceProviderBase {
     throw new SandboxError("remote_health", "sandbox OpenCode health check timed out", "REMOTE_HEALTH_TIMEOUT")
   }
 
-  private async runSbx(args: string[], stage: SandboxStage, stdin?: string | Uint8Array, options: { onLine?: (line: string) => void; maxOutputBytes?: number } = {}): Promise<ProcessResult> {
+  private async runSbx(args: string[], stage: SandboxStage, stdin?: string | Uint8Array, options: { onLine?: (line: string) => void; maxOutputBytes?: number; timeoutMs?: number } = {}): Promise<ProcessResult> {
     const result = await this.runSbxRaw(args, stage, stdin, options)
     if (result.exitCode !== 0) throw new SandboxError(stage, redactText(result.stderr || result.stdout || "sbx command failed"), "SBX_COMMAND")
     return result
   }
 
-  private async runSbxRaw(args: string[], stage: SandboxStage, stdin?: string | Uint8Array, options: { onLine?: (line: string) => void; maxOutputBytes?: number } = {}): Promise<ProcessResult> {
+  private async runSbxRaw(args: string[], stage: SandboxStage, stdin?: string | Uint8Array, options: { onLine?: (line: string) => void; maxOutputBytes?: number; timeoutMs?: number } = {}): Promise<ProcessResult> {
     try {
       return await this.runner.run({
         argv: [this.sbxBin, ...args],
         env: sanitizeEnvironment(),
         stdin,
         onLine: options.onLine,
-        timeoutMs: this.bootstrapTimeoutMs,
+        timeoutMs: options.timeoutMs ?? this.bootstrapTimeoutMs,
         maxOutputBytes: options.maxOutputBytes ?? MAX_OUTPUT_BYTES,
       })
     } catch (error) {
@@ -987,6 +1034,32 @@ export class SbxProvider implements WorkspaceProviderBase {
     } catch (error) {
       throw new SandboxError(stage, redactError(error), "GIT_COMMAND")
     }
+  }
+}
+
+async function readHealthResponse(response: Response): Promise<unknown> {
+  if (!response.body) return undefined
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      size += next.value.byteLength
+      if (size > MAX_HEALTH_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        return undefined
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+  } catch {
+    return undefined
   }
 }
 
@@ -1029,6 +1102,7 @@ export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions)
       await provider.activate(input.workspaceId)
     },
     target: () => provider.target(info),
+    inspect: () => provider.inspect(info),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
     close: () => provider.close(info),
   }
@@ -1039,7 +1113,7 @@ function readMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): SbxMetadata {
   const value = isRecord(info.extra) ? info.extra : isRecord(from?.extra) ? from.extra : {}
   const state = isRecord(value.providerState) ? value.providerState : value
   const metadata: SbxMetadata = { sessionId: "", generation: 0, workspaceId: info.id, projectId: info.projectID }
-  const field = (key: string): unknown => state[key] ?? value[key]
+  const field = (key: string): unknown => state[key] !== undefined ? state[key] : value[key]
   const provider = field("provider")
   if (provider !== undefined && provider !== "sbx") throw ownershipError()
   const sessionId = field("sessionId")
@@ -1128,6 +1202,94 @@ function sameOwner(actual: SbxOwner | undefined, expected: SbxOwner): boolean {
     actual.workspaceId === expected.workspaceId &&
     actual.projectId === expected.projectId
   )
+}
+
+function parseSbxOwner(value: string): string | SbxOwner | undefined {
+  if (/^[A-Za-z0-9_-]{43}$/.test(value)) return value
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return undefined
+  }
+  if (
+    !isRecord(parsed) ||
+    parsed.provider !== "sbx" ||
+    typeof parsed.ownershipId !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(parsed.ownershipId) ||
+    typeof parsed.sessionId !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(parsed.sessionId) ||
+    typeof parsed.generation !== "number" ||
+    !Number.isSafeInteger(parsed.generation) ||
+    parsed.generation < 1 ||
+    typeof parsed.workspaceId !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(parsed.workspaceId) ||
+    typeof parsed.projectId !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(parsed.projectId)
+  ) return undefined
+  return {
+    provider: "sbx",
+    ownershipId: parsed.ownershipId,
+    sessionId: parsed.sessionId,
+    generation: parsed.generation,
+    workspaceId: parsed.workspaceId,
+    projectId: parsed.projectId,
+  }
+}
+
+function classifyOwnership(marker: string | SbxOwner | undefined, local: SbxOwner | undefined, expected: SbxOwner): ProviderResourceObservation["ownership"] {
+  if (!expected.ownershipId) return "unknown"
+  if (typeof marker === "string") {
+    if (marker !== expected.ownershipId) return "conflict"
+    return sameOwner(local, expected) ? "verified" : "unknown"
+  }
+  if (!marker) return "unknown"
+  return sameOwner(marker, expected) ? "verified" : "conflict"
+}
+
+interface SbxInventoryItem {
+  name: string
+  status?: string
+}
+
+function parseSbxInventory(value: string): SbxInventoryItem[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new SandboxError("inspect", "SBX inventory response is invalid", "SBX_INVENTORY_INVALID")
+  }
+  const entries = Array.isArray(parsed)
+    ? parsed
+    : isRecord(parsed) && Array.isArray(parsed.sandboxes)
+      ? parsed.sandboxes
+      : isRecord(parsed) && Array.isArray(parsed.items)
+        ? parsed.items
+        : undefined
+  if (!entries) {
+    throw new SandboxError("inspect", "SBX inventory response is invalid", "SBX_INVENTORY_INVALID")
+  }
+  return entries.map((item) => {
+    if (!isRecord(item)) throw invalidSbxInventory()
+    const name = typeof item.name === "string" ? item.name : typeof item.sandbox === "string" ? item.sandbox : undefined
+    if (!name) throw invalidSbxInventory()
+    try {
+      assertSandboxName(name)
+    } catch {
+      throw invalidSbxInventory()
+    }
+    if (item.status !== undefined && typeof item.status !== "string") throw invalidSbxInventory()
+    return { name, status: item.status }
+  })
+}
+
+function invalidSbxInventory(): SandboxError {
+  return new SandboxError("inspect", "SBX inventory response is invalid", "SBX_INVENTORY_INVALID")
+}
+
+function classifySbxHealth(status: string | undefined): ProviderResourceObservation["health"] {
+  if (!status) return "unknown"
+  return status.toLowerCase() === "running" ? "healthy" : "degraded"
 }
 
 function ownershipError(): SandboxError {

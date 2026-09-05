@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcess } from "node:child_process"
 
 import { SandboxError, type ProcessHandle, type ProcessResult, type ProcessRunner, type ProcessSupervisor, type RunProcessInput } from "./types"
 
@@ -47,13 +47,19 @@ export function startProcess(input: RunProcessInput): Promise<ProcessHandle> {
     return Promise.reject(new SandboxError("validate", "process output limit is invalid", "OUTPUT_LIMIT_INVALID"))
   }
 
-  const child = spawn(input.argv[0], input.argv.slice(1), {
-    cwd: input.cwd,
-    env: input.env ? input.env : undefined,
-    shell: false,
-    detached: false,
-    stdio: ["pipe", "pipe", "pipe"],
-  })
+  let child: ChildProcess
+  try {
+    child = spawn(input.argv[0], input.argv.slice(1), {
+      cwd: input.cwd,
+      env: input.env ? input.env : undefined,
+      shell: false,
+      detached: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return Promise.reject(new SandboxError("validate", `failed to start process: ${message}`, "PROCESS_START"))
+  }
 
   let stdoutBytes = 0
   let stderrBytes = 0
@@ -61,60 +67,97 @@ export function startProcess(input: RunProcessInput): Promise<ProcessHandle> {
   let stderrOverflow = false
   const stdout: Buffer[] = []
   const stderr: Buffer[] = []
-  let pendingLine = ""
-
-  const emitLines = (chunk: Buffer) => {
-    if (!input.onLine) return
-    pendingLine += chunk.toString("utf8")
-    const lines = pendingLine.split("\n")
-    pendingLine = lines.pop() ?? ""
-    for (const line of lines) input.onLine(line.endsWith("\r") ? line.slice(0, -1) : line)
-  }
-
-  child.stdout?.on("data", (chunk: Buffer) => {
-    stdoutBytes += chunk.byteLength
-    if (stdoutBytes <= maxOutputBytes) stdout.push(chunk)
-    else stdoutOverflow = true
-    emitLines(chunk)
-  })
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrBytes += chunk.byteLength
-    if (stderrBytes <= maxOutputBytes) stderr.push(chunk)
-    else stderrOverflow = true
-  })
-
-  if (input.stdin === undefined) child.stdin?.end()
-  else child.stdin?.end(typeof input.stdin === "string" ? input.stdin : Buffer.from(input.stdin))
-
+  let pendingLine: Buffer[] = []
+  let pendingLineBytes = 0
+  let lineOverflow = false
   let terminationTimer: ReturnType<typeof setTimeout> | undefined
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined
   let timedOut = false
   let aborted = false
+  let terminating = false
+  let cleanedUp = false
+
+  const cleanup = () => {
+    if (cleanedUp) return
+    cleanedUp = true
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+    if (terminationTimer) clearTimeout(terminationTimer)
+    input.signal?.removeEventListener("abort", abort)
+  }
 
   const terminate = () => {
-    if (child.exitCode !== null || child.signalCode !== null) return
+    if (terminating || child.exitCode !== null || child.signalCode !== null) return
+    terminating = true
     child.kill("SIGTERM")
     terminationTimer = setTimeout(() => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
     }, TERMINATION_GRACE_MS)
   }
 
-  const timeoutTimer = input.timeoutMs
-    ? setTimeout(() => {
-        timedOut = true
-        terminate()
-      }, input.timeoutMs)
-    : undefined
+  const overflow = () => {
+    stdoutOverflow = true
+    terminate()
+  }
+
+  const emitLines = (chunk: Buffer) => {
+    if (!input.onLine || stdoutOverflow) return
+    let start = 0
+    while (start < chunk.byteLength) {
+      const newline = chunk.indexOf(0x0a, start)
+      const end = newline === -1 ? chunk.byteLength : newline
+      const part = chunk.subarray(start, end)
+      if (!lineOverflow) {
+        if (pendingLineBytes + part.byteLength > maxOutputBytes) {
+          lineOverflow = true
+          overflow()
+          return
+        }
+        else {
+          pendingLine.push(part)
+          pendingLineBytes += part.byteLength
+        }
+      }
+      if (newline === -1) return
+      if (!lineOverflow) {
+        const line = Buffer.concat(pendingLine, pendingLineBytes).toString("utf8")
+        input.onLine(line.endsWith("\r") ? line.slice(0, -1) : line)
+      }
+      pendingLine = []
+      pendingLineBytes = 0
+      lineOverflow = false
+      start = newline + 1
+    }
+  }
+
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdoutBytes += chunk.byteLength
+    if (stdoutBytes <= maxOutputBytes) stdout.push(chunk)
+    else overflow()
+    emitLines(chunk)
+  })
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.byteLength
+    if (stderrBytes <= maxOutputBytes) stderr.push(chunk)
+    else {
+      stderrOverflow = true
+      terminate()
+    }
+  })
+
+  if (input.stdin === undefined) child.stdin?.end()
+  else child.stdin?.end(typeof input.stdin === "string" ? input.stdin : Buffer.from(input.stdin))
 
   const abort = () => {
     aborted = true
     terminate()
   }
-  input.signal?.addEventListener("abort", abort, { once: true })
 
   const result = new Promise<ProcessResult>((resolve, reject) => {
     let spawnError: Error | undefined
     child.once("error", (error) => {
       spawnError = error
+      cleanup()
+      reject(new SandboxError("validate", `failed to start process: ${error.message}`, "PROCESS_START"))
     })
     child.once("close", (exitCode, signal) => {
       if (spawnError) {
@@ -127,27 +170,43 @@ export function startProcess(input: RunProcessInput): Promise<ProcessHandle> {
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),
       })
-      if (input.onLine && pendingLine) {
-        input.onLine(pendingLine.endsWith("\r") ? pendingLine.slice(0, -1) : pendingLine)
+      if (input.onLine && pendingLineBytes > 0 && !lineOverflow && !stdoutOverflow) {
+        const line = Buffer.concat(pendingLine, pendingLineBytes).toString("utf8")
+        input.onLine(line.endsWith("\r") ? line.slice(0, -1) : line)
       }
     })
-  }).then((result) => {
-    if (timeoutTimer) clearTimeout(timeoutTimer)
-    if (terminationTimer) clearTimeout(terminationTimer)
-    input.signal?.removeEventListener("abort", abort)
+  }).then(
+    (result) => {
+      cleanup()
 
-    if (stdoutOverflow || stderrOverflow) {
-      throw new SandboxError("validate", "process output exceeded the configured limit", "OUTPUT_LIMIT")
-    }
-    if (timedOut) return { ...result, exitCode: null, signal: "SIGTERM" as const }
-    if (aborted) return { ...result, exitCode: null, signal: "SIGTERM" as const }
-    return result
-  })
+      if (stdoutOverflow || stderrOverflow) {
+        throw new SandboxError("validate", "process output exceeded the configured limit", "OUTPUT_LIMIT")
+      }
+      if (timedOut) return { ...result, exitCode: null, signal: "SIGTERM" as const }
+      if (aborted) return { ...result, exitCode: null, signal: "SIGTERM" as const }
+      return result
+    },
+    (error) => {
+      cleanup()
+      throw error
+    },
+  )
+
+  timeoutTimer = input.timeoutMs
+    ? setTimeout(() => {
+        timedOut = true
+        terminate()
+      }, input.timeoutMs)
+    : undefined
+
+  input.signal?.addEventListener("abort", abort, { once: true })
+  if (input.signal?.aborted) abort()
 
   if (child.pid === undefined) {
-    void result.catch(() => undefined)
-    terminate()
-    return Promise.reject(new SandboxError("validate", "process did not expose a PID", "PROCESS_PID"))
+    return result.then(
+      () => Promise.reject(new SandboxError("validate", "process did not expose a PID", "PROCESS_PID")),
+      (error) => Promise.reject(error),
+    )
   }
 
   return Promise.resolve({

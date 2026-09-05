@@ -5,6 +5,7 @@ import { SandboxError } from "./types"
 import { assertSafeSshDestination, quoteRemoteCommandPart } from "./naming"
 
 export const DEFAULT_SSH_BIN = "/usr/bin/ssh"
+export const MAX_REMOTE_FRAME_BYTES = 128 * 1024
 
 export interface SupervisorArgvInput {
   sshBin: string
@@ -112,7 +113,8 @@ export interface RemoteFrameInput {
   openCodeVersion: string
 }
 
-export function buildRemoteFrame(input: RemoteFrameInput, maxBytes = 128 * 1024): string {
+export function buildRemoteFrame(input: RemoteFrameInput, maxBytes = MAX_REMOTE_FRAME_BYTES): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new SandboxError("validate", "remote frame size limit is invalid", "FRAME_LIMIT")
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(input.workspaceId)) throw new SandboxError("validate", "workspace ID is invalid", "WORKSPACE_ID")
   assertAbsolutePath(input.directory, "remote directory")
   assertAbsolutePath(input.remoteControlSocket, "remote control socket")
@@ -122,6 +124,7 @@ export function buildRemoteFrame(input: RemoteFrameInput, maxBytes = 128 * 1024)
     throw new SandboxError("validate", "remote frame credentials are incomplete", "FRAME_CREDENTIALS")
   }
   if (input.remoteControlPort !== undefined) assertPort(input.remoteControlPort)
+  if (Buffer.byteLength(input.authContent) > maxBytes) throw new SandboxError("validate", "remote frame is too large", "FRAME_LIMIT")
   const serialized = `${JSON.stringify({ ...input, version: 1, username: "opencode" })}\n`
   if (Buffer.byteLength(serialized) > maxBytes) throw new SandboxError("validate", "remote frame is too large", "FRAME_LIMIT")
   return serialized

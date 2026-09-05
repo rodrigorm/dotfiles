@@ -24,6 +24,7 @@ import {
   type ProcessResult,
   type ProcessRunner,
   type ProcessSupervisor,
+  type ProviderResourceObservation,
   type VmIdentity,
   type VmInfo,
   type WorkspaceInfo,
@@ -37,6 +38,9 @@ const EXEDEV_HOST_FINGERPRINT = "SHA256:JJOP/lwiBGOMilfONPWZCXUrfK154cnJFXcqlsi6
 const BUN_VERSION = "1.3.14"
 const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
+const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
+const INSPECTION_TIMEOUT_MS = 5_000
+const INVENTORY_TIMEOUT_MS = 10_000
 const SSH_KEYGEN_BIN = "/usr/bin/ssh-keygen"
 const SSH_KEYSCAN_BIN = "/usr/bin/ssh-keyscan"
 const REMOTE_WRITE_FILE = String.raw`#!/usr/bin/env python3
@@ -203,9 +207,13 @@ interface WorkspaceMetadata {
 
 interface Activation {
   workspaceId: string
+  projectId: string
+  sessionId: string
+  generation: number
   vm: VmInfo
   paths: RuntimePaths
   directory: string
+  branch: string
   baseSha: string
   localPort: number
   password: string
@@ -254,7 +262,6 @@ export class ExedevProvider implements WorkspaceProviderBase {
     this.revokeControlToken = options.revokeControlToken
     this.assetDirectory = options.assetDirectory ?? fileURLToPath(new URL(".", import.meta.url))
     this.deferActivation = options.deferActivation ?? false
-    this.deferActivation = options.deferActivation ?? false
   }
 
   get description(): string {
@@ -276,9 +283,20 @@ export class ExedevProvider implements WorkspaceProviderBase {
   }
 
   async prepare(info: WorkspaceInfo, env: Record<string, string | undefined>, from?: WorkspaceInfo): Promise<void> {
-    if (this.active.has(info.id)) return
-
     const metadata = readWorkspaceMetadata(info, from)
+    const active = this.active.get(info.id)
+    if (active) {
+      if (
+        !metadata.vmIdentity ||
+        !identityMatches(active.vm.identity, metadata.vmIdentity) ||
+        info.branch !== active.branch ||
+        (info.directory !== null && info.directory !== active.directory) ||
+        (metadata.baseSha !== undefined && metadata.baseSha !== active.baseSha)
+      ) throw exedevOwnershipError()
+      await this.verifyVmIdentity(info, metadata, active.vm.identity)
+      return
+    }
+
     const generation = metadata.generation
     const branch = info.branch
     if (!branch) throw new SandboxError("validate", "workspace branch is missing", "BRANCH_MISSING")
@@ -297,10 +315,14 @@ export class ExedevProvider implements WorkspaceProviderBase {
     await this.ensureHostKey()
     const paths = makeRuntimePaths(metadata.sessionId, generation)
     const localPort = await this.reservePort()
-    const provisioned = await this.provisionVm(info, metadata)
-    const vm = provisioned.vm
-
+    let createdIdentity: VmIdentity | undefined
+    let createdCleanup: (() => Promise<void>) | undefined
     try {
+      const provisioned = await this.provisionVm(info, metadata, (cleanup) => { createdCleanup = cleanup })
+      if (provisioned.created) createdIdentity = copyVmIdentity(provisioned.vm.identity)
+      const vm = provisioned.created
+        ? { ...provisioned.vm, identity: await this.verifyVmIdentity(info, metadata, provisioned.vm.identity) }
+        : provisioned.vm
       await this.ensureVmHostKey(vm.identity)
       await this.bootstrap(vm.identity, paths, directory, remoteUrl, baseSha, branch)
       const credentials = generateRemoteCredentials()
@@ -310,9 +332,13 @@ export class ExedevProvider implements WorkspaceProviderBase {
       const controlToken = await this.controlTokenFor(metadata.sessionId)
       const activation: Activation = {
         workspaceId: info.id,
+        projectId: info.projectID,
+        sessionId: metadata.sessionId,
+        generation: metadata.generation,
         vm,
         paths,
         directory,
+        branch,
         baseSha,
         localPort,
         password: credentials.serverPassword,
@@ -334,7 +360,8 @@ export class ExedevProvider implements WorkspaceProviderBase {
       }
       if (activation) this.revokeControlToken?.(activation.controlToken)
       this.active.delete(info.id)
-      if (provisioned.created) await this.control.remove(vm.identity).catch(() => undefined)
+      if (createdCleanup) await createdCleanup().catch(() => undefined)
+      else if (createdIdentity) await this.destroyVerifiedVm(info, metadata, createdIdentity).catch(() => undefined)
       if (error instanceof SandboxError) throw error
       throw new SandboxError("bootstrap", redactError(error), "PROVISION_FAILED")
     }
@@ -429,12 +456,72 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }
   }
 
+  async inspect(info: WorkspaceInfo): Promise<ProviderResourceObservation> {
+    const metadata = readWorkspaceMetadata(info)
+    const expected = metadata.vmIdentity
+    const resourceId = expected?.id ?? expected?.name ?? info.name
+    if (!expected || expected.sshDest === "pending") {
+      return {
+        resourceId,
+        resource: "unknown",
+        ownership: "unknown",
+        health: "unknown",
+        evidence: ["exe.dev VM identity is unavailable"],
+      }
+    }
+    const inventory = validateVmInventory(await this.control.list(INSPECTION_TIMEOUT_MS))
+    const matches = inventory.filter((item) => identityMatches(expected, item.identity))
+    const sameName = inventory.filter((item) => item.identity.name === expected.name)
+    if (matches.length === 0) {
+      if (sameName.length > 0) {
+        return { resourceId, resource: "present", ownership: "conflict", health: "unknown", evidence: [`exe.dev inventory:${resourceId}`] }
+      }
+      return { resourceId, resource: "absent", ownership: "unknown", health: "unknown", evidence: [`exe.dev inventory:${resourceId}`] }
+    }
+    const match = matches[0]
+    if (matches.length !== 1 || sameName.length !== 1 || !match || !hasOwnerTag(info, metadata, match.identity)) {
+      return { resourceId, resource: "present", ownership: "conflict", health: "unknown", evidence: [`exe.dev inventory:${resourceId}`] }
+    }
+    return {
+      resourceId,
+      resource: "present",
+      ownership: "verified",
+      health: classifyVmHealth(match.status),
+      evidence: [`exe.dev inventory:${resourceId}`],
+    }
+  }
+
+  async inventory(): Promise<ProviderResourceObservation[]> {
+    const inventory = validateVmInventory(await this.control.list(INVENTORY_TIMEOUT_MS))
+    const names = new Map<string, number>()
+    for (const item of inventory) names.set(item.identity.name, (names.get(item.identity.name) ?? 0) + 1)
+    return inventory.map((item) => {
+      const resourceId = item.identity.id ?? item.identity.name
+      const ambiguous = (names.get(item.identity.name) ?? 0) > 1
+      return {
+        resourceId,
+        resource: "present" as const,
+        ownership: ambiguous ? "conflict" as const : "unknown" as const,
+        health: ambiguous ? "unknown" as const : classifyVmHealth(item.status),
+        evidence: [`exe.dev inventory:${resourceId}`],
+      }
+    })
+  }
+
   async release(info: WorkspaceInfo): Promise<void> {
     const activation = this.active.get(info.id)
+    const metadata = readWorkspaceMetadata(info)
+    let identity: VmIdentity | undefined
+    if (activation) {
+      if (!metadata.vmIdentity || !identityMatches(activation.vm.identity, metadata.vmIdentity)) throw exedevOwnershipError()
+      identity = await this.verifyVmIdentity(info, metadata, activation.vm.identity)
+    }
     if (!activation) {
-      const metadata = readWorkspaceMetadata(info)
       if (!metadata.vmIdentity || !metadata.remoteDirectory) return
-      await this.remote(metadata.vmIdentity, ["rm", "-rf", "--", metadata.remoteDirectory], undefined, "detach")
+      if (metadata.vmIdentity.sshDest === "pending") throw new SandboxError("remove", "workspace VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
+      assertRuntimeDirectory(metadata.remoteDirectory)
+      identity = await this.verifyVmIdentity(info, metadata, metadata.vmIdentity)
+      await this.remote(identity, ["rm", "-rf", "--", metadata.remoteDirectory], undefined, "detach")
       return
     }
     this.revokeControlToken?.(activation.controlToken)
@@ -442,29 +529,54 @@ export class ExedevProvider implements WorkspaceProviderBase {
       activation.process.terminate()
       await waitForProcess(activation.process)
     }
-    await this.remote(activation.vm.identity, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach")
+    await this.remote(identity!, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach")
     this.active.delete(info.id)
   }
 
   async destroy(info: WorkspaceInfo): Promise<void> {
+    const activation = this.active.get(info.id)
     const metadata = readWorkspaceMetadata(info)
-    if (!metadata.vmIdentity || metadata.vmIdentity.sshDest === "pending") {
-        throw new SandboxError("remove", "workspace VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
-    }
-    await this.control.remove(metadata.vmIdentity)
+    if (activation && (!metadata.vmIdentity || !identityMatches(activation.vm.identity, metadata.vmIdentity))) throw exedevOwnershipError()
+    const expected = activation?.vm.identity ?? metadata.vmIdentity
+    if (!expected || expected.sshDest === "pending") throw new SandboxError("remove", "workspace VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
+    const identity = await this.verifyVmIdentity(info, metadata, expected)
+    await this.control.remove(identity)
     this.active.delete(info.id)
+  }
+
+  private async verifyVmIdentity(info: WorkspaceInfo, metadata: WorkspaceMetadata, expected: VmIdentity): Promise<VmIdentity> {
+    return copyVmIdentity((await this.findVerifiedVm(info, metadata, expected)).identity)
+  }
+
+  private async findVerifiedVm(info: WorkspaceInfo, metadata: WorkspaceMetadata, expected: VmIdentity): Promise<VmInfo> {
+    if (info.type !== this.type || info.name !== expected.name) throw exedevOwnershipError()
+    if (expected.sshDest === "pending") throw new SandboxError("remove", "workspace VM identity is unavailable", "VM_IDENTITY_UNAVAILABLE")
+    const inventory = validateVmInventory(await this.control.list(INSPECTION_TIMEOUT_MS))
+    const sameName = inventory.filter((item) => item.identity.name === expected.name)
+    const matches = sameName.filter((item) => identityMatches(expected, item.identity))
+    const match = matches[0]
+    if (matches.length !== 1 || sameName.length !== 1 || !match || !hasOwnerTag(info, metadata, match.identity)) {
+      throw exedevOwnershipError()
+    }
+    return match
+  }
+
+  private async destroyVerifiedVm(info: WorkspaceInfo, metadata: WorkspaceMetadata, expected: VmIdentity): Promise<void> {
+    const identity = await this.verifyVmIdentity(info, metadata, expected)
+    await this.control.remove(identity)
   }
 
   async dispose(): Promise<void> {
     const activations = [...this.active.values()]
     const results = await Promise.allSettled(
       activations.map(async (activation) => {
+        const identity = await this.verifyActivation(activation)
         this.revokeControlToken?.(activation.controlToken)
         if (activation.process) {
           activation.process.terminate()
           await waitForProcess(activation.process)
         }
-        await this.remote(activation.vm.identity, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach")
+        await this.remote(identity, ["rm", "-rf", "--", activation.paths.remoteDirectory], undefined, "detach")
         this.active.delete(activation.workspaceId)
       }),
     )
@@ -568,9 +680,14 @@ export class ExedevProvider implements WorkspaceProviderBase {
     await writeFile(hostPath, Buffer.from(encoded, "base64"), { mode: 0o600 })
   }
 
-  private async provisionVm(info: WorkspaceInfo, metadata: WorkspaceMetadata): Promise<ProvisionedVm> {
+  private async provisionVm(
+    info: WorkspaceInfo,
+    metadata: WorkspaceMetadata,
+    onCreated?: (cleanup: () => Promise<void>) => void,
+  ): Promise<ProvisionedVm> {
     const plan = makeVmPlan({ workspaceId: info.id, projectId: info.projectID, generation: metadata.generation })
-    const tags = metadata.tags ?? plan.tags
+    const ownerTag = exedevOwnerTag(info, metadata)
+    const tags = [...new Set([...(metadata.tags ?? plan.tags), ownerTag])]
     const comment = metadata.comment ?? plan.comment
     tags.forEach(assertSafeTag)
     assertSafeVmName(info.name)
@@ -581,9 +698,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
       assertSafeVmName(expected.name)
       assertSafeSshDestination(expected.sshDest)
       expected.tags.forEach(assertSafeTag)
-      const matches = (await this.control.list()).filter((item) => identityMatches(expected, item.identity))
-      if (matches.length !== 1) throw new SandboxError("discover", "known VM identity did not match exactly one VM", "VM_IDENTITY_MISMATCH")
-      const vm = matches[0]
+      const vm = await this.findVerifiedVm(info, metadata, expected)
       if (this.control.replaceTags) await this.control.replaceTags(vm.identity, tags)
       else if (tags.length > 0) await this.control.tag(vm.identity.name, tags)
       if (this.control.comment) await this.control.comment(vm.identity.name, comment)
@@ -597,28 +712,45 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }
 
     if (this.config.baseVm) {
-      return {
-        vm: await this.control.copy({
+      const vm = validateVmInfo(await this.control.copy({
           baseVm: this.config.baseVm,
           name: info.name,
           cpu: this.config.cpu,
           memory: this.config.memory,
           tags,
           comment,
-        }),
-        created: true,
-      }
+        }, onCreated))
+      return { vm, created: true }
     }
-    return {
-      vm: await this.control.create({
-        name: info.name,
-        cpu: this.config.cpu,
-        memory: this.config.memory,
-        tags,
-        comment,
-      }),
-      created: true,
+    const vm = validateVmInfo(await this.control.create({
+      name: info.name,
+      cpu: this.config.cpu,
+      memory: this.config.memory,
+      tags,
+      comment,
+    }))
+    return { vm, created: true }
+  }
+
+  private async verifyActivation(activation: Activation): Promise<VmIdentity> {
+    const info: WorkspaceInfo = {
+      id: activation.workspaceId,
+      type: this.type,
+      name: activation.vm.identity.name,
+      branch: activation.branch,
+      directory: activation.directory,
+      projectID: activation.projectId,
+      extra: {
+        sessionId: activation.sessionId,
+        generation: activation.generation,
+        vmIdentity: activation.vm.identity,
+      },
     }
+    return this.verifyVmIdentity(info, {
+      sessionId: activation.sessionId,
+      generation: activation.generation,
+      vmIdentity: activation.vm.identity,
+    }, activation.vm.identity)
   }
 
   private async bootstrap(vm: VmIdentity, paths: RuntimePaths, directory: string, remoteUrl: string, baseSha: string, branch: string): Promise<void> {
@@ -678,7 +810,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await response.json().catch(() => undefined)
+          const value = await readHealthResponse(response).catch(() => undefined)
           if (isRecord(value) && value.healthy === true && value.version === this.config.openCodeVersion) return
         }
       } catch {
@@ -793,6 +925,32 @@ export class ExedevProvider implements WorkspaceProviderBase {
   }
 }
 
+async function readHealthResponse(response: Response): Promise<unknown> {
+  if (!response.body) return undefined
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  try {
+    while (true) {
+      const next = await reader.read()
+      if (next.done) break
+      size += next.value.byteLength
+      if (size > MAX_HEALTH_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined)
+        return undefined
+      }
+      chunks.push(next.value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+  } catch {
+    return undefined
+  }
+}
+
 export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOptions): OpenCodeSandboxAdapter {
   const { input, authContent, ...providerOptions } = options
   const provider = new ExedevProvider({ ...providerOptions, deferActivation: true })
@@ -836,6 +994,7 @@ export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOp
         ...(metadata?.vmIdentity ? { vmIdentity: metadata.vmIdentity } : {}),
       }
     },
+    inspect: () => provider.inspect(info),
   }
 }
 
@@ -907,12 +1066,23 @@ export async function ensureExeDevVmHostKey(knownHostsFile: string, identity: Vm
 }
 
 function readWorkspaceMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): WorkspaceMetadata {
+  assertWorkspaceInfo(info)
+  if (from) assertWorkspaceInfo(from)
   const value = {
     ...(isRecord(from?.extra) ? from.extra : {}),
     ...(isRecord(info.extra) ? info.extra : {}),
   }
+  if (value.providerState !== undefined && !isRecord(value.providerState)) {
+    throw new SandboxError("validate", "workspace provider state is invalid", "PROVIDER_STATE_INVALID")
+  }
   const state = isRecord(value.providerState) ? value.providerState : {}
-  const field = (key: string): unknown => value[key] ?? state[key]
+  const field = (key: string): unknown => value[key] !== undefined ? value[key] : state[key]
+  const provider = field("provider")
+  if (provider !== undefined && provider !== "exedev") throw exedevOwnershipError()
+  const sessionId = field("sessionId")
+  if (sessionId !== undefined && (typeof sessionId !== "string" || !SAFE_IDENTIFIER.test(sessionId))) {
+    throw new SandboxError("validate", "workspace session ID is invalid", "SESSION_ID")
+  }
   const generation = field("generation")
   if (generation !== undefined && (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 1)) {
     throw new SandboxError("validate", "workspace generation is invalid", "GENERATION_INVALID")
@@ -925,31 +1095,77 @@ function readWorkspaceMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): Works
   if (tags !== undefined && (!Array.isArray(tags) || tags.some((tag) => typeof tag !== "string"))) {
     throw new SandboxError("validate", "workspace VM tags are invalid", "TAGS_INVALID")
   }
+  if (Array.isArray(tags)) tags.forEach(assertSafeTag)
   const vmIdentityValue = field("vmIdentity")
   const vmIdentity = vmIdentityValue === undefined ? undefined : parseVmIdentity(vmIdentityValue)
   if (vmIdentityValue !== undefined && !vmIdentity) {
     throw new SandboxError("validate", "workspace VM identity is invalid", "VM_IDENTITY_INVALID")
   }
+  if (vmIdentity && vmIdentity.name !== info.name) throw exedevOwnershipError()
   const remoteDirectory = field("remoteDirectory")
   if (remoteDirectory !== undefined) {
     if (typeof remoteDirectory !== "string") throw new SandboxError("validate", "workspace runtime directory is invalid", "RUNTIME_DIRECTORY")
     assertRemotePath(remoteDirectory, "workspace runtime directory")
   }
+  const comment = field("comment")
+  if (comment !== undefined && typeof comment !== "string") {
+    throw new SandboxError("validate", "workspace VM comment is invalid", "COMMENT_INVALID")
+  }
+  if (typeof comment === "string" && comment) assertSafeComment(comment)
   return {
-    sessionId: typeof field("sessionId") === "string" ? field("sessionId") as string : info.id,
+    sessionId: typeof sessionId === "string" ? sessionId : info.id,
     generation: typeof generation === "number" ? generation : 1,
     baseSha: typeof baseSha === "string" ? baseSha : undefined,
     tags: Array.isArray(tags) ? [...tags] : undefined,
-    comment: typeof field("comment") === "string" ? field("comment") as string : undefined,
+    comment: typeof comment === "string" ? comment : undefined,
     vmIdentity,
     remoteDirectory: typeof remoteDirectory === "string" ? remoteDirectory : undefined,
   }
 }
 
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
+
+function assertWorkspaceInfo(value: unknown): asserts value is WorkspaceInfo {
+  if (!isRecord(value) || value.type !== "exedev") throw exedevOwnershipError()
+  if (
+    typeof value.id !== "string" ||
+    !SAFE_IDENTIFIER.test(value.id) ||
+    typeof value.name !== "string" ||
+    typeof value.projectID !== "string" ||
+    !SAFE_IDENTIFIER.test(value.projectID) ||
+    (value.branch !== null && typeof value.branch !== "string") ||
+    (value.directory !== null && typeof value.directory !== "string") ||
+    (value.extra !== undefined && value.extra !== null && !isRecord(value.extra))
+  ) throw new SandboxError("validate", "exe.dev workspace info is invalid", "EXEDEV_WORKSPACE_INVALID")
+
+  assertSafeVmName(value.name)
+  if (typeof value.branch === "string") assertSafeBranch(value.branch)
+  if (typeof value.directory === "string" && (!isAbsolute(value.directory) || /[\0\n\r]/.test(value.directory))) {
+    throw new SandboxError("validate", "workspace directory is invalid", "EXEDEV_WORKSPACE_INVALID")
+  }
+}
+
+function classifyVmHealth(status: string | undefined): ProviderResourceObservation["health"] {
+  if (!status) return "unknown"
+  return ["running", "ready", "online", "active"].includes(status.toLowerCase()) ? "healthy" : "degraded"
+}
+
 function parseVmIdentity(value: unknown): VmIdentity | undefined {
   if (!isRecord(value) || typeof value.name !== "string" || typeof value.sshDest !== "string") return undefined
   if (!Array.isArray(value.tags) || value.tags.some((tag) => typeof tag !== "string")) return undefined
+  if (value.comment !== undefined && typeof value.comment !== "string") return undefined
+  for (const key of ["id", "sshUser", "sshHost", "region"] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || value[key].length === 0)) return undefined
+  }
   const tags = value.tags
+  try {
+    assertSafeVmName(value.name)
+    assertSafeSshDestination(value.sshDest)
+    tags.forEach(assertSafeTag)
+    if (typeof value.comment === "string" && value.comment) assertSafeComment(value.comment)
+  } catch {
+    return undefined
+  }
   const identity: VmIdentity = {
     name: value.name,
     sshDest: value.sshDest,
@@ -960,6 +1176,28 @@ function parseVmIdentity(value: unknown): VmIdentity | undefined {
     if (typeof value[key] === "string") identity[key] = value[key]
   }
   return identity
+}
+
+function validateVmInventory(value: unknown): VmInfo[] {
+  if (!Array.isArray(value)) throw exedevSchemaError("exe.dev VM inventory is not an array")
+  return value.map((item) => validateVmInfo(item))
+}
+
+function validateVmInfo(value: unknown): VmInfo {
+  if (!isRecord(value)) throw exedevSchemaError("exe.dev VM response is not an object")
+  const identity = parseVmIdentity(value.identity)
+  if (!identity) throw exedevSchemaError("exe.dev VM identity is invalid")
+  if (value.status !== undefined && (typeof value.status !== "string" || value.status.length === 0)) {
+    throw exedevSchemaError("exe.dev VM status is invalid")
+  }
+  return {
+    identity,
+    ...(value.status !== undefined ? { status: value.status } : {}),
+  }
+}
+
+function exedevSchemaError(message: string): SandboxError {
+  return new SandboxError("discover", message, "EXEDEV_SCHEMA")
 }
 
 function normalizePublicRemote(value: string): string {
@@ -996,6 +1234,22 @@ async function verifyHostKey(path: string, host: string, runner: ProcessRunner):
 
 function assertRemotePath(path: string, label: string): void {
   if (!/^\/[A-Za-z0-9._/-]+$/.test(path) || path.includes("..")) throw new SandboxError("validate", `${label} is unsafe`, "PATH_INVALID")
+}
+
+function assertRuntimeDirectory(path: string): void {
+  if (!/^\/tmp\/oe-[a-f0-9]{12}$/.test(path)) throw exedevOwnershipError()
+}
+
+function exedevOwnerTag(info: WorkspaceInfo, metadata: WorkspaceMetadata): string {
+  return `opencode-owner-${shortHash(`${info.projectID}:${metadata.sessionId}:${info.id}:${metadata.generation}`)}`
+}
+
+function hasOwnerTag(info: WorkspaceInfo, metadata: WorkspaceMetadata, identity: VmIdentity): boolean {
+  return identity.tags.includes(exedevOwnerTag(info, metadata))
+}
+
+function exedevOwnershipError(): SandboxError {
+  return new SandboxError("remove", "exe.dev VM ownership could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
 }
 
 function encodePath(value: string): string {

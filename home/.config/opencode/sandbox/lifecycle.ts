@@ -7,14 +7,22 @@ import {
   isRecord,
   SandboxError,
   type AuthorizedControlRequest,
+  type CapabilityRole,
   type ControlCapability,
+  type GitWorkingTreeObservation,
+  type ProviderResourceObservation,
+  type PublicOperation,
   type SandboxRecord,
+  type SandboxObservation,
+  type SandboxAllowedAction,
+  type SandboxResultV2,
   type SandboxResponse,
   type SandboxState,
   type SessionContext,
   type VmIdentity,
   type WorkingTreeCapture,
   type WorkspaceGateway,
+  type WorkspaceInfo,
   type WorkspaceTarget,
 } from "./types"
 import {
@@ -23,7 +31,13 @@ import {
   type SandcastleSessionFactory,
 } from "./sandcastle-session"
 
-const MAX_DIAGNOSTIC_BYTES = 64 * 1024
+const MAX_DIAGNOSTIC_BYTES = 48 * 1024
+const INSPECTION_TIMEOUT_MS = 5_000
+const INVENTORY_TIMEOUT_MS = 10_000
+const MAX_INVENTORY_RECORDS = 1_000
+const MAX_INVENTORY_RESOURCES = 1_000
+const MAX_INVENTORY_DETAIL_BYTES = 48 * 1024
+const MAX_RESPONSE_BYTES = 64 * 1024 - 1024
 
 export interface InfrastructureOperations {
   remove?(record: SandboxRecord): Promise<void>
@@ -37,6 +51,10 @@ export interface LifecycleDependencies {
   workspace: WorkspaceGateway
   capture?: (context: SessionContext) => Promise<WorkingTreeCapture>
   infrastructure?: InfrastructureOperations
+  providerInspect?: (record: SandboxRecord) => Promise<ProviderResourceObservation>
+  providerTarget?: (record: SandboxRecord) => WorkspaceTarget | undefined | Promise<WorkspaceTarget | undefined>
+  providerInventory?: () => Promise<ProviderResourceObservation[]>
+  gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
   providerType?: string
   branchForWorkspace?: (workspaceId: string) => string
   providerRelease?: (record: SandboxRecord) => Promise<void>
@@ -50,6 +68,10 @@ export class LifecycleController {
   private readonly workspace: WorkspaceGateway
   private readonly capture?: (context: SessionContext) => Promise<WorkingTreeCapture>
   private readonly infrastructure: InfrastructureOperations
+  private readonly providerInspect?: (record: SandboxRecord) => Promise<ProviderResourceObservation>
+  private readonly providerTarget?: (record: SandboxRecord) => WorkspaceTarget | undefined | Promise<WorkspaceTarget | undefined>
+  private readonly providerInventory?: () => Promise<ProviderResourceObservation[]>
+  private readonly gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
   private readonly providerType: string
   private readonly branchForWorkspace?: (workspaceId: string) => string
   private readonly providerRelease?: (record: SandboxRecord) => Promise<void>
@@ -70,6 +92,10 @@ export class LifecycleController {
     this.workspace = dependencies.workspace
     this.capture = dependencies.capture
     this.infrastructure = dependencies.infrastructure ?? {}
+    this.providerInspect = dependencies.providerInspect
+    this.providerTarget = dependencies.providerTarget
+    this.providerInventory = dependencies.providerInventory
+    this.gitInspect = dependencies.gitInspect
     this.providerType = dependencies.providerType ?? "exedev"
     this.branchForWorkspace = dependencies.branchForWorkspace
     this.providerRelease = dependencies.providerRelease
@@ -83,7 +109,7 @@ export class LifecycleController {
     this.contexts.set(context.sessionId, context)
   }
 
-  async capabilityFor(sessionId: string, role: "host" | "remote" = "host"): Promise<ControlCapability> {
+  async capabilityFor(sessionId: string, role: "host" | "remote" = "host", scope: "session" = "session"): Promise<ControlCapability> {
     if (this.disposed) throw pluginDisposed()
     const record = await this.store.get(sessionId)
     if (this.disposed) throw pluginDisposed()
@@ -91,6 +117,19 @@ export class LifecycleController {
       sessionId,
       generation: record?.generation ?? 1,
       role,
+      scope,
+      ...(record?.projectId ? { projectId: record.projectId } : {}),
+    })
+  }
+
+  async projectCapabilityFor(projectId: string): Promise<ControlCapability> {
+    if (this.disposed) throw pluginDisposed()
+    return createCapability({
+      sessionId: `project_${shortHash(projectId)}`,
+      generation: 1,
+      role: "host",
+      scope: "project",
+      projectId,
     })
   }
 
@@ -117,7 +156,9 @@ export class LifecycleController {
   private async handleRequest(request: AuthorizedControlRequest): Promise<SandboxResponse> {
     try {
       if (this.disposed) throw pluginDisposed()
-      const record = await this.store.get(request.capability.sessionId)
+      const record = request.operation === "inventory" && (request.capability.scope ?? "session") === "project"
+        ? undefined
+        : await this.store.get(request.capability.sessionId)
       this.assertCapability(record, request.capability)
       this.assertOperationAllowed(record, request)
 
@@ -132,11 +173,15 @@ export class LifecycleController {
           return response
         }
         case "status":
-          return this.status(record)
+          return this.status(record, request.capability)
+        case "inspect":
+          return await this.inspect(record, request.capability)
+        case "inventory":
+          return await this.inventory(request.capability)
         case "logs":
-          return await this.logs(record)
+          return await this.logs(record, request.capability)
         case "diagnose":
-          return await this.diagnose(record)
+          return await this.diagnose(record, request.capability)
         case "delete":
           return await this.delete(request.capability, request.force)
         case "retry":
@@ -150,6 +195,9 @@ export class LifecycleController {
         error instanceof SandboxError ? error.stage : "validate",
         redactError(error),
         record,
+        error,
+        request.capability.role,
+        { captureAvailable: this.capture !== undefined },
       )
     }
   }
@@ -192,15 +240,14 @@ export class LifecycleController {
         await this.onSandcastleIdle(record, write)
       } catch (error) {
         this.rejectTargetGate(record.workspaceId, error)
+        const preservedWorktreePath = preservedPathFrom(error) ?? record.preservedWorktreePath
         await write({
           ...record,
+          ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
           state: failureState(error, Boolean(this.sandcastle)),
           operation: failedOperation(record, error, Boolean(this.sandcastle)),
           updatedAt: this.now().toISOString(),
-          lastError: {
-            stage: failureStage(error),
-            message: redactError(error),
-          },
+          lastError: failureDetails(error),
         })
       }
       return
@@ -216,10 +263,7 @@ export class LifecycleController {
           state: failureState(error, false),
           operation: failedOperation(record, error, false),
           updatedAt: this.now().toISOString(),
-          lastError: {
-            stage: failureStage(error),
-            message: redactError(error),
-          },
+          lastError: failureDetails(error),
         })
       }
       return
@@ -227,7 +271,10 @@ export class LifecycleController {
     if (!isTransitionPending(record.state)) return
 
     try {
-      if (record.state === "activation_pending") {
+      if (record.state === "recovery_pending" && !record.operation) {
+        throw new SandboxError("reconcile", "restart recovery cannot prove work preservation", "RECOVERY_PRESERVATION_UNVERIFIED")
+      }
+      if (record.state === "activation_pending" || (record.state === "recovery_pending" && record.operation?.kind === "start")) {
         await this.waitForSync(record)
         await this.workspace.warp({ sessionId, workspaceId: record.workspaceId, directory: record.directory })
         await write({
@@ -240,7 +287,7 @@ export class LifecycleController {
         return
       }
 
-      if (record.state === "stop_pending" || (record.state === "recovery_pending" && record.operation?.kind !== "delete")) {
+      if (record.state === "stop_pending" || (record.state === "recovery_pending" && record.operation?.kind === "stop")) {
         if (record.operation?.kind === "stop" || record.operation?.phase === "remote") await this.syncOut(record)
         await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
         await this.cleanupWorkspace(record)
@@ -299,10 +346,7 @@ export class LifecycleController {
         state: failureState(error, false),
         operation: failedOperation(current, error, false),
         updatedAt: this.now().toISOString(),
-        lastError: {
-          stage: failureStage(error),
-          message: redactError(error),
-        },
+        lastError: failureDetails(error),
       })
     }
   }
@@ -330,6 +374,16 @@ export class LifecycleController {
       if (projectId && candidate.projectId !== projectId) continue
       await this.store.withRecordLock(candidate.sessionId, async (record, write) => {
         if (!record || (projectId && record.projectId !== projectId)) return
+        if (record.state === "recovery_pending" && !record.operation) {
+          const error = new SandboxError("reconcile", "restart recovery cannot prove work preservation", "RECOVERY_PRESERVATION_UNVERIFIED")
+          await write({
+            ...record,
+            state: "error",
+            updatedAt: this.now().toISOString(),
+            lastError: failureDetails(error),
+          })
+          return
+        }
         if (this.sandcastle && isSandcastleActive(record.state) && !this.sessions.has(record.sessionId)) {
           await write({
             ...record,
@@ -337,10 +391,15 @@ export class LifecycleController {
             operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
             updatedAt: this.now().toISOString(),
             lastError: {
+              code: "SANDCASTLE_HANDLE",
               stage: "reconcile",
               message: "Sandcastle session handle is unavailable; manual recovery is required",
             },
           })
+          return
+        }
+        if (record.state === "recovery_pending") {
+          await this.processSessionIdleLocked(record.sessionId, record, write)
           return
         }
         if (this.sandcastle && isSandcastleActive(record.state)) return
@@ -370,9 +429,23 @@ export class LifecycleController {
 
       const sessions = [...this.sessions.entries()]
       const results = await Promise.allSettled(sessions.map(async ([sessionId, session]) => {
-        const record = await this.store.get(sessionId)
-        if (record && ["remote", "stop_pending", "delete_pending", "sync_failed"].includes(record.state)) await session.sync()
-        return session.close()
+        let operationError: unknown
+        try {
+          const record = await this.store.get(sessionId)
+          if (record && ["remote", "stop_pending", "delete_pending", "sync_failed"].includes(record.state)) await session.sync()
+        } catch (error) {
+          operationError = error
+        }
+        try {
+          const closeResult = await session.close()
+          await this.persistPreservedWorktreePath(sessionId, closeResult.preservedWorktreePath)
+          this.sessions.delete(sessionId)
+          if (operationError) throw operationError
+          return closeResult
+        } catch (error) {
+          await this.persistPreservedWorktreePath(sessionId, preservedPathFrom(error))
+          throw error
+        }
       }))
       results.forEach((result, index) => {
         if (result.status === "fulfilled") this.sessions.delete(sessions[index]![0])
@@ -430,7 +503,7 @@ export class LifecycleController {
 
     const session = this.sessions.get(record.sessionId)
     if (!session) {
-      if (record.operation?.kind === "delete") {
+      if (record.operation?.kind === "delete" && record.operation.phase === "removing" && record.operation.providerDestroyed) {
         await this.removeWorkspace(record)
         await write({
           ...record,
@@ -444,41 +517,60 @@ export class LifecycleController {
       throw new SandboxError("reconcile", "Sandcastle session handle is unavailable", "SANDCASTLE_HANDLE")
     }
 
-    if (record.operation?.phase === "discarding") {
-      await this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory })
-      const closeResult = await session.close()
-      await this.removeWorkspace(record)
-      this.sessions.delete(record.sessionId)
-      await write({
-        ...record,
-        state: "deleted",
-        operation: record.operation ? { ...record.operation, phase: "deleted" } : undefined,
-        preservedWorktreePath: closeResult.preservedWorktreePath,
-        updatedAt: this.now().toISOString(),
-        lastError: undefined,
-      })
-      return
-    }
-
-    try {
-      await session.sync()
-    } catch (error) {
-      if (error instanceof SandboxError) throw error
-      throw new SandboxError("sync", redactError(error), "SANDCASTLE_SYNC")
-    }
+    const deleting = record.operation?.kind === "delete"
+    const discarding = record.operation?.phase === "discarding"
     const localTarget: WorkspaceTarget = { type: "local", directory: record.directory }
-    await this.withTarget(record.workspaceId, localTarget, () =>
-      this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory }))
+    let current = record
+    if (discarding) {
+      await this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory })
+    } else if (!deleting || !["removing", "destroying"].includes(record.operation?.phase ?? "")) {
+      try {
+        await session.sync()
+      } catch (error) {
+        if (error instanceof SandboxError) throw error
+        throw new SandboxError("sync", redactError(error), "SANDCASTLE_SYNC")
+      }
+      await this.withTarget(record.workspaceId, localTarget, () =>
+        this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory }))
+    }
     const closeResult = await session.close()
-    await this.removeWorkspace(record)
+    current = {
+      ...record,
+      ...(closeResult.preservedWorktreePath ? { preservedWorktreePath: closeResult.preservedWorktreePath } : {}),
+      updatedAt: this.now().toISOString(),
+    }
+    if (deleting) {
+      current = {
+        ...current,
+        operation: record.operation
+          ? { ...record.operation, phase: "removing", ...(this.sandcastle ? { providerDestroyed: true } : {}) }
+          : undefined,
+        updatedAt: this.now().toISOString(),
+      }
+    }
+    if (!deleting && current.operation) {
+      current = {
+        ...current,
+        operation: { ...current.operation, providerDestroyed: true },
+      }
+    }
+    await write(current)
+    try {
+      await this.removeWorkspace(current)
+    } catch (error) {
+      if (current.preservedWorktreePath && error instanceof Error) {
+        Object.assign(error, { preservedWorktreePath: current.preservedWorktreePath })
+      }
+      throw error
+    }
     this.sessions.delete(record.sessionId)
     await write({
-      ...record,
-      state: record.operation?.kind === "delete" ? "deleted" : "detached",
-      operation: record.operation
-        ? { ...record.operation, phase: record.operation.kind === "delete" ? "deleted" : "detached" }
+      ...current,
+      state: deleting ? "deleted" : "detached",
+      operation: current.operation
+        ? { ...current.operation, phase: deleting ? "deleted" : "detached" }
         : undefined,
-      preservedWorktreePath: closeResult.preservedWorktreePath,
+      ...(current.preservedWorktreePath ? { preservedWorktreePath: current.preservedWorktreePath } : {}),
       updatedAt: this.now().toISOString(),
       lastError: undefined,
     })
@@ -537,6 +629,7 @@ export class LifecycleController {
         baseSha: capture.baseSha,
         state: "provisioning",
         operation,
+        ...(existing?.preservedWorktreePath ? { preservedWorktreePath: existing.preservedWorktreePath } : {}),
         createdAt: existing?.createdAt ?? this.now().toISOString(),
         updatedAt: this.now().toISOString(),
       }
@@ -612,8 +705,8 @@ export class LifecycleController {
           state: "error",
           updatedAt: this.now().toISOString(),
           lastError: {
-            stage: error instanceof SandboxError ? error.stage : "provision",
-            message: cleanupError ? `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` : redactError(error),
+            ...failureDetails(error),
+            ...(cleanupError ? { message: `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` } : {}),
           },
         }
         await write(failed)
@@ -645,11 +738,21 @@ export class LifecycleController {
       if (existing?.state === "orphaned") {
         throw new SandboxError("reconcile", "session sandbox is orphaned; recover it manually before starting again", "SESSION_ORPHANED")
       }
+      let preservedWorktreePath = existing?.preservedWorktreePath
       if (existing?.state === "error" && existing.operation?.kind === "start") {
         const retained = this.sessions.get(capability.sessionId)
         if (retained) {
-          await retained.close()
+          try {
+            preservedWorktreePath = (await retained.close()).preservedWorktreePath ?? preservedWorktreePath
+          } catch (error) {
+            const path = preservedPathFrom(error)
+            if (path) await write({ ...existing, preservedWorktreePath: path, updatedAt: this.now().toISOString() })
+            throw error
+          }
           this.sessions.delete(capability.sessionId)
+        }
+        if (preservedWorktreePath && preservedWorktreePath !== existing.preservedWorktreePath) {
+          await write({ ...existing, preservedWorktreePath, updatedAt: this.now().toISOString() })
         }
         await this.removeWorkspace(existing)
       }
@@ -676,6 +779,7 @@ export class LifecycleController {
         baseSha: capture.baseSha,
         state: "provisioning",
         operation,
+        ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
         createdAt: existing?.createdAt ?? this.now().toISOString(),
         updatedAt: this.now().toISOString(),
       }
@@ -746,6 +850,7 @@ export class LifecycleController {
             sessionClosed = true
           } catch (error) {
             cleanupError = error
+            preservedWorktreePath ??= preservedPathFrom(error)
           }
           if (sessionClosed) this.sessions.delete(capability.sessionId)
           this.rejectTargetGate(workspaceId, error)
@@ -762,8 +867,8 @@ export class LifecycleController {
           ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
           updatedAt: this.now().toISOString(),
           lastError: {
-            stage: error instanceof SandboxError ? error.stage : "provision",
-            message: cleanupError ? `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` : redactError(error),
+            ...failureDetails(error),
+            ...(cleanupError ? { message: `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` } : {}),
           },
         }
         await write(failed)
@@ -777,9 +882,9 @@ export class LifecycleController {
     return this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "stop", force: false, capability })
-      if (!record) return successResponse("stop", undefined, "session is already local")
-      if (record.state === "detached" || record.state === "local") return successResponse("stop", record, "session is already local")
-      if (record.state === "stop_pending") return successResponse("stop", record, "session detach is already pending")
+      if (!record) return successResponse("stop", undefined, "session is already local", undefined, capability.role)
+      if (record.state === "detached" || record.state === "local") return successResponse("stop", record, "session is already local", undefined, capability.role)
+      if (record.state === "stop_pending") return successResponse("stop", record, "session detach is already pending", undefined, capability.role)
       if (record.state !== "remote") throw new SandboxError("transition", "cannot stop while another transition is pending", "STOP_TRANSITION")
 
       const next: SandboxRecord = {
@@ -794,7 +899,7 @@ export class LifecycleController {
       this.beginTargetGate(record.workspaceId)
       assertTransition(record.state, next.state)
       await write(next)
-      return successResponse("stop", next, "Detach agendado; a resposta atual sera concluida primeiro.")
+      return successResponse("stop", next, "Detach agendado; a resposta atual sera concluida primeiro.", undefined, capability.role)
     })
   }
 
@@ -829,26 +934,244 @@ export class LifecycleController {
     }
   }
 
-  private status(record: SandboxRecord | undefined): SandboxResponse {
-    if (!record) return successResponse("status", undefined, "session is local")
-    return successResponse("status", record, `session state: ${record.state}`)
+  private status(record: SandboxRecord | undefined, capability: ControlCapability): SandboxResponse {
+    const options = { captureAvailable: this.capture !== undefined }
+    if (!record) return successResponse("status", undefined, "session is local", undefined, capability.role, options)
+    return successResponse("status", record, `session state: ${record.state}`, undefined, capability.role, options)
   }
 
-  private async logs(record: SandboxRecord | undefined): Promise<SandboxResponse> {
-    if (!record) return successResponse("logs", undefined, "no sandbox session is associated")
-    const output = boundedText((this.infrastructure.logs ? await this.infrastructure.logs(record) : []).join("\n"))
-    return successResponse("logs", record, output.value, {
-      logs: output.value ? output.value.split("\n") : [],
-      ...(output.truncated ? { truncated: true } : {}),
+  private async inspect(record: SandboxRecord | undefined, capability: ControlCapability): Promise<SandboxResponse> {
+    if (!record) {
+      return successResponse("inspect", undefined, "no sandbox session is associated", undefined, capability.role, {
+        observations: emptyObservations(this.now()),
+        classification: "unknown",
+        recommendedAction: null,
+        captureAvailable: this.capture !== undefined,
+      })
+    }
+
+    const freshAt = this.now().toISOString()
+    const handle = this.sessions.get(record.sessionId)
+    const [workspace, provider, git, target] = await Promise.all([
+      this.inspectWorkspace(record, freshAt),
+      this.inspectProvider(record, handle, freshAt),
+      this.inspectGit(record, handle, freshAt),
+      this.inspectRuntimeTarget(record, handle),
+    ])
+    const handleObservation = runtimeHandleObservation(handle, target, freshAt)
+    const observations = [recordObservation(record), handleObservation, workspace.observation, provider.observation, git.observation]
+    const classification = classifySituation(record, observations)
+    const work = workFromInspection(record, git.value, classification)
+    const effectiveTarget = effectiveTargetFor(record, target.value, workspace.value, provider.value, provider.observation, handleObservation)
+    const probeError = workspace.error ?? provider.error ?? git.error ?? target.error
+    const contextAvailable = this.contexts.has(record.sessionId)
+    const preservationVerified = Boolean(record.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(git.value?.head ?? ""))
+    return successResponse("inspect", record, probeError ? "inspection completed with unknown evidence" : "inspection completed", undefined, capability.role, {
+      ok: !probeError,
+      observations,
+      classification,
+      effectiveTarget,
+      work,
+      ...(probeError ? { error: publicError(probeError) } : {}),
+      allowedActions: allowedActions(record, capability.role, classification, provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified),
+      recommendedAction: recommendedAction(record, capability.role, classification, provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified),
     })
   }
 
-  private async diagnose(record: SandboxRecord | undefined): Promise<SandboxResponse> {
-    if (!record) return successResponse("diagnose", undefined, "no sandbox session is associated")
+  private async inventory(capability: ControlCapability): Promise<SandboxResponse> {
+    const projectId = capability.projectId
+    if (!projectId) throw new SandboxError("validate", "project capability is missing a project ID", "CAPABILITY_PROJECT")
+
+    const recordsPromise = this.store.list()
+    const resourcesPromise = this.providerInventory
+      ? withTimeout(this.providerInventory(), INVENTORY_TIMEOUT_MS, "provider inventory timed out")
+      : Promise.resolve(undefined)
+    const [records, resourcesResult] = await Promise.all([
+      recordsPromise,
+      resourcesPromise.then((resources) => ({ resources, error: undefined as unknown })).catch((error: unknown) => ({ resources: undefined, error })),
+    ])
+    const allProjectRecords = records.filter((record) => record.projectId === projectId)
+    const projectRecords = allProjectRecords.slice(0, MAX_INVENTORY_RECORDS)
+    const recordsTruncated = projectRecords.length < allProjectRecords.length
+    const allResources = resourcesResult.resources ?? []
+    const projectResources = allResources.filter((resource) => resource.projectId === projectId)
+    const unscopedResources = allResources.length - projectResources.length
+    const inventoryScoped = allResources.length > 0 && unscopedResources === 0
+    const resources = projectResources.slice(0, MAX_INVENTORY_RESOURCES).map(safeProviderResource)
+    const resourcesTruncated = resources.length < projectResources.length
+    const freshAt = this.now().toISOString()
+    const providerObservationValue: SandboxObservation = resourcesResult.error
+      ? {
+          source: "provider",
+          observed: true,
+          freshAt,
+          resource: "unknown",
+          ownership: "unknown",
+          health: "unknown",
+          evidence: [`provider inventory failed:${errorCode(resourcesResult.error)}`],
+        }
+      : resourcesResult.resources
+        ? inventoryScoped
+          ? {
+            source: "provider",
+            observed: true,
+            freshAt,
+            resource: resources.length > 0 ? "present" : "absent",
+            ownership: resources.some((resource) => resource.ownership === "conflict") ? "conflict" : "unknown",
+            health: aggregateInventoryHealth(resources),
+            evidence: [`provider inventory:${resources.length}`],
+          }
+          : {
+              source: "provider",
+              observed: true,
+              freshAt,
+              resource: "unknown",
+              ownership: "unknown",
+              health: "unknown",
+              evidence: [`provider inventory scope is unknown; omitted:${unscopedResources}`],
+            }
+        : {
+            source: "provider",
+            observed: false,
+            freshAt,
+            resource: "unknown",
+            ownership: "unknown",
+            health: "unknown",
+            evidence: ["provider inventory is unavailable"],
+          }
+    const observations: SandboxObservation[] = [
+      {
+        source: "record",
+        observed: true,
+        freshAt,
+        resource: projectRecords.length > 0 ? "present" : "absent",
+        ownership: "unknown",
+        health: "unknown",
+        evidence: [`lifecycle records:${projectRecords.length}`],
+      },
+      providerObservationValue,
+      ...["handle", "workspace", "git"].map((source) => ({
+        source: source as SandboxObservation["source"],
+        observed: false,
+        freshAt,
+        evidence: [],
+      })),
+    ]
+    const error = resourcesResult.error
+    const boundedRecords = boundedItems(projectRecords.map(inventoryRecord), MAX_INVENTORY_DETAIL_BYTES / 2)
+    const boundedResources = boundedItems(resources, MAX_INVENTORY_DETAIL_BYTES / 2)
+    return {
+      ...baseResult("inventory", true, "project inventory completed", {
+        role: "host",
+        observations,
+        classification: error || !resourcesResult.resources || !inventoryScoped ? "unknown" : projectRecords.length === 0 && resources.length === 0 ? "clean" : "unknown",
+        allowedActions: [{
+          operation: "inventory",
+          role: "host",
+          arguments: [],
+          preconditions: ["host project capability"],
+          waitFor: "none",
+        }],
+        recommendedAction: null,
+        ...(error ? { ok: false, error: publicError(error) } : {}),
+      }),
+      state: "local",
+      details: {
+        records: boundedRecords.values,
+        providerResources: boundedResources.values,
+        ...(recordsTruncated || resourcesTruncated || boundedRecords.truncated || boundedResources.truncated ? { truncated: true } : {}),
+      },
+    }
+  }
+
+  private async inspectWorkspace(record: SandboxRecord, freshAt: string): Promise<Probe<WorkspaceInfo>> {
+    if (!this.workspace.inspect) {
+      return {
+        observation: { source: "workspace", observed: false, freshAt, resource: "unknown", ownership: "unknown", health: "unknown", evidence: ["workspace inspection is unavailable"] },
+      }
+    }
+    try {
+      const info = await withTimeout(this.workspace.inspect({ workspaceId: record.workspaceId, directory: record.directory }), INSPECTION_TIMEOUT_MS, "workspace inspection timed out")
+      if (!info) {
+        return { observation: { source: "workspace", observed: true, freshAt, resource: "absent", ownership: "unknown", health: "unknown", evidence: [`workspace registry:${record.workspaceId}`] } }
+      }
+      const matches = workspaceMatches(record, info)
+      return {
+        value: info,
+        observation: {
+          source: "workspace",
+          observed: true,
+          freshAt,
+          resource: "present",
+          ownership: matches ? "verified" : "conflict",
+          health: "unknown",
+          evidence: [`workspace registry:${record.workspaceId}`],
+        },
+      }
+    } catch (error) {
+      return { observation: unknownObservation("workspace", freshAt, `workspace inspection failed:${errorCode(error)}`), error }
+    }
+  }
+
+  private async inspectProvider(record: SandboxRecord, session: SandcastleSession | undefined, freshAt: string): Promise<Probe<ProviderResourceObservation>> {
+    if (!session?.inspect && !this.providerInspect) {
+      return { observation: unknownObservation("provider", freshAt, "provider inspection is unavailable") }
+    }
+    try {
+      const result = await withTimeout(session?.inspect ? session.inspect() : this.providerInspect!(record), INSPECTION_TIMEOUT_MS, "provider inspection timed out")
+      return { observation: providerObservation(result, freshAt), value: result }
+    } catch (error) {
+      return {
+        observation: unknownObservation("provider", freshAt, `provider inspection failed:${errorCode(error)}`),
+        error,
+      }
+    }
+  }
+
+  private async inspectGit(record: SandboxRecord, session: SandcastleSession | undefined, freshAt: string): Promise<Probe<GitWorkingTreeObservation>> {
+    if (!this.gitInspect) {
+      return { observation: { source: "git", observed: false, freshAt, evidence: ["Git inspection is unavailable"] } }
+    }
+    const worktreePath = session?.worktree.worktreePath ?? record.preservedWorktreePath
+    if (!worktreePath) {
+      return { observation: { source: "git", observed: false, freshAt, evidence: ["runtime worktree is unavailable"] } }
+    }
+    try {
+      const value = await withTimeout(this.gitInspect(record, worktreePath), INSPECTION_TIMEOUT_MS, "Git inspection timed out")
+      return {
+        value,
+        observation: { source: "git", observed: true, freshAt, evidence: safeEvidence(value.evidence) },
+      }
+    } catch (error) {
+      return { observation: { source: "git", observed: true, freshAt, evidence: [`Git inspection failed:${errorCode(error)}`] }, error }
+    }
+  }
+
+  private async inspectRuntimeTarget(record: SandboxRecord, session: SandcastleSession | undefined): Promise<TargetProbe> {
+    try {
+      if (session) return { observed: true, value: session.target }
+      if (!this.providerTarget) return { observed: false }
+      return { observed: true, value: await withTimeout(Promise.resolve(this.providerTarget(record)), INSPECTION_TIMEOUT_MS, "runtime target inspection timed out") }
+    } catch (error) {
+      return { observed: true, error }
+    }
+  }
+
+  private async logs(record: SandboxRecord | undefined, capability: ControlCapability): Promise<SandboxResponse> {
+    if (!record) return successResponse("logs", undefined, "no sandbox session is associated", undefined, capability.role)
+    const output = boundedText((this.infrastructure.logs ? await this.infrastructure.logs(record) : []).join("\n"))
+    return successResponse("logs", record, "logs retrieved", {
+      logs: output.value ? output.value.split("\n") : [],
+      ...(output.truncated ? { truncated: true } : {}),
+    }, capability.role)
+  }
+
+  private async diagnose(record: SandboxRecord | undefined, capability: ControlCapability): Promise<SandboxResponse> {
+    if (!record) return successResponse("diagnose", undefined, "no sandbox session is associated", undefined, capability.role)
     const details = this.infrastructure.diagnose
       ? boundedDetails(nonSecretDetails(await this.infrastructure.diagnose(record)))
       : { configured: false }
-    return successResponse("diagnose", record, "diagnostics completed", details)
+    return successResponse("diagnose", record, "diagnostics completed", details, capability.role)
   }
 
   private async delete(capability: ControlCapability, force: boolean): Promise<SandboxResponse> {
@@ -863,6 +1186,7 @@ export class LifecycleController {
       if (!forceDiscard && record.state !== "remote" && record.state !== "detached") {
         throw new SandboxError("transition", "delete is blocked while a transition is pending", "DELETE_TRANSITION")
       }
+      if (!force && record.preservedWorktreePath) await this.verifyPreservedWorktree(record)
       if (!force && this.infrastructure.preflightDelete) await this.infrastructure.preflightDelete(record)
       if (!this.sandcastle && !this.providerDestroy && !this.infrastructure.remove) {
         throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
@@ -874,10 +1198,11 @@ export class LifecycleController {
       const next: SandboxRecord = {
         ...record,
         state: "delete_pending",
-        operation: {
+          operation: {
           kind: "delete",
           phase,
           force,
+          ...(record.operation?.providerDestroyed ? { providerDestroyed: true } : {}),
         },
         updatedAt: this.now().toISOString(),
       }
@@ -894,13 +1219,13 @@ export class LifecycleController {
     })
 
     const final = decision.record
-    if (decision.alreadyDeleted) return successResponse("delete", final, "Sandbox is already deleted")
-    if (!force) return successResponse("delete", final, "Delete agendado; a resposta atual sera concluida primeiro.")
+    if (decision.alreadyDeleted) return successResponse("delete", final, "Sandbox is already deleted", undefined, capability.role)
+    if (!force) return successResponse("delete", final, "Delete agendado; a resposta atual sera concluida primeiro.", undefined, capability.role)
     if (final?.state !== "deleted") {
       const lastError = final?.lastError ?? { stage: "remove", message: "sandbox removal is still pending" }
-      return failureResponse("delete", final?.state ?? "error", lastError.stage, lastError.message, final)
+      return failureResponse("delete", final?.state ?? "error", lastError.stage, lastError.message, final, undefined, capability.role)
     }
-    return successResponse("delete", final, decision.forceDiscard ? "Failed sandbox discarded." : "Sandbox removed.")
+    return successResponse("delete", final, decision.forceDiscard ? "Failed sandbox discarded." : "Sandbox removed.", undefined, capability.role)
   }
 
   private async retry(capability: ControlCapability, record: SandboxRecord | undefined): Promise<SandboxResponse> {
@@ -918,13 +1243,13 @@ export class LifecycleController {
         }, { record, capability })
         if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned" || final.state === "recovery_pending") {
           const lastError = final.lastError ?? { stage: "reconcile", message: "retry did not complete" }
-          return failureResponse("retry", final.state, lastError.stage, lastError.message, final)
+          return failureResponse("retry", final.state, lastError.stage, lastError.message, final, undefined, capability.role)
         }
-        return successResponse("retry", final, "Retry completed.")
+        return successResponse("retry", final, "Retry completed.", undefined, capability.role)
       })
     }
     if (!record || (record.state !== "error" && record.state !== "sync_failed")) {
-      return successResponse("retry", record, "there is no failed operation to retry")
+      return successResponse("retry", record, "there is no failed operation to retry", undefined, capability.role)
     }
     const operation = record.operation?.kind
     if (operation === "start") {
@@ -974,9 +1299,9 @@ export class LifecycleController {
       }, { record: next, capability })
       if (final.state === "error" || final.state === "sync_failed" || final.state === "orphaned") {
         const lastError = final.lastError ?? { stage: "reconcile", message: "retry failed" }
-        return failureResponse("retry", final.state, lastError.stage, lastError.message, final)
+        return failureResponse("retry", final.state, lastError.stage, lastError.message, final, undefined, capability.role)
       }
-      return successResponse("retry", final, "Retry completed.")
+      return successResponse("retry", final, "Retry completed.", undefined, capability.role)
     })
   }
 
@@ -1004,18 +1329,22 @@ export class LifecycleController {
           state,
           operation: failedOperation(current, error, false),
           updatedAt: this.now().toISOString(),
-          lastError: {
-            stage: failureStage(error),
-            message: redactError(error),
-          },
+          lastError: failureDetails(error),
         })
         throw error
       }
     })
-    return successResponse("retry", next, "Retry completed.")
+    return successResponse("retry", next, "Retry completed.", undefined, capability.role)
   }
 
   private assertCapability(record: SandboxRecord | undefined, capability: ControlCapability): void {
+    const scope = capability.scope ?? "session"
+    if (scope === "project") {
+      if (capability.role !== "host" || !capability.projectId) {
+        throw new SandboxError("validate", "project capability is invalid", "CAPABILITY_SCOPE")
+      }
+      return
+    }
     if (record && capability.generation !== record.generation) {
       throw new SandboxError("validate", "control capability belongs to an old generation", "CAPABILITY_GENERATION")
     }
@@ -1025,6 +1354,16 @@ export class LifecycleController {
   }
 
   private assertOperationAllowed(record: SandboxRecord | undefined, request: AuthorizedControlRequest): void {
+    const scope = request.capability.scope ?? "session"
+    if (scope === "project") {
+      if (request.operation !== "inventory" || request.capability.role !== "host") {
+        throw new SandboxError("validate", "project capabilities are limited to host inventory", "REQUEST_SCOPE")
+      }
+      return
+    }
+    if (request.operation === "inventory") {
+      throw new SandboxError("validate", "inventory requires a host project capability", "REQUEST_INVENTORY")
+    }
     if (request.capability.role !== "remote") return
     if (request.operation === "start" || (request.operation === "retry" && record?.operation?.kind === "start")) {
       throw new SandboxError("validate", "start is only authorized from the host", "REQUEST_START")
@@ -1054,6 +1393,26 @@ export class LifecycleController {
     }
   }
 
+  private async persistPreservedWorktreePath(sessionId: string, path: string | undefined): Promise<void> {
+    if (!path) return
+    await this.store.withRecordLock(sessionId, async (record, write) => {
+      if (!record || record.preservedWorktreePath === path) return
+      await write({ ...record, preservedWorktreePath: path, updatedAt: this.now().toISOString() })
+    })
+  }
+
+  private async verifyPreservedWorktree(record: SandboxRecord): Promise<void> {
+    if (!record.preservedWorktreePath || !this.gitInspect) {
+      throw new SandboxError("inspect", "preserved Git worktree cannot be verified", "PRESERVATION_UNVERIFIED")
+    }
+    try {
+      const observation = await withTimeout(this.gitInspect(record, record.preservedWorktreePath), INSPECTION_TIMEOUT_MS, "Git preservation inspection timed out")
+      if (!/^[a-f0-9]{40}$/i.test(observation.head ?? "")) throw new Error("Git worktree HEAD is unavailable")
+    } catch {
+      throw new SandboxError("inspect", "preserved Git worktree cannot be verified", "PRESERVATION_UNVERIFIED")
+    }
+  }
+
   private async cleanupWorkspace(record: SandboxRecord, destroy = false): Promise<void> {
     let failure: unknown
     try {
@@ -1079,8 +1438,7 @@ export class LifecycleController {
   private async syncOut(record: SandboxRecord): Promise<void> {
     try {
       if (!this.workspace.syncOut) {
-        await this.waitForSync(record)
-        return
+        throw new SandboxError("sync", "workspace preservation is unavailable", record.state === "recovery_pending" ? "RECOVERY_PRESERVATION_UNVERIFIED" : "PRESERVATION_UNAVAILABLE")
       }
 
       const result = await this.workspace.syncOut({
@@ -1121,6 +1479,18 @@ function failureStage(error: unknown): string {
   return "reconcile"
 }
 
+function failureDetails(error: unknown, message = redactError(error)): NonNullable<SandboxRecord["lastError"]> {
+  return {
+    code: error instanceof SandboxError ? error.code : "SANDBOX_ERROR",
+    stage: failureStage(error),
+    message,
+  }
+}
+
+function preservedPathFrom(error: unknown): string | undefined {
+  return isRecord(error) && typeof error.preservedWorktreePath === "string" ? error.preservedWorktreePath : undefined
+}
+
 function failedOperation(record: SandboxRecord, error: unknown, sandcastle: boolean): SandboxRecord["operation"] {
   if (!record.operation) return undefined
   return failureState(error, sandcastle) === "orphaned" ? { ...record.operation, phase: "orphaned" } : record.operation
@@ -1139,7 +1509,7 @@ function nonSecretDetails(value: unknown): Record<string, unknown> {
 function nonSecretValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(nonSecretValue)
   if (isRecord(value)) return nonSecretDetails(value)
-  return typeof value === "string" ? redactText(value) : value
+  return typeof value === "string" ? safePublicText(value) : value
 }
 
 function boundedDetails(details: Record<string, unknown>): Record<string, unknown> {
@@ -1148,7 +1518,7 @@ function boundedDetails(details: Record<string, unknown>): Record<string, unknow
 }
 
 function boundedText(value: string): { value: string; truncated: boolean } {
-  const redacted = redactText(value)
+  const redacted = safePublicText(value)
   const bytes = Buffer.from(redacted)
   if (bytes.byteLength <= MAX_DIAGNOSTIC_BYTES) return { value: redacted, truncated: false }
   const suffix = "\n[truncated]"
@@ -1172,7 +1542,8 @@ function sameRetryRecord(current: SandboxRecord, expected: SandboxRecord): boole
     current.updatedAt === expected.updatedAt &&
     current.operation?.kind === expected.operation?.kind &&
     current.operation?.phase === expected.operation?.phase &&
-    current.operation?.force === expected.operation?.force
+    current.operation?.force === expected.operation?.force &&
+    current.operation?.providerDestroyed === expected.operation?.providerDestroyed
   )
 }
 
@@ -1230,33 +1601,125 @@ function workspaceMetadata(value: unknown): { providerState?: Record<string, unk
   return { providerState, vmName, vmIdentity: identity }
 }
 
-function successResponse(operation: "start" | "stop" | "status" | "delete" | "logs" | "diagnose" | "retry", record: SandboxRecord | undefined, message: string, details?: Record<string, unknown>): SandboxResponse {
+interface ResultOptions {
+  role?: CapabilityRole
+  record?: SandboxRecord
+  ok?: boolean
+  observations?: SandboxObservation[]
+  effectiveTarget?: SandboxResultV2["effectiveTarget"]
+  classification?: SandboxResultV2["classification"]
+  work?: SandboxResultV2["work"]
+  allowedActions?: SandboxAllowedAction[]
+  recommendedAction?: SandboxResultV2["recommendedAction"]
+  error?: SandboxResultV2["error"]
+  captureAvailable?: boolean
+  contextAvailable?: boolean
+  mutationsAllowed?: boolean
+}
+
+interface Probe<T> {
+  observation: SandboxObservation
+  value?: T
+  error?: unknown
+}
+
+function successResponse(
+  operation: PublicOperation,
+  record: SandboxRecord | undefined,
+  message: string,
+  details?: Record<string, unknown>,
+  role: CapabilityRole = "host",
+  options: Omit<ResultOptions, "record" | "role"> = {},
+): SandboxResponse {
   const responseDetails = { ...recordDetails(record), ...(details ?? {}) }
-  return {
-    ok: true,
-    operation,
+  return boundResponse({
+    ...baseResult(operation, true, message, { ...options, record, role }),
     state: record?.state ?? (operation === "delete" ? "deleted" : "local"),
     sessionId: record?.sessionId,
     workspaceId: record?.workspaceId,
     vm: record?.vmName,
-    message,
     ...(Object.keys(responseDetails).length > 0 ? { details: responseDetails } : {}),
-  }
+  })
 }
 
-function failureResponse(operation: "start" | "stop" | "status" | "delete" | "logs" | "diagnose" | "retry", state: SandboxRecord["state"] | "error", stage: string, message: string, record?: SandboxRecord): SandboxResponse {
+function failureResponse(
+  operation: PublicOperation,
+  state: SandboxRecord["state"] | "error",
+  stage: string,
+  message: string,
+  record?: SandboxRecord,
+  error?: unknown,
+  role: CapabilityRole = "host",
+  options: Omit<ResultOptions, "record" | "role"> = {},
+): SandboxResponse {
   const responseDetails = recordDetails(record)
-  return {
-    ok: false,
-    operation,
+  const responseError = error ? publicError(error) : recordedError(record) ?? publicError(new SandboxError(stage, message))
+  return boundResponse({
+    ...baseResult(operation, false, message, {
+      record,
+      role,
+      error: responseError,
+      ...options,
+    }),
     state,
     stage,
     sessionId: record?.sessionId,
     workspaceId: record?.workspaceId,
     vm: record?.vmName,
-    message,
     diagnosticOperation: "diagnose",
     ...(Object.keys(responseDetails).length > 0 ? { details: responseDetails } : {}),
+  })
+}
+
+function boundResponse(response: SandboxResponse): SandboxResponse {
+  if (Buffer.byteLength(JSON.stringify(response)) < MAX_RESPONSE_BYTES) return response
+  const { details: _details, ...withoutDetails } = response
+  const base = { ...withoutDetails, message: "response exceeded the control-channel size limit" }
+  const previewSource = response.details === undefined ? response.message : JSON.stringify(response.details)
+  const preview = boundedText(previewSource).value
+  const bounded = { ...base, details: { truncated: true, preview } }
+  if (Buffer.byteLength(JSON.stringify(bounded)) < MAX_RESPONSE_BYTES) return bounded
+  return {
+    ...baseResult(response.operation, false, "response exceeded the control-channel size limit", {
+      observations: emptyObservations(new Date()),
+      classification: "unknown",
+      work: emptyWork(),
+      allowedActions: [],
+      recommendedAction: null,
+      error: { code: "RESPONSE_LIMIT", stage: "control_channel", retryable: false },
+    }),
+    state: "error",
+    stage: "control_channel",
+  }
+}
+
+function baseResult(operation: PublicOperation, ok: boolean, message: string, options: ResultOptions = {}): SandboxResultV2 {
+  const record = options.record
+  const role = options.role ?? "host"
+  const now = new Date()
+  const observations = options.observations ?? recordOnlyObservations(record, now)
+  const classification = options.classification ?? recordOnlyClassification(record)
+  const provider = observations.find((observation) => observation.source === "provider")
+  const captureAvailable = options.captureAvailable ?? false
+  const contextAvailable = options.contextAvailable ?? false
+  const mutationsAllowed = options.mutationsAllowed ?? false
+  return {
+    schemaVersion: 2,
+    requestId: cryptoRandomUuid(),
+    ok: options.ok ?? ok,
+    operation,
+    message: safePublicText(message),
+    session: sessionFor(record),
+    intent: intentFor(record),
+    effectiveTarget: options.effectiveTarget ?? null,
+    observations,
+    classification,
+    work: options.work ?? workFromRecord(record, classification),
+    allowedActions: options.allowedActions ?? allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed),
+    recommendedAction: options.recommendedAction === undefined
+      ? recommendedAction(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed)
+      : options.recommendedAction,
+    error: options.error === undefined ? recordedError(record) : options.error,
   }
 }
 
@@ -1269,4 +1732,495 @@ function recordDetails(record: SandboxRecord | undefined): Record<string, unknow
     ...(Object.keys(recoveryMetadata).length > 0 ? { recoveryMetadata } : {}),
     ...(record.preservedWorktreePath ? { preservedWorktreePath: record.preservedWorktreePath } : {}),
   }
+}
+
+function sessionFor(record: SandboxRecord | undefined): SandboxResultV2["session"] {
+  if (!record || !isPublicProvider(record.provider)) return null
+  return {
+    projectId: record.projectId,
+    sessionId: record.sessionId,
+    workspaceId: record.workspaceId,
+    generation: record.generation,
+    provider: record.provider,
+  }
+}
+
+function intentFor(record: SandboxRecord | undefined): SandboxResultV2["intent"] {
+  if (!record) return { desiredLocation: "local", phase: "idle" }
+  let desiredLocation: SandboxResultV2["intent"]["desiredLocation"]
+  if (record.operation?.kind === "delete" || record.state === "delete_pending" || record.state === "deleted") desiredLocation = "deleted"
+  else if (record.operation?.kind === "stop" || record.state === "stop_pending" || record.state === "detached" || record.state === "local") desiredLocation = "local"
+  else desiredLocation = "remote"
+
+  let phase: SandboxResultV2["intent"]["phase"] = "idle"
+  if (record.state === "provisioning") phase = "provisioning"
+  else if (record.state === "activation_pending") phase = "activating"
+  else if (record.state === "stop_pending") phase = "detaching"
+  else if (record.state === "delete_pending") phase = "deleting"
+  else if (record.state === "sync_failed") phase = "syncing"
+  else if (record.state === "recovery_pending") {
+    phase = record.operation?.kind === "start" ? "activating" : record.operation?.kind === "stop" ? "detaching" : record.operation?.kind === "delete" ? "deleting" : "idle"
+  }
+  return { desiredLocation, phase }
+}
+
+function recordOnlyObservations(record: SandboxRecord | undefined, now: Date): SandboxObservation[] {
+  const freshAt = now.toISOString()
+  return [
+    recordObservation(record),
+    ...["handle", "workspace", "provider", "git"].map((source) => ({
+      source: source as SandboxObservation["source"],
+      observed: false,
+      freshAt,
+      evidence: [],
+    })),
+  ]
+}
+
+function emptyObservations(now: Date): SandboxObservation[] {
+  const freshAt = now.toISOString()
+  return [
+    {
+      source: "record",
+      observed: true,
+      freshAt,
+      resource: "absent",
+      ownership: "unknown",
+      health: "unknown",
+      evidence: ["no lifecycle record"],
+    },
+    ...["handle", "workspace", "provider", "git"].map((source) => ({
+      source: source as SandboxObservation["source"],
+      observed: false,
+      freshAt,
+      evidence: [],
+    })),
+  ]
+}
+
+function recordObservation(record: SandboxRecord | undefined): SandboxObservation {
+  if (!record) {
+    return {
+      source: "record",
+      observed: true,
+      freshAt: new Date().toISOString(),
+      resource: "absent",
+      ownership: "unknown",
+      health: "unknown",
+      evidence: ["no lifecycle record"],
+    }
+  }
+  return {
+    source: "record",
+    observed: true,
+    freshAt: record.updatedAt,
+    resource: "present",
+    ownership: "unknown",
+    health: "unknown",
+    evidence: [`state record:${record.sessionId}`],
+  }
+}
+
+function recordOnlyClassification(record: SandboxRecord | undefined): SandboxResultV2["classification"] {
+  return "unknown"
+}
+
+function workFromRecord(record: SandboxRecord | undefined, classification: SandboxResultV2["classification"]): SandboxResultV2["work"] {
+  if (!record) return emptyWork()
+  const failed = record.state === "sync_failed"
+  return {
+    captureBaseSha: record.baseSha,
+    runtimeHead: null,
+    sync: failed ? "failed" : "unknown",
+    preservation: record.operation?.force || isForceDelete(record)
+      ? "discard_authorized"
+      : classification === "clean" && !record.preservedWorktreePath ? "not_needed" : "at_risk",
+    preservedWorktreePath: record.preservedWorktreePath ?? null,
+  }
+}
+
+function emptyWork(): SandboxResultV2["work"] {
+  return {
+    captureBaseSha: null,
+    runtimeHead: null,
+    sync: "unknown",
+    preservation: "not_needed",
+    preservedWorktreePath: null,
+  }
+}
+
+function allowedActions(
+  record: SandboxRecord | undefined,
+  role: CapabilityRole,
+  classification: SandboxResultV2["classification"],
+  provider: SandboxObservation | undefined,
+  captureAvailable: boolean,
+  contextAvailable = false,
+  mutationsAllowed = true,
+  preservationVerified = false,
+): SandboxAllowedAction[] {
+  const actions: SandboxAllowedAction[] = [
+    action("status", role, [], [], "none"),
+    action("inspect", role, [], [], "none"),
+  ]
+  if (record) {
+    actions.push(action("logs", role, [], ["session record exists"], "none"))
+    actions.push(action("diagnose", role, [], ["session record exists"], "none"))
+  }
+  if (!record) {
+    if (mutationsAllowed && captureAvailable && contextAvailable && role === "host") actions.push(action("start", "host", [], ["host capability", "session context is available", "working tree is available"], "none"))
+    return actions
+  }
+
+  if (mutationsAllowed && classification === "attached" && record.state === "remote") {
+    actions.push(action("stop", role, [], ["runtime is attached", "preserve runtime changes before detaching"], "session_idle"))
+    actions.push(action("delete", role, [], ["preserve runtime changes before deletion"], "session_idle"))
+  }
+  if (
+    mutationsAllowed &&
+    classification === "leaked_resource" &&
+    record.state === "detached" &&
+    provider?.observed === true &&
+    provider.resource === "present" &&
+    provider?.ownership === "verified" &&
+    (preservationVerified || record.operation?.force)
+  ) {
+    actions.push(action("delete", "host", [], ["provider ownership is verified", "Git preservation is verified or explicitly discarded"], "operation_completion"))
+  }
+  if (
+    mutationsAllowed &&
+    (record.state === "error" || record.state === "sync_failed" || record.state === "recovery_pending") &&
+    record.operation &&
+    ["start", "stop", "delete"].includes(record.operation.kind)
+  ) {
+    const requiredRole = record.operation?.kind === "start" || isForceDelete(record) ? "host" : role
+    if (classification !== "conflict") actions.push(action("retry", requiredRole, [], ["recorded operation is retryable"], "operation_completion"))
+  }
+  if (
+    mutationsAllowed &&
+    classification === "clean" &&
+    (record.state === "local" || record.state === "detached") &&
+    provider?.observed === true &&
+    provider.resource === "absent" &&
+    role === "host" &&
+    captureAvailable &&
+    contextAvailable
+  ) {
+    actions.push(action("start", "host", [], ["no observed runtime requires preservation", "session context is available", "working tree is available"], "none"))
+  }
+  return actions
+}
+
+function recommendedAction(
+  record: SandboxRecord | undefined,
+  role: CapabilityRole,
+  classification: SandboxResultV2["classification"],
+  provider: SandboxObservation | undefined,
+  captureAvailable: boolean,
+  contextAvailable = false,
+  mutationsAllowed = true,
+  preservationVerified = false,
+): SandboxResultV2["recommendedAction"] {
+  const actions = allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed, preservationVerified)
+  const can = (operation: PublicOperation, requiredRole?: CapabilityRole) => actions.some((item) => item.operation === operation && (!requiredRole || item.role === requiredRole))
+  if (classification === "attached" && can("stop")) return { operation: "stop", reasonCode: "ATTACHED_RUNTIME" }
+  if (classification === "leaked_resource" && can("delete", "host")) return { operation: "delete", reasonCode: "VERIFIED_LEAK" }
+  if (classification === "leaked_resource") return { operation: "inspect", reasonCode: "PRESERVATION_UNVERIFIED" }
+  if (classification === "work_at_risk" && can("retry")) return { operation: "retry", reasonCode: "WORK_AT_RISK" }
+  if (classification === "clean" && can("start", "host")) return { operation: "start", reasonCode: "NO_RUNTIME" }
+  if (classification === "control_lost") return { operation: "inspect", reasonCode: "RESOURCE_STATE_UNKNOWN" }
+  if (classification === "stale_record") return { operation: "inspect", reasonCode: "STALE_RECORD_NEEDS_EVIDENCE" }
+  if (classification === "orphan") return { operation: "inspect", reasonCode: "VERIFIED_ORPHAN_READ_ONLY" }
+  if (classification === "conflict") return { operation: "inspect", reasonCode: "OWNERSHIP_CONFLICT" }
+  if (classification === "unknown" && can("inspect")) return { operation: "inspect", reasonCode: "INSUFFICIENT_EVIDENCE" }
+  return null
+}
+
+function action(
+  operation: PublicOperation,
+  role: CapabilityRole,
+  args: string[],
+  preconditions: string[],
+  waitFor: SandboxAllowedAction["waitFor"],
+): SandboxAllowedAction {
+  return { operation, role, arguments: args, preconditions, waitFor }
+}
+
+function publicError(error: unknown): NonNullable<SandboxResultV2["error"]> {
+  const sandboxError = error instanceof SandboxError ? error : undefined
+  const stage = sandboxError?.stage ?? "inspect"
+  const code = sandboxError?.code ?? "SANDBOX_ERROR"
+  return { code, stage, retryable: retryableError(code, stage) }
+}
+
+function recordedError(record: SandboxRecord | undefined): SandboxResultV2["error"] {
+  if (!record?.lastError) return null
+  const code = record.lastError.code ?? "RECORDED_ERROR"
+  return { code, stage: record.lastError.stage, retryable: retryableError(code, record.lastError.stage) }
+}
+
+function retryableError(code: string, stage: string): boolean {
+  return stage !== "validate" && !["STATE_SECRET", "STATE_OWNER", "STATE_MODE", "STATE_FILE", "STATE_SCHEMA"].includes(code)
+}
+
+function isPublicProvider(value: string): value is "exedev" | "sbx" | "cloudflare" {
+  return value === "exedev" || value === "sbx" || value === "cloudflare"
+}
+
+function providerObservation(value: ProviderResourceObservation, freshAt: string): SandboxObservation {
+  const resource = safeProviderResource(value)
+  return {
+    source: "provider",
+    observed: true,
+    freshAt,
+    resource: resource.resource,
+    ownership: resource.ownership,
+    health: resource.health,
+    evidence: resource.evidence,
+  }
+}
+
+function safeProviderResource(value: ProviderResourceObservation): ProviderResourceObservation {
+  return {
+    resourceId: safeResourceId(value.resourceId),
+    ...(value.projectId ? { projectId: safeResourceId(value.projectId) } : {}),
+    resource: value.resource,
+    ownership: value.ownership,
+    health: value.health,
+    evidence: safeEvidence(value.evidence),
+  }
+}
+
+function aggregateInventoryHealth(resources: readonly ProviderResourceObservation[]): ProviderResourceObservation["health"] {
+  if (resources.length === 0 || resources.some((resource) => resource.resource !== "present" || resource.health === "unknown")) return "unknown"
+  if (resources.some((resource) => resource.health === "degraded")) return "degraded"
+  return resources.every((resource) => resource.health === "healthy") ? "healthy" : "unknown"
+}
+
+function unknownObservation(source: SandboxObservation["source"], freshAt: string, evidence: string): SandboxObservation {
+  return {
+    source,
+    observed: true,
+    freshAt,
+    resource: "unknown",
+    ownership: "unknown",
+    health: "unknown",
+    evidence: safeEvidence([evidence]),
+  }
+}
+
+function workspaceMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
+  if (info.id !== record.workspaceId || info.projectID !== record.projectId || info.type !== record.provider || info.branch !== record.branch) return false
+  const extra = isRecord(info.extra) ? info.extra : {}
+  const state = isRecord(extra.providerState) ? extra.providerState : extra
+  for (const [key, expected] of [
+    ["sessionId", record.sessionId],
+    ["generation", record.generation],
+    ["workspaceId", record.workspaceId],
+    ["projectId", record.projectId],
+    ["provider", record.provider],
+  ] as const) {
+    const actual = extra[key] ?? state[key]
+    if (actual !== undefined && actual !== expected) return false
+  }
+  return true
+}
+
+function classifySituation(record: SandboxRecord, observations: SandboxObservation[]): SandboxResultV2["classification"] {
+  const provider = observations.find((observation) => observation.source === "provider")
+  const handle = observations.find((observation) => observation.source === "handle")
+  const workspace = observations.find((observation) => observation.source === "workspace")
+  if (observations.some((observation) => observation.ownership === "conflict")) return "conflict"
+  if (record.state === "sync_failed") return "work_at_risk"
+
+  const present = provider?.observed === true && provider.resource === "present" && provider.ownership === "verified"
+  const absent = provider?.observed === true && provider.resource === "absent"
+  const handlePresent = handle?.observed === true && handle.resource === "present"
+  const handleAbsent = handle?.observed === true && handle.resource === "absent"
+  const workspaceAbsent = workspace?.observed === true && workspace.resource === "absent"
+  const desired = intentFor(record).desiredLocation
+  if (handlePresent && present && provider.health !== "unknown") return "attached"
+  if (handlePresent) return "unknown"
+  if (!provider?.observed || provider.resource === "unknown") {
+    return record.state === "local" || record.state === "detached" || record.state === "deleted" ? "unknown" : "control_lost"
+  }
+  if (provider.resource === "present" && provider.ownership !== "verified") return "unknown"
+  if (handleAbsent && present) return desired === "local" || desired === "deleted" ? "leaked_resource" : "orphan"
+  if (handleAbsent && record.state !== "local" && record.state !== "detached" && record.state !== "deleted") {
+    if (absent && workspaceAbsent) return "stale_record"
+    return "control_lost"
+  }
+  if (absent && workspaceAbsent && handleAbsent) return "clean"
+  return "unknown"
+}
+
+function workFromInspection(
+  record: SandboxRecord,
+  git: GitWorkingTreeObservation | undefined,
+  classification: SandboxResultV2["classification"],
+): SandboxResultV2["work"] {
+  const base = workFromRecord(record, classification)
+  const preservation = record.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(git?.head ?? "")
+    ? "preserved"
+    : record.operation?.force || isForceDelete(record)
+      ? "discard_authorized"
+      : ["control_lost", "orphan", "leaked_resource", "work_at_risk", "unknown"].includes(classification)
+        ? "at_risk"
+        : "not_needed"
+  return {
+    ...base,
+    runtimeHead: git?.head ?? null,
+    sync: record.state === "sync_failed" ? "failed" : git?.dirty === true ? "dirty" : git?.dirty === false ? "clean" : base.sync,
+    preservation,
+    preservedWorktreePath: record.preservedWorktreePath ?? null,
+  }
+}
+
+function effectiveTargetFor(
+  record: SandboxRecord,
+  runtimeTarget: WorkspaceTarget | undefined,
+  workspace: WorkspaceInfo | undefined,
+  providerValue: ProviderResourceObservation | undefined,
+  provider: SandboxObservation,
+  handle: SandboxObservation,
+): SandboxResultV2["effectiveTarget"] {
+  if (handle.observed && handle.resource === "present") {
+    const target = runtimeTarget
+    if (!target) return null
+    if (target.type === "local") return { kind: "local", directory: target.directory }
+    if (provider.resource !== "present" || provider.ownership !== "verified" || !providerValue?.resourceId) return null
+    return { kind: "remote", resourceId: safeResourceId(providerValue.resourceId) }
+  }
+  if (handle.observed && handle.resource === "unknown") return null
+  if (record.state !== "local" || !workspace || !workspaceMatches(record, workspace) || workspace.directory !== record.directory) return null
+  return { kind: "local", directory: record.directory }
+}
+
+interface TargetProbe {
+  observed: boolean
+  value?: WorkspaceTarget
+  error?: unknown
+}
+
+function runtimeHandleObservation(
+  session: SandcastleSession | undefined,
+  target: TargetProbe,
+  freshAt: string,
+): SandboxObservation {
+  if (target.error) {
+    return {
+      source: "handle",
+      observed: true,
+      freshAt,
+      resource: "unknown",
+      ownership: "unknown",
+      health: "unknown",
+      evidence: [`runtime target inspection failed:${errorCode(target.error)}`],
+      }
+  }
+  if (!target.observed) {
+    return {
+      source: "handle",
+      observed: false,
+      freshAt,
+      evidence: ["runtime target inspection is unavailable"],
+    }
+  }
+  if (session) {
+    return {
+      source: "handle",
+      observed: true,
+      freshAt,
+      resource: "present",
+      ownership: "verified",
+      health: "unknown",
+      evidence: ["in-memory runtime handle"],
+    }
+  }
+  if (target.value) {
+    return {
+      source: "handle",
+      observed: true,
+      freshAt,
+      resource: "present",
+      ownership: "verified",
+      health: "unknown",
+      evidence: ["direct provider runtime target"],
+    }
+  }
+  return {
+    source: "handle",
+    observed: true,
+    freshAt,
+    resource: "absent",
+    ownership: "unknown",
+    health: "unknown",
+    evidence: ["no in-memory runtime handle"],
+  }
+}
+
+function inventoryRecord(record: SandboxRecord): Record<string, unknown> {
+  const result: Record<string, unknown> = {
+    sessionId: record.sessionId,
+    projectId: record.projectId,
+    workspaceId: record.workspaceId,
+    generation: record.generation,
+    provider: record.provider,
+    state: record.state,
+    branch: record.branch,
+    baseSha: record.baseSha,
+  }
+  if (record.preservedWorktreePath) result.preservedWorktreePath = record.preservedWorktreePath
+  const providerState = boundedDetails(nonSecretDetails(record.providerState))
+  if (Object.keys(providerState).length > 0) result.providerState = providerState
+  return result
+}
+
+function boundedItems<T>(values: readonly T[], maxBytes: number): { values: T[]; truncated: boolean } {
+  const result: T[] = []
+  let bytes = 0
+  for (const value of values) {
+    const size = Buffer.byteLength(JSON.stringify(value))
+    if (bytes + size > maxBytes) return { values: result, truncated: true }
+    result.push(value)
+    bytes += size
+  }
+  return { values: result, truncated: false }
+}
+
+function safeEvidence(values: readonly unknown[]): string[] {
+  const output: string[] = []
+  let bytes = 0
+  for (const value of values.slice(0, 8)) {
+    const text = safePublicText(String(value)).slice(0, 256)
+    const size = Buffer.byteLength(text)
+    if (bytes + size > 4_096) break
+    output.push(text)
+    bytes += size
+  }
+  return output
+}
+
+function safeResourceId(value: string): string {
+  const text = safePublicText(value).slice(0, 128)
+  return text || "unknown"
+}
+
+function safePublicText(value: string): string {
+  return redactText(value).replace(/https?:\/\/[^\s]+/gi, "[REDACTED_URL]")
+}
+
+function errorCode(error: unknown): string {
+  return error instanceof SandboxError ? error.code : "SANDBOX_ERROR"
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new SandboxError("inspect", message, "INSPECTION_TIMEOUT")), timeoutMs)
+    promise.then(resolve, reject).finally(() => clearTimeout(timer)).catch(() => undefined)
+  })
+}
+
+function cryptoRandomUuid(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
 }

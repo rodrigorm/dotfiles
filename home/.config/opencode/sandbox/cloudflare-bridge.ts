@@ -387,10 +387,12 @@ async function parseSseStream(response: Response, onLine?: (line: string) => voi
   let pendingLine = ""
   let exitCode: number | null | undefined
   let outputBytes = 0
+  let eventDataBytes = 0
 
   const consume = () => {
     if (!event) {
       data = []
+      eventDataBytes = 0
       return
     }
     const value = data.join("\n")
@@ -429,27 +431,50 @@ async function parseSseStream(response: Response, onLine?: (line: string) => voi
     }
     event = ""
     data = []
+    eventDataBytes = 0
   }
 
   try {
     while (true) {
       const next = await reader.read()
       if (next.done) break
-      buffer += decoder.decode(next.value, { stream: true })
+      const chunk = decoder.decode(next.value, { stream: true })
+      if (Buffer.byteLength(buffer) + Buffer.byteLength(chunk) > MAX_RESPONSE_BYTES) {
+        throw new SandboxError("control_channel", "Cloudflare command output is too large", "CLOUDFLARE_RESPONSE_LIMIT")
+      }
+      buffer += chunk
       let newline = buffer.indexOf("\n")
       while (newline >= 0) {
         const line = buffer.slice(0, newline).replace(/\r$/, "")
         buffer = buffer.slice(newline + 1)
         if (line === "") consume()
         else if (line.startsWith("event:")) event = line.slice("event:".length).trim()
-        else if (line.startsWith("data:")) data.push(line.slice("data:".length).trimStart())
+        else if (line.startsWith("data:")) {
+          const value = line.slice("data:".length).trimStart()
+          eventDataBytes += Buffer.byteLength(value)
+          if (eventDataBytes > MAX_RESPONSE_BYTES) {
+            throw new SandboxError("control_channel", "Cloudflare command output is too large", "CLOUDFLARE_RESPONSE_LIMIT")
+          }
+          data.push(value)
+        }
         newline = buffer.indexOf("\n")
       }
     }
-    buffer += decoder.decode()
+    const remainder = decoder.decode()
+    if (Buffer.byteLength(buffer) + Buffer.byteLength(remainder) > MAX_RESPONSE_BYTES) {
+      throw new SandboxError("control_channel", "Cloudflare command output is too large", "CLOUDFLARE_RESPONSE_LIMIT")
+    }
+    buffer += remainder
     if (buffer) {
       if (buffer.startsWith("event:")) event = buffer.slice("event:".length).trim()
-      else if (buffer.startsWith("data:")) data.push(buffer.slice("data:".length).trimStart())
+      else if (buffer.startsWith("data:")) {
+        const value = buffer.slice("data:".length).trimStart()
+        eventDataBytes += Buffer.byteLength(value)
+        if (eventDataBytes > MAX_RESPONSE_BYTES) {
+          throw new SandboxError("control_channel", "Cloudflare command output is too large", "CLOUDFLARE_RESPONSE_LIMIT")
+        }
+        data.push(value)
+      }
     }
     consume()
   } catch (error) {
