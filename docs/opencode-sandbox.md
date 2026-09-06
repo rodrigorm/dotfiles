@@ -107,7 +107,7 @@ Every normal control response is a `SandboxResultV2` with `schemaVersion: 2`. Th
 | `recommendedAction` | One allowed operation plus a reason code, or `null` when no safe recommendation exists. It is a recommendation, not permission to invent another operation. |
 | `error` | `null` or a stable code, stage, and retryability flag. Probe failures are represented as unknown evidence rather than guessed facts. |
 
-`status` and `inspect` use session capabilities. `inventory` uses a host-only project capability; remote capabilities cannot request it. Inventory details contain bounded `records` and `providerResources` arrays. The CLI still exposes the compatibility fields `state`, `stage`, and non-secret `details` where present. `recover` and `repair` are reserved result vocabulary, not current `sandboxctl` commands.
+`status` and `inspect` use session capabilities. `inventory` uses a host-only project capability; remote capabilities cannot request it. `recover`, `repair`, and verified-orphan deletion use host session capabilities and are host-only. Inventory details contain bounded `records` and `providerResources` arrays. The CLI still exposes the compatibility fields `state`, `stage`, and non-secret `details` where present. `recover` and orphan deletion are available only when an injected runtime driver and fresh inspection prove their preconditions; `repair` remains the stale-control-plane operation.
 
 ### Observation budgets
 
@@ -118,7 +118,7 @@ Every normal control response is a `SandboxResultV2` with `schemaVersion: 2`. Th
 | Project `inventory` | One lifecycle-record scan and one configured-provider listing; no per-resource deep probes | Provider listing has a 10-second deadline. Records remain available if provider inventory fails; provider scope is unknown when resources cannot be tied to the requested project. |
 | `diagnose` | Explicit configured diagnostics, separate from `inspect` | The lifecycle controller supplies no generic probe-count or wall-clock budget for diagnostics. Returned details are still redacted and bounded; an unconfigured hook returns `{ "configured": false }`. |
 
-Provider inspection is currently available through the exe.dev and SBX adapters. SBX inspection checks an exact inventory match and its ownership marker; exe.dev inspection checks an exact durable VM identity and owner tag. Cloudflare has no resource inspection or inventory adapter in this phase, so its provider source cannot establish presence, health, or ownership.
+Provider inspection is currently available through the exe.dev and SBX adapters. SBX inspection checks an exact inventory match and its ownership marker; exe.dev inspection checks an exact durable VM identity and owner tag. The `RuntimeDriver` seam has five methods: `inspect`, `adopt`, `sync`, `close`, and `destroy`. The default SBX and exe.dev Sandcastle factories wire production drivers: recovery requires one exact live inventory entry, durable ownership proof, and a safe matching checkout; SBX also requires its published OpenCode port, while exe.dev rebuilds a fresh SSH supervisor and tunnel. Cloudflare has no resource inspection, inventory, or runtime-adoption adapter, so it remains unsupported for recovery.
 
 ### Classifications and actions
 
@@ -127,14 +127,14 @@ Provider inspection is currently available through the exe.dev and SBX adapters.
 | `clean` | Provider, runtime handle, and workspace are all observed absent for a local, detached, or deleted record | `start` may be advertised only to a host with session context and capture available; otherwise read-only inspection remains the choice. |
 | `attached` | Runtime handle is present, provider resource is present and ownership-verified, and provider health is known | `stop` is recommended; normal `stop` or `delete` waits for session idle and preserves work first. |
 | `control_lost` | A non-local record has no handle and provider state is unavailable or unknown | Inspect only; do not treat `remote` or `orphaned` state as proof that the resource exists or stopped. |
-| `orphan` | Handle is absent, provider resource is present, ownership is verified, and the desired location is remote | Read-only `inspect` only in Phase 1. Recovery, adoption, and destruction are deferred. |
-| `stale_record` | A non-local record has observed absence of its provider resource, handle, and workspace | Inspect only; `repair` is deferred. |
+| `orphan` | Handle is absent, provider resource is present, ownership is verified, and the desired location is remote | Host `recover` can adopt the exact resource without destruction; host `delete` can adopt it, preserve or explicitly discard its work, remove the exact workspace, and then destroy it. |
+| `stale_record` | A non-local record has observed absence of its provider resource, handle, and workspace | Host `repair` is allowed only when those observations are fresh and workspace ownership is absent or exact; otherwise inspect. |
 | `leaked_resource` | Desired location is local or deleted, handle is absent, and a provider resource is present with verified ownership | Host `delete` is allowed only after preservation is verified or discard was explicitly recorded; otherwise inspect. |
 | `conflict` | Any ownership evidence conflicts | Read-only actions only. |
 | `work_at_risk` | The recorded state is `sync_failed` | Retry the recorded operation when it is present and allowed; preserve work before any discard. |
 | `unknown` | Required evidence is missing, unavailable, or inconsistent without a more specific safe classification | Inspect again or require an operator; no inferred provider action. |
 
-The action list is authoritative. `recommendedAction` must be present in `allowedActions` when non-null. A post-restart active or control-lost runtime cannot be adopted, recovered, repaired, or destroyed through `sandboxctl` in Phase 1. A detached leaked resource is the narrower exception: it can be deleted after inspection proves ownership and preservation, but that is not post-restart recovery.
+The action list is authoritative. `recommendedAction` must be present in `allowedActions` when non-null. A post-restart active or control-lost runtime can be recovered or deleted only through an injected runtime driver after exact resource and ownership verification; Cloudflare remains explicitly unsupported. Host `repair` can reconcile only a stale control-plane record after fresh provider and runtime-handle absence plus an absent or exactly owned workspace registration. Orphan deletion adopts before preservation, rechecks ownership immediately before destruction, and persists the destruction phase so retries do not repeat it. Recovery itself never destroys a provider resource.
 
 ### Output bounds
 
@@ -159,7 +159,7 @@ local -> provisioning -> activation_pending -> remote
 failures -> error | sync_failed | recovery_pending | orphaned
 ```
 
-The states currently mix stable location, transition phase, and failure classification. `orphaned` is terminal in the current state machine. The current reconciliation code assigns it when a lifecycle record looks active but the new plugin instance has no in-memory session handle. Reconciliation itself performs no provider observation, so the label proves control was lost, not that the runtime still exists. The target model reserves `orphan` for a resource that was actually observed.
+The states currently mix stable location, transition phase, and failure classification. `orphaned` is a recovery and deletion gate in the current state machine; explicit host-authorized recovery can move it to `recovery_pending`, while verified deletion can move it to `delete_pending` only after fresh ownership evidence. Startup reconciliation now reads a bounded observation plan before any recovery mutation, revalidates the record identity, generation, and `updatedAt` under lock, and marks a Sandcastle record orphaned only when provider presence and ownership are observed; a missing handle alone remains unchanged. A proved stale record is repaired explicitly to `local` or `detached`, with no provider mutation.
 
 ### Start
 
@@ -181,15 +181,15 @@ The command returns while activation is pending. The next message runs remotely 
 
 ### Delete
 
-Normal deletion attempts to preserve changes before destruction. `delete --force` is host-only and is limited to a detached runtime or explicit discard after sync failure. SBX and Cloudflare block unknown ownership even when force is requested. A control-lost resource still requires the operator preflight in the runbook because automatic recovery and adoption are not available.
+Normal deletion attempts to preserve changes before destruction. A verified orphan is adopted first, then synchronized, closed, removed from the exact workspace, freshly ownership-checked, and destroyed. `delete --force` is host-only and is limited to a detached runtime, an orphan after verified adoption, or explicit discard after sync failure; it may skip synchronization only after adoption. SBX and Cloudflare block unknown ownership even when force is requested. A control-lost resource requires a configured runtime driver for automatic recovery or deletion; otherwise use the operator preflight in the runbook.
 
 ### Recovery
 
-Non-Sandcastle pending states enter `recovery_pending` during plugin startup and replay their cleanup path. Sandcastle state still depends on an in-memory handle for control; after restart it becomes `orphaned`. Phase 1 inspection can verify SBX ownership from its durable marker and exe.dev ownership from durable VM identity, but Cloudflare has no provider inspection adapter. Recovery, adoption, repair, and destructive control of a post-restart control-lost runtime remain unavailable.
+Startup reconciliation does not replay a pending operation when its fresh observation plan is unknown or conflicting. Sandcastle state still depends on an in-memory handle for control; after restart, a missing handle remains control-lost unless provider presence and ownership are verified, in which case it may be recorded as `orphaned`. Host `recover` then performs a locked fresh preflight, adopts the exact resource through the runtime driver, routes the existing workspace, and persists `remote`; host `delete` uses the same adoption gate before preservation and destruction. Stale plans, failed adoption, preservation failures, and ownership changes remain inspectable and retryable without destruction. Host `repair` handles only the proved stale case: provider absent, handle absent, and workspace absent or exactly owned.
 
 ## Control and trust
 
-The plugin injects a short-lived capability into the shell environment. Session capabilities are scoped to one session generation and either the host or remote role; the host-only project capability is reserved for `inventory`. Both the CLI and lifecycle controller block remote `start`; retry cannot bypass that rule. `delete --force` is also host-only. The control channel accepts only loopback TCP, a private Unix socket, or the provider mailbox transport.
+The plugin injects a short-lived capability into the shell environment. Session capabilities are scoped to one session generation and either the host or remote role; the host-only project capability is reserved for `inventory`. Both the CLI and lifecycle controller block remote `start`, `recover`, and `repair`; retry cannot bypass those rules. `delete --force` is also host-only. The control channel accepts only loopback TCP, a private Unix socket, or the provider mailbox transport.
 
 State files reject credential-shaped keys, use private permissions, write atomically, and redact errors. Workspace metadata strips secret-shaped fields before it reaches OpenCode. Do not weaken these checks to improve diagnostics; diagnostics must expose evidence without credentials.
 
@@ -202,6 +202,8 @@ State files reject credential-shaped keys, use private permissions, write atomic
 | `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | No provider inspect or inventory adapter; provider observations stay unavailable or unknown |
 
 All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
+
+The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare additionally needs a bridge resource lookup returning the durable sandbox ID and owner tuple before it can support recovery; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map.
 
 ## Configuration
 
@@ -252,10 +254,10 @@ The Bun tests are the executable sandbox contract. `make test` validates the wid
 The current implementation has documented gaps, not hidden assumptions:
 
 - Plugin disposal syncs and closes owned remote Sandcastle sessions and cancels pending idle work, but it does not yet persist a provider-observed final state.
-- A restarted plugin cannot recover, adopt, or delete a control-lost runtime through `sandboxctl`; inspection is read-only. A detached, verified, preserved leak is the separate deletion path.
-- SBX ownership can be inspected after restart from its durable marker, and exe.dev from durable VM identity and owner metadata; mutation still requires the creating provider instance. Cloudflare has no provider inspection or inventory adapter and remains unknown-safe.
-- The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path recreates the runtime.
-- A missing Sandcastle handle during an in-progress deletion leaves the record orphaned; an already-detached deletion can finish workspace cleanup, while recovery and adoption remain unavailable.
+- The Cloudflare production factory does not yet inject a runtime driver, so restarted Cloudflare runtimes remain inspect-only. The bridge has no resource lookup that returns durable owner metadata, and the provider's ownership map is process-local; add that bridge contract before recovery can prove a persisted sandbox ID belongs to the session. The default SBX and exe.dev factories recover only running resources with exact durable ownership proof; a detached, verified, preserved leak is still the separate deletion path.
+- SBX ownership can be inspected after restart from its durable marker, and exe.dev from durable VM identity and owner metadata. Recovery and orphan deletion create only fresh local credentials, ports, and supervisors; provider mutation remains gated by exact ownership observations. Cloudflare has no provider inspection or inventory adapter and remains unknown-safe.
+- The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path can adopt an exact running runtime without recreating it, but stopped runtimes remain unsupported.
+- A missing Sandcastle handle during reconciliation remains unchanged when provider or workspace evidence is unavailable or conflicting; recovery remains unavailable without a runtime driver.
 - Provider cleanup failure before workspace registration can leave a resource whose ID never reached the lifecycle record.
 - Unsupported provider inspection returns unknown observations and no destructive action.
 - Default `diagnose` reports only that diagnostics are not configured.

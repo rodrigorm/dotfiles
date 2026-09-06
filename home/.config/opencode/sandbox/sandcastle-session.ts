@@ -9,7 +9,7 @@ import {
 
 import { redactError, redactText } from "./redaction"
 import { runSyncBarrier } from "./sync-barrier"
-import { SandboxError, type ProviderResourceObservation, type SessionContext, type WorkspaceTarget, type WorkingTreeCapture } from "./types"
+import { SandboxError, type ProviderResourceObservation, type RuntimeDriver, type RuntimeSession, type SessionContext, type WorkspaceTarget, type WorkingTreeCapture } from "./types"
 
 export interface OpenCodeSandboxAdapter {
   readonly provider: SandboxProvider
@@ -33,6 +33,7 @@ export interface SandcastleAdapterInput {
 export interface SandcastleSessionFactory {
   createAdapter(input: SandcastleAdapterInput): OpenCodeSandboxAdapter | Promise<OpenCodeSandboxAdapter>
   createWorktree?: typeof defaultCreateWorktree
+  runtimeDriver?: RuntimeDriver
 }
 
 export interface SandcastleSessionInput {
@@ -44,10 +45,11 @@ export interface SandcastleSessionInput {
   baseSha: string
 }
 
-export interface SandcastleSession {
+export interface SandcastleSession extends RuntimeSession {
   readonly workspaceId: string
   readonly branch: string
   readonly worktree: Worktree
+  readonly worktreePath: string
   readonly sandbox: Sandbox
   readonly target: Extract<WorkspaceTarget, { type: "remote" }>
   readonly recoveryMetadata: Record<string, unknown>
@@ -55,6 +57,7 @@ export interface SandcastleSession {
   applyCapture(capture: WorkingTreeCapture): Promise<void>
   sync(): Promise<SandboxRunResult>
   close(): Promise<CloseResult>
+  abort(): Promise<CloseResult>
 }
 
 export async function createSandcastleSession(input: SandcastleSessionInput): Promise<SandcastleSession> {
@@ -90,11 +93,13 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
     let sandboxFailure: unknown
     let worktreeClosed = false
     let closeResult: CloseResult = {}
+    let aborting: Promise<CloseResult> | undefined
 
     return {
       workspaceId: input.workspaceId,
       branch: input.branch,
       worktree: sessionWorktree,
+      worktreePath: sessionWorktree.worktreePath,
       sandbox: sessionSandbox,
       get target() {
         if (!target) throw new SandboxError("tunnel", "sandbox target is unavailable", "TARGET_UNAVAILABLE")
@@ -166,25 +171,79 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
               closeResult = await sessionWorktree.close()
               worktreeClosed = true
             } catch (error) {
+              const preservedWorktreePath = preservedPathFrom(error)
+              if (preservedWorktreePath) closeResult = { preservedWorktreePath }
               failure ??= error
             }
           }
           if (failure) throw failure
           return closeResult
         })().catch((error) => {
-          if (closeResult.preservedWorktreePath && error instanceof Error) {
-            Object.assign(error, { preservedWorktreePath: closeResult.preservedWorktreePath })
-          }
+          attachPreservedPath(error, closeResult.preservedWorktreePath)
           closing = undefined
           throw error
         })
         return closing
       },
+      abort() {
+        aborting ??= (async () => {
+          let failure: unknown
+          if (!sandboxClosed) {
+            try {
+              await sessionSandbox.close()
+              sandboxClosed = true
+            } catch (error) {
+              failure = error
+            }
+          }
+          if (!worktreeClosed) {
+            try {
+              closeResult = await sessionWorktree.close()
+              worktreeClosed = true
+            } catch (error) {
+              const preservedWorktreePath = preservedPathFrom(error)
+              if (preservedWorktreePath) closeResult = { preservedWorktreePath }
+              failure ??= error
+            }
+          }
+          if (failure) {
+            attachPreservedPath(failure, closeResult.preservedWorktreePath)
+            throw failure
+          }
+          return closeResult
+        })().catch((error) => {
+          attachPreservedPath(error, closeResult.preservedWorktreePath)
+          aborting = undefined
+          throw error
+        })
+        return aborting
+      },
     }
   } catch (error) {
-    await sandbox?.close().catch(() => undefined)
-    await worktree?.close().catch(() => undefined)
+    let preservedWorktreePath: string | undefined
+    try {
+      preservedWorktreePath = (await sandbox?.close())?.preservedWorktreePath
+    } catch (cleanupError) {
+      preservedWorktreePath = preservedPathFrom(cleanupError)
+    }
+    try {
+      preservedWorktreePath ??= (await worktree?.close())?.preservedWorktreePath
+    } catch (cleanupError) {
+      preservedWorktreePath ??= preservedPathFrom(cleanupError)
+    }
+    attachPreservedPath(error, preservedWorktreePath)
     if (error instanceof SandboxError) throw error
     throw new SandboxError("provision", redactError(error), "SANDCASTLE_SESSION")
   }
+}
+
+function preservedPathFrom(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null && "preservedWorktreePath" in error && typeof error.preservedWorktreePath === "string"
+    ? error.preservedWorktreePath
+    : undefined
+}
+
+function attachPreservedPath(error: unknown, path: string | undefined): void {
+  if (!path || !(error instanceof Error)) return
+  Object.assign(error, { preservedWorktreePath: path })
 }

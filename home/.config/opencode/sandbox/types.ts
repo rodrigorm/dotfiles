@@ -8,14 +8,13 @@ export const SANDBOX_OPERATIONS = [
   "logs",
   "diagnose",
   "retry",
+  "recover",
+  "repair",
 ] as const
 
 export type SandboxOperation = (typeof SANDBOX_OPERATIONS)[number]
 
-export type PublicOperation =
-  | SandboxOperation
-  | "recover"
-  | "repair"
+export type PublicOperation = SandboxOperation
 
 export const SANDBOX_STATES = [
   "local",
@@ -193,6 +192,53 @@ export type WorkspaceTarget =
       url: string | URL
       headers?: HeadersInit
     }
+
+export interface RuntimeResourceReference {
+  provider: string
+  resourceId: string
+}
+
+export interface RuntimeOwner {
+  provider: string
+  projectId: string
+  sessionId: string
+  generation: number
+  workspaceId: string
+  directory: string
+  branch: string
+  baseSha: string
+}
+
+export interface RuntimeAdoptionInput {
+  resource: RuntimeResourceReference
+  owner: RuntimeOwner
+}
+
+export interface RuntimeSession {
+  readonly workspaceId: string
+  readonly target: Extract<WorkspaceTarget, { type: "remote" }>
+  /** Host-accessible worktree path; omitted for provider-local checkouts. */
+  readonly worktreePath?: string
+  /** Provider-local checkout path; never pass this to host Git. */
+  readonly remoteWorktreePath?: string
+  readonly recoveryMetadata?: Record<string, unknown>
+  inspect?(): Promise<ProviderResourceObservation>
+  /** Drop only local control assets created for this session; never stop the provider resource. */
+  abort?(): Promise<RuntimeCloseResult>
+}
+
+export interface RuntimeCloseResult {
+  preservedWorktreePath?: string
+}
+
+export interface RuntimeDriver {
+  inspect(resource: RuntimeResourceReference): Promise<ProviderResourceObservation>
+  adopt(input: RuntimeAdoptionInput): Promise<RuntimeSession>
+  sync(session: RuntimeSession): Promise<void>
+  close(session: RuntimeSession): Promise<RuntimeCloseResult>
+  abort?(session: RuntimeSession): Promise<RuntimeCloseResult>
+  destroy(resource: RuntimeResourceReference, owner: RuntimeOwner): Promise<void>
+}
 
 export interface WorkspaceCreateInput {
   type: string

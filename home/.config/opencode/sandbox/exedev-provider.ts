@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { lstat, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises"
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from "node:fs/promises"
 import { dirname, isAbsolute, join, posix } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
@@ -25,6 +25,12 @@ import {
   type ProcessRunner,
   type ProcessSupervisor,
   type ProviderResourceObservation,
+  type RuntimeAdoptionInput,
+  type RuntimeCloseResult,
+  type RuntimeDriver,
+  type RuntimeOwner,
+  type RuntimeResourceReference,
+  type RuntimeSession,
   type VmIdentity,
   type VmInfo,
   type WorkspaceInfo,
@@ -39,6 +45,7 @@ const BUN_VERSION = "1.3.14"
 const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
 const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
+const MAX_SYNC_PATCH_BYTES = 8 * 1024 * 1024
 const INSPECTION_TIMEOUT_MS = 5_000
 const INVENTORY_TIMEOUT_MS = 10_000
 const SSH_KEYGEN_BIN = "/usr/bin/ssh-keygen"
@@ -186,6 +193,8 @@ export interface ExedevProviderOptions {
   ensureVmHostKey?: (identity: VmIdentity) => Promise<void>
   controlTokenFor?: (sessionId: string) => Promise<string>
   revokeControlToken?: (token: string) => void
+  authContent?: string
+  durableMetadataForResource?: (resourceId: string, owner?: RuntimeOwner) => Promise<unknown>
   assetDirectory?: string
   deferActivation?: boolean
 }
@@ -193,6 +202,7 @@ export interface ExedevProviderOptions {
 export interface ExedevSandcastleAdapterOptions extends ExedevProviderOptions {
   input: SandcastleAdapterInput
   authContent?: string
+  provider?: ExedevProvider
 }
 
 interface WorkspaceMetadata {
@@ -203,6 +213,19 @@ interface WorkspaceMetadata {
   comment?: string
   vmIdentity?: VmIdentity
   remoteDirectory?: string
+}
+
+interface ExedevRuntimeMetadata {
+  provider: "exedev"
+  projectId: string
+  sessionId: string
+  generation: number
+  workspaceId: string
+  branch: string
+  baseSha: string
+  remoteDirectory: string
+  vmName: string
+  vmIdentity: VmIdentity
 }
 
 interface Activation {
@@ -220,6 +243,7 @@ interface Activation {
   controlToken: string
   process?: ProcessHandle
   authContent?: string
+  preservedWorktreePath?: string
   failure?: string
 }
 
@@ -243,9 +267,12 @@ export class ExedevProvider implements WorkspaceProviderBase {
   private readonly ensureVmHostKey: (identity: VmIdentity) => Promise<void>
   private readonly controlTokenFor?: (sessionId: string) => Promise<string>
   private readonly revokeControlToken?: (token: string) => void
+  private readonly authContent?: string
+  private readonly durableMetadataForResource?: (resourceId: string, owner?: RuntimeOwner) => Promise<unknown>
   private readonly assetDirectory: string
   private readonly deferActivation: boolean
   private readonly active = new Map<string, Activation>()
+  private readonly runtimeSessions = new WeakMap<RuntimeSession, Activation>()
 
   constructor(options: ExedevProviderOptions) {
     this.config = options.config
@@ -260,6 +287,8 @@ export class ExedevProvider implements WorkspaceProviderBase {
     this.ensureVmHostKey = options.ensureVmHostKey ?? ((identity) => ensureExeDevVmHostKey(this.config.knownHostsFile, identity, this.runner))
     this.controlTokenFor = options.controlTokenFor
     this.revokeControlToken = options.revokeControlToken
+    this.authContent = options.authContent
+    this.durableMetadataForResource = options.durableMetadataForResource
     this.assetDirectory = options.assetDirectory ?? fileURLToPath(new URL(".", import.meta.url))
     this.deferActivation = options.deferActivation ?? false
   }
@@ -315,10 +344,15 @@ export class ExedevProvider implements WorkspaceProviderBase {
     await this.ensureHostKey()
     const paths = makeRuntimePaths(metadata.sessionId, generation)
     const localPort = await this.reservePort()
+    let createdByThisCall = false
     let createdIdentity: VmIdentity | undefined
     let createdCleanup: (() => Promise<void>) | undefined
     try {
-      const provisioned = await this.provisionVm(info, metadata, (cleanup) => { createdCleanup = cleanup })
+      const provisioned = await this.provisionVm(info, metadata, (cleanup) => {
+        createdByThisCall = true
+        createdCleanup = cleanup
+      })
+      createdByThisCall ||= provisioned.created
       if (provisioned.created) createdIdentity = copyVmIdentity(provisioned.vm.identity)
       const vm = provisioned.created
         ? { ...provisioned.vm, identity: await this.verifyVmIdentity(info, metadata, provisioned.vm.identity) }
@@ -360,8 +394,10 @@ export class ExedevProvider implements WorkspaceProviderBase {
       }
       if (activation) this.revokeControlToken?.(activation.controlToken)
       this.active.delete(info.id)
-      if (createdCleanup) await createdCleanup().catch(() => undefined)
-      else if (createdIdentity) await this.destroyVerifiedVm(info, metadata, createdIdentity).catch(() => undefined)
+      if (createdByThisCall) {
+        if (createdCleanup) await createdCleanup().catch(() => undefined)
+        else if (createdIdentity) await this.destroyVerifiedVm(info, metadata, createdIdentity).catch(() => undefined)
+      }
       if (error instanceof SandboxError) throw error
       throw new SandboxError("bootstrap", redactError(error), "PROVISION_FAILED")
     }
@@ -450,7 +486,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
     const activation = this.active.get(workspaceId)
     if (!activation) return undefined
     return {
-      providerState: { remoteDirectory: activation.paths.remoteDirectory },
+      providerState: { ...metadataForActivation(activation) },
       vmName: activation.vm.identity.name,
       vmIdentity: copyVmIdentity(activation.vm.identity),
     }
@@ -506,6 +542,371 @@ export class ExedevProvider implements WorkspaceProviderBase {
         evidence: [`exe.dev inventory:${resourceId}`],
       }
     })
+  }
+
+  runtimeDriver(): RuntimeDriver {
+    return {
+      inspect: (resource) => this.inspectRuntime(resource),
+      adopt: (input) => this.adoptRuntime(input),
+      sync: (session) => this.syncRuntime(session),
+      close: (session) => this.closeRuntime(session),
+      abort: (session) => this.abortRuntime(session),
+      destroy: (resource, owner) => this.destroyRuntime(resource, owner),
+    }
+  }
+
+  private async inspectRuntime(resource: RuntimeResourceReference): Promise<ProviderResourceObservation> {
+    if (resource.provider !== this.type) {
+      throw new SandboxError("inspect", "runtime provider does not match exe.dev", "EXEDEV_PROVIDER_MISMATCH")
+    }
+    assertSafeVmName(resource.resourceId)
+    const metadata = await this.durableMetadata(resource.resourceId)
+    if (!metadata) {
+      return {
+        resourceId: resource.resourceId,
+        resource: "unknown",
+        ownership: "unknown",
+        health: "unknown",
+        evidence: [`exe.dev durable owner metadata:${resource.resourceId}`],
+      }
+    }
+    return (await this.observeRuntime(resource, metadata)).observation
+  }
+
+  private async adoptRuntime(input: RuntimeAdoptionInput): Promise<RuntimeSession> {
+    if (input.resource.provider !== this.type || input.owner.provider !== this.type) {
+      throw new SandboxError("adopt", "runtime adoption is not supported for this provider", "EXEDEV_ADOPT_UNSUPPORTED")
+    }
+    assertSafeVmName(input.resource.resourceId)
+    assertSafeBranch(input.owner.branch)
+    assertSha(input.owner.baseSha)
+    if ([...this.active.values()].some((activation) => resourceMatchesIdentity(input.resource, activation.vm.identity))) {
+      throw new SandboxError("adopt", "exe.dev VM is already controlled by this process", "EXEDEV_ADOPT_CONFLICT")
+    }
+
+    let metadata: ExedevRuntimeMetadata | undefined
+    let observed: { observation: ProviderResourceObservation; vm?: VmInfo }
+    try {
+      metadata = await this.durableMetadata(input.resource.resourceId, input.owner)
+      if (!metadata || !sameRuntimeOwner(metadata, input.owner)) {
+        throw new SandboxError("adopt", "exe.dev VM ownership metadata is unavailable", "EXEDEV_ADOPT_UNKNOWN")
+      }
+      observed = await this.observeRuntime(input.resource, metadata)
+    } catch (error) {
+      throw adoptionUnknown(error)
+    }
+    assertAdoptableExedev(observed.observation)
+    const vm = observed.vm
+    if (!vm) throw new SandboxError("adopt", "exe.dev VM identity is unavailable", "EXEDEV_ADOPT_UNKNOWN")
+    if (!this.localControlSocket || !this.controlTokenFor || !this.authContent) {
+      throw new SandboxError("adopt", "exe.dev control runtime is unavailable", "EXEDEV_ADOPT_UNSUPPORTED")
+    }
+
+    const paths = runtimePathsForDirectory(metadata.remoteDirectory)
+    const directory = remoteWorkspaceDirectory(input.owner.workspaceId)
+    let activation: Activation | undefined
+    try {
+      // Inventory and durable metadata are the ownership proof. SSH is read-only until both match.
+      await this.ensureVmHostKey(vm.identity)
+      await this.verifyAdoptedCheckout(vm.identity, directory, input.owner.branch, input.owner.baseSha)
+      const localPort = await this.reservePort()
+      const credentials = generateRemoteCredentials()
+      const controlToken = await this.controlTokenFor(input.owner.sessionId)
+      activation = {
+        workspaceId: input.owner.workspaceId,
+        projectId: input.owner.projectId,
+        sessionId: input.owner.sessionId,
+        generation: input.owner.generation,
+        vm,
+        paths,
+        directory,
+        branch: input.owner.branch,
+        baseSha: input.owner.baseSha,
+        localPort,
+        password: credentials.serverPassword,
+        controlToken,
+        authContent: this.authContent,
+      }
+      this.active.set(activation.workspaceId, activation)
+      await this.activate(activation.workspaceId)
+      let aborting: Promise<RuntimeCloseResult> | undefined
+      let session!: RuntimeSession
+      session = {
+        workspaceId: activation.workspaceId,
+        target: {
+          type: "remote",
+          url: `http://127.0.0.1:${activation.localPort}`,
+          headers: { Authorization: basicAuthHeader(activation.password) },
+        },
+        remoteWorktreePath: activation.directory,
+        recoveryMetadata: { ...metadataForActivation(activation) },
+        inspect: () => this.inspectRuntime({ provider: this.type, resourceId: resourceIdForIdentity(activation!.vm.identity) }),
+        abort: () => {
+          aborting ??= this.abortRuntime(session).catch((error) => {
+            aborting = undefined
+            throw error
+          })
+          return aborting
+        },
+      }
+      this.runtimeSessions.set(session, activation)
+      return session
+    } catch (error) {
+      if (activation) await this.cleanupAdoption(activation)
+      throw error instanceof SandboxError ? error : new SandboxError("adopt", redactError(error), "EXEDEV_ADOPT_UNKNOWN")
+    }
+  }
+
+  private async syncRuntime(session: RuntimeSession): Promise<void> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) throw new SandboxError("sync", "adopted exe.dev runtime is not active", "RUNTIME_UNAVAILABLE")
+    await this.assertRuntimeOwned(activation, true)
+    const localBase = await this.localGit(this.worktree, ["cat-file", "-e", `${activation.baseSha}^{commit}`], "sync")
+    if (localBase.exitCode !== 0) throw new SandboxError("sync", "the captured base revision is unavailable locally", "GIT_BASE_UNAVAILABLE")
+
+    const branch = await this.remoteResult(activation.vm.identity, ["git", "-C", activation.directory, "symbolic-ref", "--short", "HEAD"], undefined, "sync")
+    if (branch.exitCode !== 0 || branch.stdout.trim() !== activation.branch) {
+      throw new SandboxError("sync", "exe.dev checkout is on an unexpected branch", "BRANCH_MISMATCH")
+    }
+    const head = await this.remoteResult(activation.vm.identity, ["git", "-C", activation.directory, "rev-parse", "HEAD"], undefined, "sync")
+    try {
+      if (head.exitCode !== 0) throw new Error("remote HEAD is unavailable")
+      assertSha(head.stdout.trim())
+    } catch {
+      throw new SandboxError("sync", "exe.dev checkout HEAD is invalid", "REMOTE_HEAD_MISMATCH")
+    }
+    const lineage = await this.remoteResult(
+      activation.vm.identity,
+      ["git", "-C", activation.directory, "merge-base", "--is-ancestor", activation.baseSha, head.stdout.trim()],
+      undefined,
+      "sync",
+    )
+    if (lineage.exitCode !== 0) {
+      throw new SandboxError("sync", "exe.dev checkout history diverged from the captured revision", "REMOTE_LINEAGE_MISMATCH")
+    }
+
+    await this.remote(activation.vm.identity, ["git", "-C", activation.directory, "add", "-A"], undefined, "sync")
+    const staged = await this.remoteResult(activation.vm.identity, ["git", "-C", activation.directory, "diff", "--cached", "--quiet"], undefined, "sync")
+    if (staged.exitCode === 1) {
+      await this.remote(activation.vm.identity, [
+        "git",
+        "-C",
+        activation.directory,
+        "-c",
+        "user.name=OpenCode Sandbox",
+        "-c",
+        "user.email=opencode@localhost",
+        "commit",
+        "-m",
+        "opencode: sync sandbox workspace",
+      ], undefined, "sync")
+    } else if (staged.exitCode !== 0) {
+      throw new SandboxError("sync", redactText(staged.stderr || "could not inspect remote changes"), "GIT_COMMAND")
+    }
+
+    const patch = await this.remoteResult(
+      activation.vm.identity,
+      ["git", "-C", activation.directory, "diff", "--binary", activation.baseSha, "--"],
+      undefined,
+      "sync",
+      { maxOutputBytes: MAX_SYNC_PATCH_BYTES },
+    )
+    if (patch.exitCode !== 0) throw new SandboxError("sync", redactText(patch.stderr || "could not capture remote changes"), "GIT_DIFF")
+    if (patch.stdout) await this.preservePatch(activation, patch.stdout)
+  }
+
+  private async closeRuntime(session: RuntimeSession): Promise<RuntimeCloseResult> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) throw new SandboxError("remove", "adopted exe.dev runtime is not active", "RUNTIME_UNAVAILABLE")
+    try {
+      await this.assertRuntimeOwned(activation)
+      await this.release(workspaceInfoForActivation(activation))
+      return activation.preservedWorktreePath ? { preservedWorktreePath: activation.preservedWorktreePath } : {}
+    } catch (error) {
+      await this.cleanupAdoption(activation).catch(() => undefined)
+      throw error
+    } finally {
+      this.runtimeSessions.delete(session)
+    }
+  }
+
+  private async abortRuntime(session: RuntimeSession): Promise<RuntimeCloseResult> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) return {}
+    try {
+      await this.cleanupAdoption(activation)
+      return activation.preservedWorktreePath ? { preservedWorktreePath: activation.preservedWorktreePath } : {}
+    } finally {
+      this.runtimeSessions.delete(session)
+    }
+  }
+
+  private async destroyRuntime(resource: RuntimeResourceReference, owner: RuntimeOwner): Promise<void> {
+    if (resource.provider !== this.type || owner.provider !== this.type) {
+      throw new SandboxError("remove", "runtime destruction is not supported for this provider", "EXEDEV_ADOPT_UNSUPPORTED")
+    }
+    assertSafeVmName(resource.resourceId)
+    const metadata = await this.durableMetadata(resource.resourceId, owner)
+    if (!metadata || !sameRuntimeOwner(metadata, owner)) {
+      throw new SandboxError("remove", "exe.dev VM ownership could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
+    }
+    const observed = await this.observeRuntime(resource, metadata)
+    assertDestructibleExedev(observed.observation)
+    if (!observed.vm) throw new SandboxError("remove", "exe.dev VM identity could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
+    await this.control.remove(observed.vm.identity)
+  }
+
+  private async durableMetadata(resourceId: string, owner?: RuntimeOwner): Promise<ExedevRuntimeMetadata | undefined> {
+    const raw = this.durableMetadataForResource
+      ? await this.durableMetadataForResource(resourceId, owner)
+      : [...this.active.values()].find((activation) => resourceMatchesIdentity({ provider: this.type, resourceId }, activation.vm.identity))
+        ? metadataForActivation([...this.active.values()].find((activation) => resourceMatchesIdentity({ provider: this.type, resourceId }, activation.vm.identity))!)
+        : undefined
+    if (!raw) return undefined
+    return parseExedevRuntimeMetadata(raw)
+  }
+
+  private async observeRuntime(
+    resource: RuntimeResourceReference,
+    metadata: ExedevRuntimeMetadata,
+  ): Promise<{ observation: ProviderResourceObservation; vm?: VmInfo }> {
+    const inventory = validateVmInventory(await this.control.list(INSPECTION_TIMEOUT_MS))
+    const byReference = inventory.filter((item) => resourceMatchesIdentity(resource, item.identity))
+    const sameName = inventory.filter((item) => item.identity.name === metadata.vmName)
+    const exact = inventory.filter((item) => identityMatches(metadata.vmIdentity, item.identity))
+    const evidence = [`exe.dev inventory:${resource.resourceId}`]
+    if (byReference.length === 0 && sameName.length === 0) {
+      return {
+        observation: {
+          resourceId: resource.resourceId,
+          projectId: metadata.projectId,
+          resource: "absent",
+          ownership: "unknown",
+          health: "unknown",
+          evidence,
+        },
+      }
+    }
+    if (byReference.length !== 1 || sameName.length !== 1 || exact.length !== 1) {
+      return {
+        observation: {
+          resourceId: resource.resourceId,
+          projectId: metadata.projectId,
+          resource: "present",
+          ownership: "conflict",
+          health: "unknown",
+          evidence: [...evidence, "exe.dev inventory is ambiguous"],
+        },
+      }
+    }
+    const vm = exact[0]
+    if (!vm || !resourceMatchesIdentity(resource, vm.identity) || vm.identity.name !== metadata.vmName || !hasOwnerTagForMetadata(metadata, vm.identity)) {
+      return {
+        observation: {
+          resourceId: resource.resourceId,
+          projectId: metadata.projectId,
+          resource: "present",
+          ownership: "conflict",
+          health: "unknown",
+          evidence,
+        },
+      }
+    }
+    return {
+      vm,
+      observation: {
+        resourceId: resource.resourceId,
+        projectId: metadata.projectId,
+        resource: "present",
+        ownership: "verified",
+        health: classifyVmHealth(vm.status),
+        evidence,
+      },
+    }
+  }
+
+  private async verifyAdoptedCheckout(identity: VmIdentity, directory: string, branch: string, baseSha: string): Promise<void> {
+    assertRemotePath(directory, "workspace directory")
+    const branchResult = await this.remoteResult(identity, ["git", "-C", directory, "symbolic-ref", "--short", "HEAD"], undefined, "checkout")
+    if (branchResult.exitCode !== 0 || branchResult.stdout.trim() !== branch) {
+      throw new SandboxError("adopt", "exe.dev checkout branch does not match the lifecycle record", "EXEDEV_ADOPT_CHECKOUT")
+    }
+    const head = await this.remoteResult(identity, ["git", "-C", directory, "rev-parse", "HEAD"], undefined, "checkout")
+    if (head.exitCode !== 0) throw new SandboxError("adopt", "exe.dev checkout revision is unavailable", "EXEDEV_ADOPT_CHECKOUT")
+    try {
+      assertSha(head.stdout.trim())
+    } catch {
+      throw new SandboxError("adopt", "exe.dev checkout revision is invalid", "EXEDEV_ADOPT_CHECKOUT")
+    }
+    const lineage = await this.remoteResult(
+      identity,
+      ["git", "-C", directory, "merge-base", "--is-ancestor", baseSha, head.stdout.trim()],
+      undefined,
+      "checkout",
+    )
+    if (lineage.exitCode !== 0) {
+      throw new SandboxError("adopt", "exe.dev checkout history does not contain the lifecycle base revision", "EXEDEV_ADOPT_CHECKOUT")
+    }
+  }
+
+  private async assertRuntimeOwned(activation: Activation, requireHealthy = false): Promise<void> {
+    const metadata = metadataForActivation(activation)
+    const observed = await this.observeRuntime({ provider: this.type, resourceId: resourceIdForIdentity(activation.vm.identity) }, metadata)
+    if (observed.observation.resource !== "present" || observed.observation.ownership !== "verified" || !observed.vm) {
+      throw new SandboxError("remove", "exe.dev VM ownership could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
+    }
+    if (requireHealthy && observed.observation.health !== "healthy") {
+      throw new SandboxError("sync", "exe.dev VM health is not usable", "EXEDEV_RUNTIME_UNAVAILABLE")
+    }
+  }
+
+  private async preservePatch(activation: Activation, patch: string): Promise<void> {
+    const temporaryRoot = await makeTemporarySyncRoot(this.worktree, activation.workspaceId)
+    const worktreePath = join(temporaryRoot, "worktree")
+    let added = false
+    try {
+      const addedWorktree = await this.localGit(this.worktree, ["worktree", "add", "--detach", worktreePath, activation.baseSha], "sync")
+      if (addedWorktree.exitCode !== 0) throw new SandboxError("sync", redactText(addedWorktree.stderr || "could not create a preservation worktree"), "GIT_WORKTREE")
+      added = true
+      const applied = await this.localGit(worktreePath, ["apply", "--binary", "-"], "sync", patch)
+      if (applied.exitCode !== 0) throw new SandboxError("sync", redactText(applied.stderr || "could not apply remote changes"), "GIT_APPLY")
+      const staged = await this.localGit(worktreePath, ["add", "-A"], "sync")
+      if (staged.exitCode !== 0) throw new SandboxError("sync", redactText(staged.stderr || "could not stage preserved changes"), "GIT_COMMAND")
+      const committed = await this.localGit(worktreePath, ["-c", "user.name=OpenCode Sandbox", "-c", "user.email=opencode@localhost", "commit", "-m", "opencode: preserve recovered workspace"], "sync")
+      if (committed.exitCode !== 0) throw new SandboxError("sync", redactText(committed.stderr || "could not commit preserved changes"), "GIT_COMMAND")
+      const head = await this.localGit(worktreePath, ["rev-parse", "HEAD"], "sync")
+      if (head.exitCode !== 0) throw new SandboxError("sync", "could not read preserved revision", "GIT_HEAD")
+      const updated = await this.localGit(this.worktree, ["update-ref", `refs/heads/${activation.branch}`, head.stdout.trim()], "sync")
+      if (updated.exitCode !== 0) throw new SandboxError("sync", redactText(updated.stderr || "could not update preserved branch"), "GIT_BRANCH")
+      await this.localGit(this.worktree, ["worktree", "remove", "--force", worktreePath], "sync")
+      added = false
+      await removeTemporarySyncRoot(temporaryRoot)
+    } catch (error) {
+      if (added) activation.preservedWorktreePath = worktreePath
+      else await removeTemporarySyncRoot(temporaryRoot)
+      throw error
+    }
+  }
+
+  private async localGit(cwd: string, args: string[], stage: "sync", stdin?: string): Promise<ProcessResult> {
+    return this.runner.run({
+      argv: ["git", "-C", cwd, ...args],
+      cwd,
+      stdin,
+      env: sanitizeEnvironment(),
+      timeoutMs: this.config.bootstrapTimeoutMs,
+      maxOutputBytes: MAX_SYNC_PATCH_BYTES,
+    })
+  }
+
+  private async cleanupAdoption(activation: Activation): Promise<void> {
+    if (activation.process) {
+      activation.process.terminate()
+      await waitForProcess(activation.process).catch(() => undefined)
+      activation.process = undefined
+    }
+    this.revokeControlToken?.(activation.controlToken)
+    this.active.delete(activation.workspaceId)
   }
 
   async release(info: WorkspaceInfo): Promise<void> {
@@ -840,14 +1241,14 @@ export class ExedevProvider implements WorkspaceProviderBase {
   }
 
   private async readHead(): Promise<string> {
-    return this.localGit(["rev-parse", "HEAD"])
+    return this.localGitText(["rev-parse", "HEAD"])
   }
 
   private async readRemoteUrl(): Promise<string> {
-    return normalizePublicRemote(await this.localGit(["remote", "get-url", "origin"]))
+    return normalizePublicRemote(await this.localGitText(["remote", "get-url", "origin"]))
   }
 
-  private async localGit(args: string[]): Promise<string> {
+  private async localGitText(args: string[]): Promise<string> {
     const result = await this.runner.run({ argv: ["git", "-C", this.worktree, ...args], cwd: this.worktree, maxOutputBytes: 4096 })
     if (result.exitCode !== 0) throw new SandboxError("git_preflight", "local Git command failed", "GIT_COMMAND")
     return result.stdout.trim()
@@ -952,8 +1353,8 @@ async function readHealthResponse(response: Response): Promise<unknown> {
 }
 
 export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOptions): OpenCodeSandboxAdapter {
-  const { input, authContent, ...providerOptions } = options
-  const provider = new ExedevProvider({ ...providerOptions, deferActivation: true })
+  const { input, authContent, provider: suppliedProvider, ...providerOptions } = options
+  const provider = suppliedProvider ?? new ExedevProvider({ ...providerOptions, authContent, deferActivation: true })
   const info: WorkspaceInfo = {
     id: input.workspaceId,
     type: "exedev",
@@ -1147,7 +1548,10 @@ function assertWorkspaceInfo(value: unknown): asserts value is WorkspaceInfo {
 
 function classifyVmHealth(status: string | undefined): ProviderResourceObservation["health"] {
   if (!status) return "unknown"
-  return ["running", "ready", "online", "active"].includes(status.toLowerCase()) ? "healthy" : "degraded"
+  const normalized = status.trim().toLowerCase()
+  if (["running", "ready", "online", "active"].includes(normalized)) return "healthy"
+  if (["created", "dead", "exited", "paused", "stopped", "powered_off"].includes(normalized)) return "degraded"
+  return "unknown"
 }
 
 function parseVmIdentity(value: unknown): VmIdentity | undefined {
@@ -1238,6 +1642,149 @@ function assertRemotePath(path: string, label: string): void {
 
 function assertRuntimeDirectory(path: string): void {
   if (!/^\/tmp\/oe-[a-f0-9]{12}$/.test(path)) throw exedevOwnershipError()
+}
+
+function runtimePathsForDirectory(remoteDirectory: string): RuntimePaths {
+  assertRuntimeDirectory(remoteDirectory)
+  return {
+    remoteDirectory,
+    remoteControlSocket: `${remoteDirectory}/c.sock`,
+    remoteLauncherPath: `${remoteDirectory}/launcher`,
+    remoteCliPath: `${remoteDirectory}/bin/sandboxctl`,
+    remoteCommandPath: `${remoteDirectory}/config/command/sandbox.md`,
+    remoteWriteFilePath: `${remoteDirectory}/write-file`,
+  }
+}
+
+function metadataForActivation(activation: Activation): ExedevRuntimeMetadata {
+  return {
+    provider: "exedev",
+    projectId: activation.projectId,
+    sessionId: activation.sessionId,
+    generation: activation.generation,
+    workspaceId: activation.workspaceId,
+    branch: activation.branch,
+    baseSha: activation.baseSha,
+    remoteDirectory: activation.paths.remoteDirectory,
+    vmName: activation.vm.identity.name,
+    vmIdentity: copyVmIdentity(activation.vm.identity),
+  }
+}
+
+function parseExedevRuntimeMetadata(value: unknown): ExedevRuntimeMetadata {
+  if (!isRecord(value) || value.provider !== "exedev") throw new SandboxError("discover", "exe.dev durable metadata is invalid", "EXEDEV_METADATA")
+  const strings = ["projectId", "sessionId", "workspaceId", "branch", "baseSha", "remoteDirectory", "vmName"]
+  if (strings.some((key) => typeof value[key] !== "string" || value[key] === "")) {
+    throw new SandboxError("discover", "exe.dev durable metadata is incomplete", "EXEDEV_METADATA")
+  }
+  const projectId = value.projectId as string
+  const sessionId = value.sessionId as string
+  const workspaceId = value.workspaceId as string
+  const branch = value.branch as string
+  const baseSha = value.baseSha as string
+  const remoteDirectory = value.remoteDirectory as string
+  const vmName = value.vmName as string
+  if (!SAFE_IDENTIFIER.test(projectId) || !SAFE_IDENTIFIER.test(sessionId) || !SAFE_IDENTIFIER.test(workspaceId)) {
+    throw new SandboxError("discover", "exe.dev durable owner metadata is invalid", "EXEDEV_METADATA")
+  }
+  if (typeof value.generation !== "number" || !Number.isSafeInteger(value.generation) || value.generation < 1) {
+    throw new SandboxError("discover", "exe.dev durable generation is invalid", "EXEDEV_METADATA")
+  }
+  assertSafeBranch(branch)
+  assertSha(baseSha)
+  assertRuntimeDirectory(remoteDirectory)
+  assertSafeVmName(vmName)
+  const vmIdentity = parseVmIdentity(value.vmIdentity)
+  if (!vmIdentity || vmIdentity.name !== vmName) {
+    throw new SandboxError("discover", "exe.dev durable VM identity is invalid", "EXEDEV_METADATA")
+  }
+  return {
+    provider: "exedev",
+    projectId,
+    sessionId,
+    generation: value.generation,
+    workspaceId,
+    branch,
+    baseSha,
+    remoteDirectory,
+    vmName,
+    vmIdentity,
+  }
+}
+
+function sameRuntimeOwner(metadata: ExedevRuntimeMetadata, owner: RuntimeOwner): boolean {
+  return metadata.provider === owner.provider &&
+    metadata.projectId === owner.projectId &&
+    metadata.sessionId === owner.sessionId &&
+    metadata.generation === owner.generation &&
+    metadata.workspaceId === owner.workspaceId &&
+    metadata.branch === owner.branch &&
+    metadata.baseSha === owner.baseSha
+}
+
+function resourceMatchesIdentity(resource: RuntimeResourceReference, identity: VmIdentity): boolean {
+  return resource.resourceId === identity.name || resource.resourceId === identity.id
+}
+
+function resourceIdForIdentity(identity: VmIdentity): string {
+  return identity.id ?? identity.name
+}
+
+function hasOwnerTagForMetadata(metadata: ExedevRuntimeMetadata, identity: VmIdentity): boolean {
+  return identity.tags.includes("opencode-sandbox") && identity.tags.includes(exedevOwnerTagForValues(metadata))
+}
+
+function exedevOwnerTagForValues(metadata: Pick<ExedevRuntimeMetadata, "projectId" | "sessionId" | "workspaceId" | "generation">): string {
+  return `opencode-owner-${shortHash(`${metadata.projectId}:${metadata.sessionId}:${metadata.workspaceId}:${metadata.generation}`)}`
+}
+
+function assertAdoptableExedev(observation: ProviderResourceObservation): void {
+  if (observation.ownership === "conflict") {
+    throw new SandboxError("adopt", "exe.dev VM ownership conflicts with the lifecycle record", "EXEDEV_ADOPT_CONFLICT")
+  }
+  if (observation.resource !== "present" || observation.ownership !== "verified" || observation.health === "unknown") {
+    throw new SandboxError("adopt", "exe.dev VM ownership or health is unknown", "EXEDEV_ADOPT_UNKNOWN")
+  }
+  if (observation.health !== "healthy") {
+    throw new SandboxError("adopt", "stopped exe.dev VMs cannot be resumed without provider mutation", "EXEDEV_ADOPT_UNSUPPORTED")
+  }
+}
+
+function assertDestructibleExedev(observation: ProviderResourceObservation): void {
+  if (observation.ownership === "conflict" || observation.resource !== "present" || observation.ownership !== "verified") {
+    throw new SandboxError("remove", "exe.dev VM ownership could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
+  }
+}
+
+function adoptionUnknown(error: unknown): SandboxError {
+  if (error instanceof SandboxError && ["EXEDEV_ADOPT_CONFLICT", "EXEDEV_ADOPT_CHECKOUT", "EXEDEV_ADOPT_UNSUPPORTED"].includes(error.code)) return error
+  return new SandboxError("adopt", "exe.dev VM state is unknown", "EXEDEV_ADOPT_UNKNOWN")
+}
+
+function workspaceInfoForActivation(activation: Activation): WorkspaceInfo {
+  return {
+    id: activation.workspaceId,
+    type: "exedev",
+    name: activation.vm.identity.name,
+    branch: activation.branch,
+    directory: activation.directory,
+    projectID: activation.projectId,
+    extra: {
+      sessionId: activation.sessionId,
+      generation: activation.generation,
+      providerState: metadataForActivation(activation),
+      vmName: activation.vm.identity.name,
+      vmIdentity: copyVmIdentity(activation.vm.identity),
+    },
+  }
+}
+
+async function makeTemporarySyncRoot(worktree: string, workspaceId: string): Promise<string> {
+  return mkdtemp(join(dirname(worktree), `.opencode-exedev-sync-${shortHash(workspaceId)}-`))
+}
+
+async function removeTemporarySyncRoot(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true })
 }
 
 function exedevOwnerTag(info: WorkspaceInfo, metadata: WorkspaceMetadata): string {

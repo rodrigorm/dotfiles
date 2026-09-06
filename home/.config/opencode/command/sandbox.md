@@ -5,9 +5,9 @@ agent: build
 
 Execute the requested sandbox lifecycle operation.
 
-Supported operations are exactly: `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, and `retry`. The only optional argument is `--force` for `delete`. `inventory` is host-only and project-scoped.
+Supported operations are exactly: `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, `retry`, host-only `recover`, and host-only `repair`. The only optional argument is `--force` for `delete`. `inventory` is host-only and project-scoped.
 
-`recover`, `adopt`, and `repair` are deferred; never synthesize them from a result.
+`adopt` is provider vocabulary, not a public command. Run `recover` or delete a verified orphan only when a host result advertises the runtime-driver action with fresh provider, ownership, and runtime-handle preconditions. Run `repair` only when a host result advertises it with fresh provider, runtime-handle, and workspace preconditions.
 
 Run `retry` using the role listed in `allowedActions`. A remote capability must not retry a failed `start` or a forced delete; report that host recovery is required instead.
 

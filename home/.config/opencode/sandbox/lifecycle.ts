@@ -12,6 +12,11 @@ import {
   type GitWorkingTreeObservation,
   type ProviderResourceObservation,
   type PublicOperation,
+  type RuntimeDriver,
+  type RuntimeCloseResult,
+  type RuntimeOwner,
+  type RuntimeResourceReference,
+  type RuntimeSession,
   type SandboxRecord,
   type SandboxObservation,
   type SandboxAllowedAction,
@@ -39,6 +44,32 @@ const MAX_INVENTORY_RESOURCES = 1_000
 const MAX_INVENTORY_DETAIL_BYTES = 48 * 1024
 const MAX_RESPONSE_BYTES = 64 * 1024 - 1024
 
+interface ReconciliationRecordIdentity {
+  sessionId: string
+  projectId: string
+  workspaceId: string
+  provider: string
+  generation: number
+  directory: string
+  branch: string
+  baseSha: string
+  state: SandboxState
+  updatedAt: string
+}
+
+interface ObservationPlan {
+  identity: ReconciliationRecordIdentity
+  workspace: Probe<WorkspaceInfo>
+  provider: Probe<ProviderResourceObservation>
+  git: Probe<GitWorkingTreeObservation>
+  handle: SandboxObservation
+  observations: SandboxObservation[]
+  classification: SandboxResultV2["classification"]
+  work: SandboxResultV2["work"]
+  effectiveTarget: SandboxResultV2["effectiveTarget"]
+  probeError?: unknown
+}
+
 export interface InfrastructureOperations {
   remove?(record: SandboxRecord): Promise<void>
   diagnose?(record: SandboxRecord): Promise<Record<string, unknown>>
@@ -60,6 +91,7 @@ export interface LifecycleDependencies {
   providerRelease?: (record: SandboxRecord) => Promise<void>
   providerDestroy?: (record: SandboxRecord) => Promise<void>
   sandcastle?: SandcastleSessionFactory
+  runtimeDriver?: RuntimeDriver
   now?: () => Date
 }
 
@@ -77,12 +109,15 @@ export class LifecycleController {
   private readonly providerRelease?: (record: SandboxRecord) => Promise<void>
   private readonly providerDestroy?: (record: SandboxRecord) => Promise<void>
   private readonly sandcastle?: SandcastleSessionFactory
+  private readonly runtimeDriver?: RuntimeDriver
   private readonly now: () => Date
   private readonly contexts = new Map<string, SessionContext>()
-  private readonly sessions = new Map<string, SandcastleSession>()
+  private readonly sessions = new Map<string, RuntimeSession>()
+  private readonly sessionDrivers = new Map<string, RuntimeDriver>()
   private readonly targets = new Map<string, WorkspaceTarget | Promise<WorkspaceTarget>>()
   private readonly targetGates = new Map<string, Deferred<WorkspaceTarget>>()
   private readonly operations = new Set<Promise<unknown>>()
+  private readonly recoveryFlights = new Map<string, Promise<SandboxResponse>>()
   private readonly idleTimers = new Set<ReturnType<typeof setTimeout>>()
   private disposed = false
   private disposal?: Promise<void>
@@ -101,6 +136,7 @@ export class LifecycleController {
     this.providerRelease = dependencies.providerRelease
     this.providerDestroy = dependencies.providerDestroy
     this.sandcastle = dependencies.sandcastle
+    this.runtimeDriver = dependencies.runtimeDriver ?? dependencies.sandcastle?.runtimeDriver
     this.now = dependencies.now ?? (() => new Date())
   }
 
@@ -167,7 +203,7 @@ export class LifecycleController {
           return await this.start(request.capability)
         case "stop": {
           const response = await this.stop(request.capability)
-          if (this.sandcastle && response.state === "stop_pending") {
+          if ((this.sandcastle || this.sessionDrivers.has(request.capability.sessionId)) && response.state === "stop_pending") {
             this.scheduleSessionIdle(request.capability.sessionId)
           }
           return response
@@ -186,6 +222,10 @@ export class LifecycleController {
           return await this.delete(request.capability, request.force)
         case "retry":
           return await this.retry(request.capability, record)
+        case "recover":
+          return await this.recover(request.capability)
+        case "repair":
+          return await this.repair(request.capability)
       }
     } catch (error) {
       const record = await this.store.get(request.capability.sessionId).catch(() => undefined)
@@ -235,17 +275,44 @@ export class LifecycleController {
       this.assertCapability(record, expected.capability)
       this.assertOperationAllowed(record, { operation: "retry", force: false, capability: expected.capability })
     }
-    if (this.sandcastle) {
+    if (
+      record.operation &&
+      (record.operation.kind === "stop" || record.operation.kind === "delete") &&
+      record.operation.phase === "adopting" &&
+      this.runtimeDriver &&
+      !this.sessions.has(sessionId)
+    ) {
+      try {
+        await this.adoptPendingRuntime(record)
+      } catch (error) {
+        const failedRecord = await this.store.get(sessionId).catch(() => undefined) ?? record
+        const nextState = failureState(error)
+        if (failedRecord.state !== nextState) assertTransition(failedRecord.state, nextState)
+        await write({
+          ...failedRecord,
+          ...(preservedPathFrom(error) ? { preservedWorktreePath: preservedPathFrom(error) } : {}),
+          state: failureState(error),
+          operation: failedOperation(failedRecord),
+          updatedAt: this.now().toISOString(),
+          lastError: failureDetails(error),
+        })
+        return
+      }
+    }
+    if (this.sandcastle || this.sessionDrivers.has(sessionId)) {
       try {
         await this.onSandcastleIdle(record, write)
       } catch (error) {
         this.rejectTargetGate(record.workspaceId, error)
-        const preservedWorktreePath = preservedPathFrom(error) ?? record.preservedWorktreePath
+        const failedRecord = await this.store.get(sessionId).catch(() => undefined) ?? record
+        const preservedWorktreePath = preservedPathFrom(error) ?? failedRecord.preservedWorktreePath
+        const nextState = failureState(error)
+        if (failedRecord.state !== nextState) assertTransition(failedRecord.state, nextState)
         await write({
-          ...record,
+          ...failedRecord,
           ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
-          state: failureState(error, Boolean(this.sandcastle)),
-          operation: failedOperation(record, error, Boolean(this.sandcastle)),
+          state: failureState(error),
+          operation: failedOperation(failedRecord),
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
         })
@@ -258,10 +325,12 @@ export class LifecycleController {
       try {
         await this.syncOut(record)
       } catch (error) {
+        const nextState = failureState(error)
+        if (record.state !== nextState) assertTransition(record.state, nextState)
         await write({
           ...record,
-          state: failureState(error, false),
-          operation: failedOperation(record, error, false),
+          state: nextState,
+          operation: failedOperation(record),
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
         })
@@ -277,6 +346,7 @@ export class LifecycleController {
       if (record.state === "activation_pending" || (record.state === "recovery_pending" && record.operation?.kind === "start")) {
         await this.waitForSync(record)
         await this.workspace.warp({ sessionId, workspaceId: record.workspaceId, directory: record.directory })
+        assertTransition(record.state, "remote")
         await write({
           ...record,
           state: "remote",
@@ -325,13 +395,21 @@ export class LifecycleController {
           }
           await write(current)
         }
-        if (this.providerDestroy) await this.providerDestroy(current)
-        else {
-          if (!this.infrastructure.remove) {
-            throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
+        if (!current.operation?.providerDestroyed) {
+          if (this.providerDestroy) {
+            await this.providerDestroy(current)
+            current = await this.markProviderDestroyed(current, write)
+          } else if (this.runtimeDriver) {
+            current = await this.destroyRuntimeForDelete(current, write, this.runtimeDriver)
+          } else {
+            if (!this.infrastructure.remove) {
+              throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
+            }
+            await this.infrastructure.remove(current)
+            current = await this.markProviderDestroyed(current, write)
           }
-          await this.infrastructure.remove(current)
         }
+        assertTransition(current.state, "deleted")
         await write({
           ...current,
           state: "deleted",
@@ -341,10 +419,12 @@ export class LifecycleController {
         })
       }
     } catch (error) {
+      const nextState = failureState(error)
+      if (current.state !== nextState) assertTransition(current.state, nextState)
       await write({
         ...current,
-        state: failureState(error, false),
-        operation: failedOperation(current, error, false),
+        state: nextState,
+        operation: failedOperation(current),
         updatedAt: this.now().toISOString(),
         lastError: failureDetails(error),
       })
@@ -372,50 +452,108 @@ export class LifecycleController {
   private async reconcileRecords(projectId?: string): Promise<void> {
     for (const candidate of await this.store.list()) {
       if (projectId && candidate.projectId !== projectId) continue
+      const plan = await this.inspectRecord(candidate)
       await this.store.withRecordLock(candidate.sessionId, async (record, write) => {
-        if (!record || (projectId && record.projectId !== projectId)) return
-        if (record.state === "recovery_pending" && !record.operation) {
-          const error = new SandboxError("reconcile", "restart recovery cannot prove work preservation", "RECOVERY_PRESERVATION_UNVERIFIED")
-          await write({
-            ...record,
-            state: "error",
-            updatedAt: this.now().toISOString(),
-            lastError: failureDetails(error),
-          })
-          return
-        }
-        if (this.sandcastle && isSandcastleActive(record.state) && !this.sessions.has(record.sessionId)) {
-          await write({
-            ...record,
-            state: "orphaned",
-            operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
-            updatedAt: this.now().toISOString(),
-            lastError: {
-              code: "SANDCASTLE_HANDLE",
-              stage: "reconcile",
-              message: "Sandcastle session handle is unavailable; manual recovery is required",
-            },
-          })
-          return
-        }
-        if (record.state === "recovery_pending") {
-          await this.processSessionIdleLocked(record.sessionId, record, write)
-          return
-        }
-        if (this.sandcastle && isSandcastleActive(record.state)) return
-        if (record.state !== "provisioning" && record.state !== "activation_pending" && record.state !== "remote" && record.state !== "stop_pending" && record.state !== "delete_pending") return
-        assertTransition(record.state, "recovery_pending")
-        const next: SandboxRecord = {
-          ...record,
-          state: "recovery_pending",
-          operation: record.operation ? { ...record.operation } : undefined,
-          updatedAt: this.now().toISOString(),
-          lastError: undefined,
-        }
-        await write(next)
-        await this.processSessionIdleLocked(record.sessionId, next, write)
+        if (!record || (projectId && record.projectId !== projectId) || !sameObservationPlanRecord(record, plan.identity)) return
+        await this.applyReconciliationPlan(record, plan, write)
       })
     }
+  }
+
+  private async applyReconciliationPlan(
+    record: SandboxRecord,
+    plan: ObservationPlan,
+    write: (record: SandboxRecord) => Promise<void>,
+  ): Promise<void> {
+    if (persistedDeleteCanFinish(record, plan)) {
+      if (plan.workspace.value) await this.removeWorkspace(record)
+      assertTransition(record.state, "deleted")
+      await write({
+        ...record,
+        state: "deleted",
+        operation: record.operation ? { ...record.operation, phase: "deleted" } : undefined,
+        updatedAt: this.now().toISOString(),
+        lastError: undefined,
+      })
+      return
+    }
+    if (!reconciliationPlanIsSafe(plan)) return
+
+    if (
+      this.runtimeDriver &&
+      !this.sessions.has(record.sessionId) &&
+      ((record.state === "stop_pending" && record.operation?.kind === "stop") ||
+        (record.state === "delete_pending" && record.operation?.kind === "delete")) &&
+      verifiedPendingRuntime(record, plan)
+    ) {
+      const operation = record.operation!
+      const phase = operation.kind === "delete" && ["removing", "destroying"].includes(operation.phase)
+        ? operation.phase
+        : "adopting"
+      const next: SandboxRecord = {
+        ...record,
+        state: "recovery_pending",
+        operation: {
+          ...operation,
+          phase,
+        },
+        updatedAt: this.now().toISOString(),
+        lastError: {
+          code: operation.kind === "delete" ? "DELETE_RECOVERY_REQUIRED" : "STOP_RECOVERY_REQUIRED",
+          stage: "reconcile",
+          message: `pending ${operation.kind} requires fresh evidence before retry`,
+        },
+      }
+      assertTransition(record.state, next.state)
+      await write(next)
+      return
+    }
+    if (["conflict", "unknown", "control_lost", "stale_record"].includes(plan.classification)) return
+
+    if ((this.sandcastle || this.runtimeDriver) && isSandcastleActive(record.state) && !this.sessions.has(record.sessionId)) {
+      if (plan.classification !== "orphan") return
+      assertTransition(record.state, "orphaned")
+      await write({
+        ...record,
+        state: "orphaned",
+        operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
+        updatedAt: this.now().toISOString(),
+        lastError: {
+          code: "SANDCASTLE_HANDLE",
+          stage: "reconcile",
+          message: "Sandcastle session handle is unavailable; provider ownership was verified",
+        },
+      })
+      return
+    }
+
+    if (record.state === "recovery_pending") {
+      if (plan.classification !== "attached") return
+      if (!record.operation) return
+      await this.processSessionIdleLocked(record.sessionId, record, write)
+      return
+    }
+    if ((this.sandcastle || this.runtimeDriver) && isSandcastleActive(record.state)) return
+    if (plan.classification !== "attached") return
+    if (
+      record.state !== "provisioning" &&
+      record.state !== "activation_pending" &&
+      record.state !== "remote" &&
+      record.state !== "stop_pending" &&
+      record.state !== "delete_pending"
+    ) return
+    if (!record.operation) return
+
+    assertTransition(record.state, "recovery_pending")
+    const next: SandboxRecord = {
+      ...record,
+      state: "recovery_pending",
+      operation: { ...record.operation },
+      updatedAt: this.now().toISOString(),
+      lastError: undefined,
+    }
+    await write(next)
+    await this.processSessionIdleLocked(record.sessionId, next, write)
   }
 
   dispose(): Promise<void> {
@@ -432,14 +570,17 @@ export class LifecycleController {
         let operationError: unknown
         try {
           const record = await this.store.get(sessionId)
-          if (record && ["remote", "stop_pending", "delete_pending", "sync_failed"].includes(record.state)) await session.sync()
+           if (record && ["remote", "stop_pending", "delete_pending", "sync_failed"].includes(record.state)) {
+             await this.syncSession(sessionId, session)
+           }
         } catch (error) {
           operationError = error
         }
-        try {
-          const closeResult = await session.close()
+         try {
+           const closeResult = await this.closeSession(sessionId, session)
           await this.persistPreservedWorktreePath(sessionId, closeResult.preservedWorktreePath)
-          this.sessions.delete(sessionId)
+           this.sessions.delete(sessionId)
+           this.sessionDrivers.delete(sessionId)
           if (operationError) throw operationError
           return closeResult
         } catch (error) {
@@ -448,7 +589,10 @@ export class LifecycleController {
         }
       }))
       results.forEach((result, index) => {
-        if (result.status === "fulfilled") this.sessions.delete(sessions[index]![0])
+         if (result.status === "fulfilled") {
+           this.sessions.delete(sessions[index]![0])
+           this.sessionDrivers.delete(sessions[index]![0])
+         }
       })
       this.contexts.clear()
       this.targets.clear()
@@ -465,6 +609,104 @@ export class LifecycleController {
     this.operations.add(operation)
     void operation.finally(() => this.operations.delete(operation)).catch(() => undefined)
     return operation
+  }
+
+  private syncSession(sessionId: string, session: RuntimeSession): Promise<void> {
+    const driver = this.sessionDrivers.get(sessionId)
+    if (driver) return driver.sync(session)
+    const sandcastle = session as SandcastleSession
+    if (typeof sandcastle.sync !== "function") throw new SandboxError("sync", "runtime session cannot sync", "RUNTIME_SYNC_UNAVAILABLE")
+    return sandcastle.sync().then(() => undefined)
+  }
+
+  private closeSession(sessionId: string, session: RuntimeSession): Promise<RuntimeCloseResult> {
+    const driver = this.sessionDrivers.get(sessionId)
+    if (driver) return driver.close(session)
+    const sandcastle = session as SandcastleSession
+    if (typeof sandcastle.close !== "function") throw new SandboxError("remove", "runtime session cannot close", "RUNTIME_CLOSE_UNAVAILABLE")
+    return sandcastle.close()
+  }
+
+  private async adoptPendingRuntime(record: SandboxRecord): Promise<void> {
+    const driver = this.runtimeDriver
+    if (!driver) throw new SandboxError("adopt", "runtime adoption is not supported for this provider", "DELETE_ADOPT_UNSUPPORTED")
+    const resource = runtimeResourceReference(record)
+    const plan = await this.inspectRecord(record)
+    const evidenceError = deleteEvidenceError(record, plan, resource, record.operation?.kind === "stop" ? "stop" : "delete")
+    if (evidenceError) throw evidenceError
+    if (!resource) {
+      throw new SandboxError(
+        "adopt",
+        "runtime resource reference is unavailable",
+        record.operation?.kind === "stop" ? "STOP_EVIDENCE" : "DELETE_EVIDENCE",
+      )
+    }
+
+    let session: RuntimeSession | undefined
+    try {
+      session = await driver.adopt({ resource, owner: runtimeOwner(record) })
+      if (session.workspaceId !== record.workspaceId) {
+        throw new SandboxError("adopt", "runtime session workspace does not match the lifecycle record", "RUNTIME_ADOPT_OWNER")
+      }
+    } catch (error) {
+      if (session) {
+        try {
+          const result = await this.abortRuntimeSession(driver, session)
+          attachPreservedPath(error, result.preservedWorktreePath)
+        } catch (abortError) {
+          attachPreservedPath(error, preservedPathFrom(abortError))
+        }
+      }
+      throw error
+    }
+
+    if (!session) throw new SandboxError("adopt", "runtime adoption returned no session", "DELETE_ADOPT_UNKNOWN")
+    this.sessions.set(record.sessionId, session)
+    this.sessionDrivers.set(record.sessionId, driver)
+  }
+
+  private abortRuntimeSession(driver: RuntimeDriver, session: RuntimeSession): Promise<RuntimeCloseResult> {
+    if (session.abort) return session.abort()
+    if (driver.abort) return driver.abort(session)
+    throw new SandboxError("remove", "runtime session cannot abort local control assets", "RUNTIME_ABORT_UNAVAILABLE")
+  }
+
+  private async destroyRuntimeForDelete(
+    record: SandboxRecord,
+    write: (record: SandboxRecord) => Promise<void>,
+    driver: RuntimeDriver,
+  ): Promise<SandboxRecord> {
+    const resource = runtimeResourceReference(record)
+    if (!resource) throw new SandboxError("remove", "runtime resource reference is unavailable", "REMOVE_UNAVAILABLE")
+
+    let observation: ProviderResourceObservation
+    try {
+      observation = await withTimeout(driver.inspect(resource), INSPECTION_TIMEOUT_MS, "runtime ownership inspection timed out")
+    } catch (error) {
+      throw error instanceof SandboxError ? error : new SandboxError("remove", redactError(error), "DELETE_OWNERSHIP_UNVERIFIED")
+    }
+    if (observation.resource === "absent" && observation.ownership !== "conflict") {
+      return this.markProviderDestroyed(record, write)
+    }
+    if (observation.resource !== "present" || observation.ownership !== "verified" || observation.resourceId !== resource.resourceId) {
+      throw new SandboxError("remove", "runtime resource ownership could not be verified", "DELETE_OWNERSHIP_UNVERIFIED")
+    }
+
+    await driver.destroy(resource, runtimeOwner(record))
+    return this.markProviderDestroyed(record, write)
+  }
+
+  private async markProviderDestroyed(
+    record: SandboxRecord,
+    write: (record: SandboxRecord) => Promise<void>,
+  ): Promise<SandboxRecord> {
+    const next: SandboxRecord = {
+      ...record,
+      operation: record.operation ? { ...record.operation, providerDestroyed: true } : undefined,
+      updatedAt: this.now().toISOString(),
+    }
+    await write(next)
+    return next
   }
 
   private async onSandcastleIdle(
@@ -503,8 +745,49 @@ export class LifecycleController {
 
     const session = this.sessions.get(record.sessionId)
     if (!session) {
+      if (record.operation?.kind === "delete" && record.operation.phase === "destroying" && record.operation.providerDestroyed) {
+        assertTransition(record.state, "deleted")
+        await write({
+          ...record,
+          state: "deleted",
+          operation: { ...record.operation, phase: "deleted" },
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        })
+        return
+      }
+      if (record.operation?.kind === "delete" && ["removing", "destroying"].includes(record.operation.phase) && this.runtimeDriver) {
+        const plan = await this.inspectRecord(record)
+        const evidenceError = record.operation.providerDestroyed
+          ? persistedDeleteEvidenceError(record, plan)
+          : deleteEvidenceError(record, plan, runtimeResourceReference(record))
+        if (evidenceError) throw evidenceError
+        let current = record
+        if (record.operation.phase === "removing") {
+          if (plan.workspace.value) await this.removeWorkspace(current)
+          current = {
+            ...current,
+            operation: { ...current.operation!, phase: "destroying" },
+            updatedAt: this.now().toISOString(),
+          }
+          await write(current)
+        } else if (record.operation.providerDestroyed && plan.workspace.value) {
+          await this.removeWorkspace(current)
+        }
+        if (!current.operation?.providerDestroyed) current = await this.destroyRuntimeForDelete(current, write, this.runtimeDriver)
+        assertTransition(current.state, "deleted")
+        await write({
+          ...current,
+          state: "deleted",
+          operation: { ...current.operation!, phase: "deleted" },
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        })
+        return
+      }
       if (record.operation?.kind === "delete" && record.operation.phase === "removing" && record.operation.providerDestroyed) {
         await this.removeWorkspace(record)
+        assertTransition(record.state, "deleted")
         await write({
           ...record,
           state: "deleted",
@@ -518,14 +801,15 @@ export class LifecycleController {
     }
 
     const deleting = record.operation?.kind === "delete"
-    const discarding = record.operation?.phase === "discarding"
+    const runtimeDriver = this.sessionDrivers.get(record.sessionId)
+    const discarding = record.operation?.force === true && ["adopting", "discarding"].includes(record.operation.phase)
     const localTarget: WorkspaceTarget = { type: "local", directory: record.directory }
     let current = record
     if (discarding) {
       await this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory })
     } else if (!deleting || !["removing", "destroying"].includes(record.operation?.phase ?? "")) {
       try {
-        await session.sync()
+         await this.syncSession(record.sessionId, session)
       } catch (error) {
         if (error instanceof SandboxError) throw error
         throw new SandboxError("sync", redactError(error), "SANDCASTLE_SYNC")
@@ -533,7 +817,9 @@ export class LifecycleController {
       await this.withTarget(record.workspaceId, localTarget, () =>
         this.workspace.warp({ sessionId: record.sessionId, workspaceId: null, directory: record.directory }))
     }
-    const closeResult = await session.close()
+    const closeResult = await this.closeSession(record.sessionId, session)
+    this.sessions.delete(record.sessionId)
+    this.sessionDrivers.delete(record.sessionId)
     current = {
       ...record,
       ...(closeResult.preservedWorktreePath ? { preservedWorktreePath: closeResult.preservedWorktreePath } : {}),
@@ -543,7 +829,7 @@ export class LifecycleController {
       current = {
         ...current,
         operation: record.operation
-          ? { ...record.operation, phase: "removing", ...(this.sandcastle ? { providerDestroyed: true } : {}) }
+           ? { ...record.operation, phase: "removing", ...(!runtimeDriver && this.sandcastle ? { providerDestroyed: true } : {}) }
           : undefined,
         updatedAt: this.now().toISOString(),
       }
@@ -551,7 +837,7 @@ export class LifecycleController {
     if (!deleting && current.operation) {
       current = {
         ...current,
-        operation: { ...current.operation, providerDestroyed: true },
+        operation: { ...current.operation, ...(!runtimeDriver ? { providerDestroyed: true } : {}) },
       }
     }
     await write(current)
@@ -563,10 +849,22 @@ export class LifecycleController {
       }
       throw error
     }
-    this.sessions.delete(record.sessionId)
+    if (deleting && runtimeDriver) {
+      if (!current.operation?.providerDestroyed && current.operation?.phase === "removing") {
+        current = {
+          ...current,
+          operation: { ...current.operation, phase: "destroying" },
+          updatedAt: this.now().toISOString(),
+        }
+        await write(current)
+      }
+      if (!current.operation?.providerDestroyed) current = await this.destroyRuntimeForDelete(current, write, runtimeDriver)
+    }
+    const nextState = deleting ? "deleted" : "detached"
+    assertTransition(current.state, nextState)
     await write({
       ...current,
-      state: deleting ? "deleted" : "detached",
+      state: nextState,
       operation: current.operation
         ? { ...current.operation, phase: deleting ? "deleted" : "detached" }
         : undefined,
@@ -743,13 +1041,14 @@ export class LifecycleController {
         const retained = this.sessions.get(capability.sessionId)
         if (retained) {
           try {
-            preservedWorktreePath = (await retained.close()).preservedWorktreePath ?? preservedWorktreePath
+             preservedWorktreePath = (await this.closeSession(capability.sessionId, retained)).preservedWorktreePath ?? preservedWorktreePath
           } catch (error) {
             const path = preservedPathFrom(error)
             if (path) await write({ ...existing, preservedWorktreePath: path, updatedAt: this.now().toISOString() })
             throw error
           }
-          this.sessions.delete(capability.sessionId)
+           this.sessions.delete(capability.sessionId)
+           this.sessionDrivers.delete(capability.sessionId)
         }
         if (preservedWorktreePath && preservedWorktreePath !== existing.preservedWorktreePath) {
           await write({ ...existing, preservedWorktreePath, updatedAt: this.now().toISOString() })
@@ -795,7 +1094,8 @@ export class LifecycleController {
             branch,
             baseSha: capture.baseSha,
           })
-        this.sessions.set(capability.sessionId, session)
+         this.sessions.set(capability.sessionId, session)
+         this.sessionDrivers.delete(capability.sessionId)
         this.targets.set(workspaceId, { type: "local", directory: context.directory })
         current = {
           ...current,
@@ -846,13 +1146,16 @@ export class LifecycleController {
         if (session) {
           let sessionClosed = false
           try {
-            preservedWorktreePath = (await session.close()).preservedWorktreePath
+             preservedWorktreePath = (await this.closeSession(capability.sessionId, session)).preservedWorktreePath
             sessionClosed = true
           } catch (error) {
             cleanupError = error
             preservedWorktreePath ??= preservedPathFrom(error)
           }
-          if (sessionClosed) this.sessions.delete(capability.sessionId)
+           if (sessionClosed) {
+             this.sessions.delete(capability.sessionId)
+             this.sessionDrivers.delete(capability.sessionId)
+           }
           this.rejectTargetGate(workspaceId, error)
           this.targets.delete(workspaceId)
         }
@@ -950,6 +1253,23 @@ export class LifecycleController {
       })
     }
 
+    const plan = await this.inspectRecord(record)
+    const contextAvailable = this.contexts.has(record.sessionId)
+    const preservationVerified = Boolean(record.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(plan.git.value?.head ?? ""))
+    const recoveryAvailable = this.runtimeDriver !== undefined && record.provider !== "cloudflare" && runtimeResourceReference(record) !== undefined && !workspaceEvidenceError(record, plan, "recover")
+    return successResponse("inspect", record, plan.probeError ? "inspection completed with unknown evidence" : "inspection completed", undefined, capability.role, {
+      ok: !plan.probeError,
+      observations: plan.observations,
+      classification: plan.classification,
+      effectiveTarget: plan.effectiveTarget,
+      work: plan.work,
+      ...(plan.probeError ? { error: publicError(plan.probeError) } : {}),
+      allowedActions: allowedActions(record, capability.role, plan.classification, plan.provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified, repairAvailable(record, plan), recoveryAvailable),
+      recommendedAction: recommendedAction(record, capability.role, plan.classification, plan.provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified, repairAvailable(record, plan), recoveryAvailable),
+    })
+  }
+
+  private async inspectRecord(record: SandboxRecord): Promise<ObservationPlan> {
     const freshAt = this.now().toISOString()
     const handle = this.sessions.get(record.sessionId)
     const [workspace, provider, git, target] = await Promise.all([
@@ -961,20 +1281,251 @@ export class LifecycleController {
     const handleObservation = runtimeHandleObservation(handle, target, freshAt)
     const observations = [recordObservation(record), handleObservation, workspace.observation, provider.observation, git.observation]
     const classification = classifySituation(record, observations)
-    const work = workFromInspection(record, git.value, classification)
-    const effectiveTarget = effectiveTargetFor(record, target.value, workspace.value, provider.value, provider.observation, handleObservation)
-    const probeError = workspace.error ?? provider.error ?? git.error ?? target.error
-    const contextAvailable = this.contexts.has(record.sessionId)
-    const preservationVerified = Boolean(record.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(git.value?.head ?? ""))
-    return successResponse("inspect", record, probeError ? "inspection completed with unknown evidence" : "inspection completed", undefined, capability.role, {
-      ok: !probeError,
+    return {
+      identity: reconciliationRecordIdentity(record),
+      workspace,
+      provider,
+      git,
+      handle: handleObservation,
       observations,
       classification,
-      effectiveTarget,
-      work,
-      ...(probeError ? { error: publicError(probeError) } : {}),
-      allowedActions: allowedActions(record, capability.role, classification, provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified),
-      recommendedAction: recommendedAction(record, capability.role, classification, provider.observation, this.capture !== undefined, contextAvailable, true, preservationVerified),
+      work: workFromInspection(record, git.value, classification),
+      effectiveTarget: effectiveTargetFor(record, target.value, workspace.value, provider.value, provider.observation, handleObservation),
+      probeError: workspace.error ?? provider.error ?? git.error ?? target.error,
+    }
+  }
+
+  private recover(capability: ControlCapability): Promise<SandboxResponse> {
+    const existing = this.recoveryFlights.get(capability.sessionId)
+    if (existing) return existing
+    const flight = this.recoverLocked(capability)
+    this.recoveryFlights.set(capability.sessionId, flight)
+    void flight.then(
+      () => {
+        if (this.recoveryFlights.get(capability.sessionId) === flight) this.recoveryFlights.delete(capability.sessionId)
+      },
+      () => {
+        if (this.recoveryFlights.get(capability.sessionId) === flight) this.recoveryFlights.delete(capability.sessionId)
+      },
+    )
+    return flight
+  }
+
+  private async recoverLocked(capability: ControlCapability): Promise<SandboxResponse> {
+    return this.store.withRecordLock(capability.sessionId, async (record, write) => {
+      this.assertCapability(record, capability)
+      this.assertOperationAllowed(record, { operation: "recover", force: false, capability })
+      if (!record) throw new SandboxError("reconcile", "no sandbox session is associated", "RECOVER_UNAVAILABLE")
+      if (record.provider === "cloudflare" || !this.runtimeDriver) {
+        throw new SandboxError("reconcile", "runtime adoption is not supported for this provider", "RECOVER_UNSUPPORTED")
+      }
+
+      const plan = await this.inspectRecord(record)
+      const resource = runtimeResourceReference(record)
+      const recoveryAvailable = this.runtimeDriver !== undefined && record.provider !== "cloudflare" && resource !== undefined
+      const evidenceError = recoveryEvidenceError(record, plan, resource?.resourceId)
+      if (evidenceError) {
+        return failureResponse("recover", record.state, evidenceError.stage, evidenceError.message, record, evidenceError, capability.role, {
+          observations: plan.observations,
+          classification: plan.classification,
+          effectiveTarget: plan.effectiveTarget,
+          work: plan.work,
+          captureAvailable: this.capture !== undefined,
+          contextAvailable: this.contexts.has(record.sessionId),
+          mutationsAllowed: true,
+          recoveryAvailable: false,
+        })
+      }
+
+      if (!resource) {
+        const error = new SandboxError("reconcile", "recovery requires a durable runtime resource reference", "RECOVER_EVIDENCE")
+        return failureResponse("recover", record.state, error.stage, error.message, record, error, capability.role, {
+          observations: plan.observations,
+          classification: plan.classification,
+          effectiveTarget: plan.effectiveTarget,
+          work: plan.work,
+          captureAvailable: this.capture !== undefined,
+          contextAvailable: this.contexts.has(record.sessionId),
+          mutationsAllowed: true,
+          recoveryAvailable: false,
+        })
+      }
+
+      const pending: SandboxRecord = {
+        ...record,
+        state: "recovery_pending",
+        operation: { kind: "recover", phase: "adopting" },
+        updatedAt: this.now().toISOString(),
+        lastError: undefined,
+      }
+      if (record.state !== "recovery_pending") assertTransition(record.state, pending.state)
+      await write(pending)
+      const driver = this.runtimeDriver
+      if (!driver) throw new SandboxError("reconcile", "runtime adoption is not supported for this provider", "RECOVER_UNSUPPORTED")
+
+      let session: RuntimeSession | undefined
+      let preservedWorktreePath: string | undefined
+      try {
+        session = await driver.adopt({ resource, owner: runtimeOwner(pending) })
+        if (session.workspaceId !== pending.workspaceId) {
+          throw new SandboxError("adopt", "runtime session workspace does not match the lifecycle record", "RECOVER_OWNER")
+        }
+        const current = await this.store.get(capability.sessionId)
+        if (!current || !sameRecoveryRecord(current, pending)) throw recoveryStale()
+
+        this.sessions.set(current.sessionId, session)
+        this.sessionDrivers.set(current.sessionId, driver)
+        this.beginTargetGate(current.workspaceId)
+        await this.routeRecoveredSession(current, session)
+        const next: SandboxRecord = {
+          ...current,
+          state: "remote",
+          operation: { kind: "recover", phase: "remote" },
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        }
+        assertTransition(current.state, next.state)
+        await write(next)
+        this.resolveTargetGate(next.workspaceId, session.target)
+        return recoverySuccessResponse(next, plan, session, capability.role, this.capture !== undefined, this.contexts.has(next.sessionId), recoveryAvailable)
+      } catch (error) {
+        if (session) {
+          this.sessions.delete(record.sessionId)
+          this.sessionDrivers.delete(record.sessionId)
+          this.rejectTargetGate(record.workspaceId, error)
+          try {
+            const result = await this.abortRuntimeSession(driver, session)
+            preservedWorktreePath = result.preservedWorktreePath
+            attachPreservedPath(error, preservedWorktreePath)
+          } catch (abortError) {
+            preservedWorktreePath ??= preservedPathFrom(abortError)
+            attachPreservedPath(error, preservedWorktreePath)
+            error = new SandboxError("reconcile", `${redactError(error)}; adopted runtime abort failed: ${redactError(abortError)}`, "RECOVER_ABORT")
+          }
+        } else {
+          preservedWorktreePath = preservedPathFrom(error)
+        }
+
+        const current = await this.store.get(capability.sessionId).catch(() => undefined)
+        const currentMatches = current !== undefined && sameRecoveryRecord(current, pending)
+        const failed = currentMatches
+          ? {
+              ...current,
+              state: "recovery_pending" as const,
+              operation: { kind: "recover" as const, phase: "adopt_failed" },
+              ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
+              updatedAt: this.now().toISOString(),
+              lastError: failureDetails(error),
+            }
+          : current && preservedWorktreePath
+            ? { ...current, preservedWorktreePath }
+            : current
+        if (failed && currentMatches) await write(failed)
+        const responseRecord = failed ?? pending
+        const responseWork = preservedWorktreePath ? workWithPreservedPath(plan.work, preservedWorktreePath) : plan.work
+        return failureResponse("recover", responseRecord.state, failureStage(error), redactError(error), responseRecord, error, capability.role, {
+          observations: plan.observations,
+          classification: plan.classification,
+          effectiveTarget: null,
+          work: responseWork,
+          captureAvailable: this.capture !== undefined,
+          contextAvailable: this.contexts.has(responseRecord.sessionId),
+          mutationsAllowed: true,
+          recoveryAvailable,
+        })
+      }
+    })
+  }
+
+  private async routeRecoveredSession(record: SandboxRecord, session: RuntimeSession): Promise<void> {
+    if (!this.workspace.replaySession || !this.workspace.startSync || !this.workspace.waitForSync) {
+      throw new SandboxError("sync", "workspace activation protocol is unavailable", "WORKSPACE_ACTIVATION")
+    }
+    await this.withTarget(record.workspaceId, session.target, () =>
+      this.workspace.warp({ sessionId: record.sessionId, workspaceId: record.workspaceId, directory: record.directory }))
+    await this.withTarget(record.workspaceId, session.target, () => this.workspace.startSync!({ directory: record.directory }))
+    await this.workspace.waitForSync({ workspaceId: record.workspaceId, directory: record.directory, timeoutMs: 30_000 })
+    await this.workspace.replaySession({ sessionId: record.sessionId, directory: record.directory, target: session.target })
+  }
+
+  private async repair(capability: ControlCapability): Promise<SandboxResponse> {
+    return this.store.withRecordLock(capability.sessionId, async (record, write) => {
+      this.assertCapability(record, capability)
+      this.assertOperationAllowed(record, { operation: "repair", force: false, capability })
+    if (!record) return successResponse("repair", undefined, "no sandbox session is associated", undefined, capability.role)
+
+      let plan = await this.inspectRecord(record)
+      if (!repairAvailable(record, plan)) {
+        const error = repairEvidenceError(plan)
+        return failureResponse("repair", record.state, error.stage, error.message, record, error, capability.role, {
+          observations: plan.observations,
+          classification: plan.classification,
+          effectiveTarget: plan.effectiveTarget,
+          work: plan.work,
+          captureAvailable: this.capture !== undefined,
+          contextAvailable: this.contexts.has(record.sessionId),
+          mutationsAllowed: true,
+        })
+      }
+
+      if (plan.workspace.value) {
+        const workspace = await this.inspectWorkspace(record, this.now().toISOString())
+        plan = {
+          ...plan,
+          workspace,
+          observations: plan.observations.map((observation) => observation.source === "workspace" ? workspace.observation : observation),
+        }
+        if (!repairAvailable(record, plan)) {
+          const error = repairEvidenceError(plan)
+          return failureResponse("repair", record.state, error.stage, error.message, record, error, capability.role, {
+            observations: plan.observations,
+            classification: classifySituation(record, plan.observations),
+            effectiveTarget: plan.effectiveTarget,
+            work: plan.work,
+            captureAvailable: this.capture !== undefined,
+            contextAvailable: this.contexts.has(record.sessionId),
+            mutationsAllowed: true,
+          })
+        }
+        if (workspace.value) await this.removeWorkspace(record)
+      }
+
+      const next: SandboxRecord = {
+        ...record,
+        providerState: {},
+        vmName: undefined,
+        vmIdentity: undefined,
+        state: repairedState(record),
+        operation: undefined,
+        updatedAt: this.now().toISOString(),
+        lastError: undefined,
+      }
+      await write(next)
+      const observations = plan.observations.map((observation) => observation.source === "record"
+        ? recordObservation(next)
+        : observation.source === "workspace" && plan.workspace.value
+          ? {
+              source: "workspace" as const,
+              observed: true,
+              freshAt: this.now().toISOString(),
+              resource: "absent" as const,
+              ownership: "unknown" as const,
+              health: "unknown" as const,
+              evidence: [`workspace registry removed:${record.workspaceId}`],
+            }
+          : observation)
+      const classification = classifySituation(next, observations)
+      const provider = observations.find((observation) => observation.source === "provider")
+      const work = workFromInspection(next, plan.git.value, classification)
+      const preservationVerified = Boolean(next.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(plan.git.value?.head ?? ""))
+      return successResponse("repair", next, "stale sandbox control-plane state repaired", undefined, capability.role, {
+        observations,
+        classification,
+        effectiveTarget: null,
+        work,
+        allowedActions: allowedActions(next, capability.role, classification, provider, this.capture !== undefined, this.contexts.has(next.sessionId), true, preservationVerified),
+        recommendedAction: recommendedAction(next, capability.role, classification, provider, this.capture !== undefined, this.contexts.has(next.sessionId), true, preservationVerified),
+      })
     })
   }
 
@@ -1113,12 +1664,24 @@ export class LifecycleController {
     }
   }
 
-  private async inspectProvider(record: SandboxRecord, session: SandcastleSession | undefined, freshAt: string): Promise<Probe<ProviderResourceObservation>> {
-    if (!session?.inspect && !this.providerInspect) {
+  private async inspectProvider(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string): Promise<Probe<ProviderResourceObservation>> {
+    const resource = runtimeResourceReference(record)
+    if (!session?.inspect && !this.runtimeDriver && !this.providerInspect) {
       return { observation: unknownObservation("provider", freshAt, "provider inspection is unavailable") }
     }
+    if (this.runtimeDriver && !session?.inspect && !resource) {
+      return { observation: unknownObservation("provider", freshAt, "runtime resource reference is unavailable") }
+    }
     try {
-      const result = await withTimeout(session?.inspect ? session.inspect() : this.providerInspect!(record), INSPECTION_TIMEOUT_MS, "provider inspection timed out")
+      const result = await withTimeout(
+        session?.inspect
+          ? session.inspect()
+          : this.runtimeDriver
+            ? this.runtimeDriver.inspect(resource!)
+            : this.providerInspect!(record),
+        INSPECTION_TIMEOUT_MS,
+        "provider inspection timed out",
+      )
       return { observation: providerObservation(result, freshAt), value: result }
     } catch (error) {
       return {
@@ -1128,11 +1691,11 @@ export class LifecycleController {
     }
   }
 
-  private async inspectGit(record: SandboxRecord, session: SandcastleSession | undefined, freshAt: string): Promise<Probe<GitWorkingTreeObservation>> {
+  private async inspectGit(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string): Promise<Probe<GitWorkingTreeObservation>> {
     if (!this.gitInspect) {
       return { observation: { source: "git", observed: false, freshAt, evidence: ["Git inspection is unavailable"] } }
     }
-    const worktreePath = session?.worktree.worktreePath ?? record.preservedWorktreePath
+    const worktreePath = sessionWorktreePath(session) ?? record.preservedWorktreePath
     if (!worktreePath) {
       return { observation: { source: "git", observed: false, freshAt, evidence: ["runtime worktree is unavailable"] } }
     }
@@ -1147,12 +1710,13 @@ export class LifecycleController {
     }
   }
 
-  private async inspectRuntimeTarget(record: SandboxRecord, session: SandcastleSession | undefined): Promise<TargetProbe> {
+  private async inspectRuntimeTarget(record: SandboxRecord, session: RuntimeSession | undefined): Promise<TargetProbe> {
     try {
       if (session) return { observed: true, value: session.target }
-      if (!this.providerTarget) return { observed: false }
+       if (!this.providerTarget) return { observed: this.runtimeDriver !== undefined }
       return { observed: true, value: await withTimeout(Promise.resolve(this.providerTarget(record)), INSPECTION_TIMEOUT_MS, "runtime target inspection timed out") }
     } catch (error) {
+      if (error instanceof SandboxError && error.code === "RUNTIME_UNAVAILABLE") return { observed: true }
       return { observed: true, error }
     }
   }
@@ -1179,21 +1743,43 @@ export class LifecycleController {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "delete", force, capability })
       if (!record || record.state === "deleted") return { record, forceDiscard: false, alreadyDeleted: true }
+      let orphaned = record.state === "orphaned"
       const forceDiscard = force && record.state === "sync_failed"
-      if (force && (capability.role !== "host" || (record.state !== "detached" && !forceDiscard))) {
+      if (orphaned && (capability.role !== "host" || !this.runtimeDriver)) {
+        throw new SandboxError("adopt", "orphan deletion requires a host runtime driver", "DELETE_ADOPT_UNSUPPORTED")
+      }
+      if (force && (capability.role !== "host" || (record.state !== "detached" && !forceDiscard && !orphaned))) {
         throw new SandboxError("remove", "force delete is available only on the host after stop", "FORCE_DELETE_SCOPE")
       }
-      if (!forceDiscard && record.state !== "remote" && record.state !== "detached") {
+      if (!forceDiscard && !orphaned && record.state !== "remote" && record.state !== "detached") {
         throw new SandboxError("transition", "delete is blocked while a transition is pending", "DELETE_TRANSITION")
       }
       if (!force && record.preservedWorktreePath) await this.verifyPreservedWorktree(record)
       if (!force && this.infrastructure.preflightDelete) await this.infrastructure.preflightDelete(record)
-      if (!this.sandcastle && !this.providerDestroy && !this.infrastructure.remove) {
-        throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
+      if (orphaned || (record.state === "remote" && !this.sessions.has(record.sessionId) && this.runtimeDriver)) {
+        if (!this.runtimeDriver) {
+          throw new SandboxError("adopt", "orphan deletion requires a host runtime driver", "DELETE_ADOPT_UNSUPPORTED")
+        }
+        const plan = await this.inspectRecord(record)
+        const resource = runtimeResourceReference(record)
+        if (plan.classification === "orphan" && capability.role !== "host") {
+          throw new SandboxError("validate", "orphan deletion is only authorized from the host", "REQUEST_ORPHAN_DELETE")
+        }
+        const error = deleteEvidenceError(record, plan, resource)
+        if (error) return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error, plan } }
+        if (!orphaned && plan.classification !== "orphan") {
+          const error = new SandboxError("reconcile", "delete requires a freshly observed orphaned runtime", "DELETE_EVIDENCE")
+          return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error, plan } }
+        }
+        orphaned = true
+      }
+      if (!this.sandcastle && !this.runtimeDriver && !this.providerDestroy && !this.infrastructure.remove) {
+         throw new SandboxError("remove", "provider removal is not configured", "REMOVE_UNAVAILABLE")
       }
 
       let phase = "awaiting_idle"
-      if (forceDiscard) phase = "discarding"
+      if (orphaned || (forceDiscard && this.runtimeDriver && !this.sessions.has(record.sessionId))) phase = "adopting"
+      else if (forceDiscard) phase = "discarding"
       else if (record.state === "detached") phase = "removing"
       const next: SandboxRecord = {
         ...record,
@@ -1220,6 +1806,26 @@ export class LifecycleController {
 
     const final = decision.record
     if (decision.alreadyDeleted) return successResponse("delete", final, "Sandbox is already deleted", undefined, capability.role)
+    if (decision.preflightFailure) {
+      return failureResponse(
+        "delete",
+        final?.state ?? "error",
+        decision.preflightFailure.error.stage,
+        decision.preflightFailure.error.message,
+        final,
+        decision.preflightFailure.error,
+        capability.role,
+        {
+          observations: decision.preflightFailure.plan.observations,
+          classification: decision.preflightFailure.plan.classification,
+          effectiveTarget: decision.preflightFailure.plan.effectiveTarget,
+          work: decision.preflightFailure.plan.work,
+          captureAvailable: this.capture !== undefined,
+          contextAvailable: this.contexts.has(capability.sessionId),
+          mutationsAllowed: true,
+        },
+      )
+    }
     if (!force) return successResponse("delete", final, "Delete agendado; a resposta atual sera concluida primeiro.", undefined, capability.role)
     if (final?.state !== "deleted") {
       const lastError = final?.lastError ?? { stage: "remove", message: "sandbox removal is still pending" }
@@ -1234,6 +1840,7 @@ export class LifecycleController {
       throw new SandboxError("reconcile", "session sandbox is orphaned; manual recovery is required", "SESSION_ORPHANED")
     }
     if (record?.state === "recovery_pending") {
+      if (record.operation?.kind === "recover") return this.retryRecovery(capability)
       return this.store.withRecordLock(record.sessionId, async (current, write) => {
         if (!current || !sameRetryRecord(current, record)) throw retryStale()
         let final = current
@@ -1252,6 +1859,7 @@ export class LifecycleController {
       return successResponse("retry", record, "there is no failed operation to retry", undefined, capability.role)
     }
     const operation = record.operation?.kind
+    if (operation === "recover") return this.retryRecovery(capability)
     if (operation === "start") {
       if (record.operation?.phase === "awaiting_idle") return this.retryPending(capability, record, "activation_pending", "start", "awaiting_idle")
       if (record.operation?.phase === "remote") return this.retryRemoteSync(capability, record)
@@ -1260,12 +1868,22 @@ export class LifecycleController {
     if (operation === "stop") return this.retryPending(capability, record, "stop_pending", "stop", "awaiting_idle")
     if (operation === "delete") {
       let phase = "awaiting_idle"
-      if (record.operation?.phase === "destroying") phase = "destroying"
+      if (record.operation?.phase === "adopting") phase = "adopting"
+      else if (record.operation?.phase === "destroying") phase = "destroying"
       else if (record.operation?.phase === "removing") phase = "removing"
       else if (record.operation?.phase === "discarding") phase = "discarding"
       return this.retryPending(capability, record, "delete_pending", "delete", phase)
     }
     throw new SandboxError("validate", "no retryable operation is recorded", "RETRY_UNAVAILABLE")
+  }
+
+  private async retryRecovery(capability: ControlCapability): Promise<SandboxResponse> {
+    const result = await this.recover(capability)
+    return {
+      ...result,
+      operation: "retry",
+      message: result.ok ? "Retry completed." : result.message,
+    }
   }
 
   private async retryPending(
@@ -1323,11 +1941,11 @@ export class LifecycleController {
         await write(next)
         return next
       } catch (error) {
-        const state = failureState(error, false)
+        const state = failureState(error)
         await write({
           ...current,
           state,
-          operation: failedOperation(current, error, false),
+          operation: failedOperation(current),
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
         })
@@ -1368,8 +1986,23 @@ export class LifecycleController {
     if (request.operation === "start" || (request.operation === "retry" && record?.operation?.kind === "start")) {
       throw new SandboxError("validate", "start is only authorized from the host", "REQUEST_START")
     }
+    if (request.operation === "repair") {
+      throw new SandboxError("validate", "repair is only authorized from the host", "REQUEST_REPAIR")
+    }
+    if (request.operation === "recover") {
+      throw new SandboxError("validate", "recover is only authorized from the host", "REQUEST_RECOVER")
+    }
     if (request.operation === "delete" && request.force) {
       throw new SandboxError("validate", "force delete is only authorized from the host", "REQUEST_FORCE")
+    }
+    if (request.operation === "delete" && record?.state === "orphaned") {
+      throw new SandboxError("validate", "orphan deletion is only authorized from the host", "REQUEST_ORPHAN_DELETE")
+    }
+    if (request.operation === "retry" && record?.operation?.kind === "delete" && record.operation.phase === "adopting") {
+      throw new SandboxError("validate", "runtime adoption can only be retried from the host", "REQUEST_ORPHAN_DELETE")
+    }
+    if (request.operation === "retry" && record?.operation?.kind === "recover") {
+      throw new SandboxError("validate", "runtime recovery can only be retried from the host", "REQUEST_RECOVER")
     }
     if (request.operation === "retry" && isForceDelete(record)) {
       throw new SandboxError("validate", "force delete can only be retried from the host", "REQUEST_FORCE")
@@ -1468,8 +2101,7 @@ function isSandcastleActive(state: SandboxState): boolean {
   )
 }
 
-function failureState(error: unknown, sandcastle: boolean): SandboxState {
-  if (sandcastle && error instanceof SandboxError && error.code === "SANDCASTLE_HANDLE") return "orphaned"
+function failureState(error: unknown): SandboxState {
   if (error instanceof SandboxError && error.stage === "sync") return "sync_failed"
   return "error"
 }
@@ -1491,9 +2123,22 @@ function preservedPathFrom(error: unknown): string | undefined {
   return isRecord(error) && typeof error.preservedWorktreePath === "string" ? error.preservedWorktreePath : undefined
 }
 
-function failedOperation(record: SandboxRecord, error: unknown, sandcastle: boolean): SandboxRecord["operation"] {
+function attachPreservedPath(error: unknown, path: string | undefined): void {
+  if (!path || !(error instanceof Error)) return
+  Object.assign(error, { preservedWorktreePath: path })
+}
+
+function workWithPreservedPath(work: SandboxResultV2["work"], path: string): SandboxResultV2["work"] {
+  return {
+    ...work,
+    preservation: "preserved",
+    preservedWorktreePath: path,
+  }
+}
+
+function failedOperation(record: SandboxRecord): SandboxRecord["operation"] {
   if (!record.operation) return undefined
-  return failureState(error, sandcastle) === "orphaned" ? { ...record.operation, phase: "orphaned" } : record.operation
+  return record.operation
 }
 
 function nonSecretDetails(value: unknown): Record<string, unknown> {
@@ -1531,6 +2176,193 @@ function boundedText(value: string): { value: string; truncated: boolean } {
 function workspaceIdFor(sessionId: string, generation: number): string {
   const compact = Buffer.from(`${sessionId}:${generation}`).toString("base64url").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40)
   return `wrk_${compact}`
+}
+
+function runtimeResourceReference(record: SandboxRecord): RuntimeResourceReference | undefined {
+  const state = record.providerState
+  const values = [
+    state.resourceId,
+    state.sandboxId,
+    state.sandbox,
+    state.vmName,
+    record.vmIdentity?.id,
+    record.vmIdentity?.name,
+    record.vmName,
+  ]
+  const resourceId = values.find((value): value is string => typeof value === "string" && value.length > 0)
+  return resourceId ? { provider: record.provider, resourceId } : undefined
+}
+
+function runtimeOwner(record: SandboxRecord): RuntimeOwner {
+  return {
+    provider: record.provider,
+    projectId: record.projectId,
+    sessionId: record.sessionId,
+    generation: record.generation,
+    workspaceId: record.workspaceId,
+    directory: record.directory,
+    branch: record.branch,
+    baseSha: record.baseSha,
+  }
+}
+
+function sameRecoveryRecord(current: SandboxRecord, expected: SandboxRecord): boolean {
+  return (
+    current.sessionId === expected.sessionId &&
+    current.projectId === expected.projectId &&
+    current.provider === expected.provider &&
+    current.generation === expected.generation &&
+    current.workspaceId === expected.workspaceId &&
+    current.directory === expected.directory &&
+    current.branch === expected.branch &&
+    current.baseSha === expected.baseSha &&
+    current.updatedAt === expected.updatedAt &&
+    current.state === "recovery_pending" &&
+    current.operation?.kind === "recover" &&
+    current.operation?.phase === expected.operation?.phase
+  )
+}
+
+function recoveryStale(): SandboxError {
+  return new SandboxError("validate", "session changed while recovery was pending; retry again", "RECOVER_STALE")
+}
+
+function recoveryEvidenceError(record: SandboxRecord, plan: ObservationPlan, resourceId: string | undefined): SandboxError | undefined {
+  if (plan.observations.some((observation) => observation.ownership === "conflict")) {
+    return new SandboxError("reconcile", "recovery is blocked by conflicting ownership evidence", "RECOVER_CONFLICT")
+  }
+  if (plan.probeError) {
+    return new SandboxError("reconcile", "recovery requires fresh provider and runtime observations", "RECOVER_EVIDENCE")
+  }
+  const workspaceError = workspaceEvidenceError(record, plan, "recover")
+  if (workspaceError) return workspaceError
+  const provider = plan.provider.observation
+  if (!provider.observed || provider.resource !== "present" || provider.ownership !== "verified" || !plan.provider.value || plan.provider.value.resourceId !== resourceId) {
+    return new SandboxError("reconcile", "recovery requires a present, ownership-verified runtime resource", "RECOVER_EVIDENCE")
+  }
+  if (plan.handle.resource === "present") {
+    return new SandboxError("reconcile", "recovery is blocked by a live runtime handle", "RECOVER_HANDLE_CONFLICT")
+  }
+  if (!plan.handle.observed || plan.handle.resource !== "absent") {
+    return new SandboxError("reconcile", "recovery requires proof that no live runtime handle is present", "RECOVER_EVIDENCE")
+  }
+  if (plan.classification !== "orphan") {
+    return new SandboxError("reconcile", "recovery requires a verified orphaned runtime", "RECOVER_EVIDENCE")
+  }
+  return undefined
+}
+
+function deleteEvidenceError(
+  record: SandboxRecord,
+  plan: ObservationPlan,
+  resource: RuntimeResourceReference | undefined,
+  operation: "delete" | "stop" = "delete",
+): SandboxError | undefined {
+  const prefix = operation === "stop" ? "stop" : "delete"
+  const conflictCode = operation === "stop" ? "STOP_CONFLICT" : "DELETE_CONFLICT"
+  const evidenceCode = operation === "stop" ? "STOP_EVIDENCE" : "DELETE_EVIDENCE"
+  if (plan.observations.some((observation) => observation.ownership === "conflict")) {
+    return new SandboxError("reconcile", `${prefix} is blocked by conflicting ownership evidence`, conflictCode)
+  }
+  if (plan.probeError) {
+    return new SandboxError("reconcile", `${prefix} requires fresh provider and runtime observations`, evidenceCode)
+  }
+  const provider = plan.provider.observation
+  if (!resource || !plan.provider.value || provider.resource !== "present" || provider.ownership !== "verified" || plan.provider.value.resourceId !== resource.resourceId) {
+    return new SandboxError("reconcile", `${prefix} requires a present, ownership-verified runtime resource`, evidenceCode)
+  }
+  if (!plan.handle.observed || plan.handle.resource !== "absent") {
+    return new SandboxError(
+      "reconcile",
+      `${prefix} requires proof that no live runtime handle is present`,
+      operation === "stop" ? "STOP_HANDLE_CONFLICT" : "DELETE_HANDLE_CONFLICT",
+    )
+  }
+  return workspaceEvidenceError(record, plan, operation)
+}
+
+function persistedDeleteCanFinish(record: SandboxRecord, plan: ObservationPlan): boolean {
+  return (
+    (record.state === "delete_pending" || record.state === "recovery_pending") &&
+    record.operation?.kind === "delete" &&
+    ["removing", "destroying"].includes(record.operation.phase) &&
+    record.operation.providerDestroyed === true &&
+    persistedDeleteEvidenceError(record, plan) === undefined
+  )
+}
+
+function persistedDeleteEvidenceError(record: SandboxRecord, plan: ObservationPlan): SandboxError | undefined {
+  if (plan.observations.some((observation) => observation.ownership === "conflict")) {
+    return new SandboxError("reconcile", "delete is blocked by conflicting ownership evidence", "DELETE_CONFLICT")
+  }
+  if (plan.probeError) {
+    return new SandboxError("reconcile", "delete requires fresh provider and workspace observations", "DELETE_EVIDENCE")
+  }
+  const provider = plan.provider.observation
+  if (!provider.observed || provider.resource !== "absent") {
+    return new SandboxError("reconcile", "delete requires fresh provider absence evidence", "DELETE_EVIDENCE")
+  }
+  if (!plan.handle.observed || plan.handle.resource !== "absent") {
+    return new SandboxError("reconcile", "delete requires proof that no live runtime handle is present", "DELETE_HANDLE_CONFLICT")
+  }
+  return workspaceEvidenceError(record, plan, "delete")
+}
+
+function workspaceEvidenceError(
+  record: SandboxRecord | undefined,
+  plan: ObservationPlan,
+  operation: "recover" | "delete" | "stop",
+): SandboxError | undefined {
+  const workspace = plan.workspace.observation
+  const prefix = operation === "recover" ? "recovery" : operation
+  const conflictCode = operation === "recover" ? "RECOVER_CONFLICT" : operation === "stop" ? "STOP_CONFLICT" : "DELETE_CONFLICT"
+  const evidenceCode = operation === "recover" ? "RECOVER_EVIDENCE" : operation === "stop" ? "STOP_EVIDENCE" : "DELETE_EVIDENCE"
+  if (workspace.ownership === "conflict") {
+    return new SandboxError("reconcile", `${prefix} is blocked by conflicting workspace ownership evidence`, conflictCode)
+  }
+  if (!workspace.observed || workspace.resource === "unknown") {
+    return new SandboxError("reconcile", `${prefix} requires fresh workspace absence or ownership evidence`, evidenceCode)
+  }
+  if (workspace.resource === "absent") return undefined
+  if (record && workspace.resource === "present" && plan.workspace.value && workspaceMatchesExactly(record, plan.workspace.value)) return undefined
+  return new SandboxError("reconcile", `${prefix} is blocked by conflicting workspace ownership evidence`, conflictCode)
+}
+
+function recoverySuccessResponse(
+  record: SandboxRecord,
+  plan: ObservationPlan,
+  session: RuntimeSession,
+  role: CapabilityRole,
+  captureAvailable: boolean,
+  contextAvailable: boolean,
+  recoveryAvailable: boolean,
+): SandboxResponse {
+  const freshAt = new Date().toISOString()
+  const handle = runtimeHandleObservation(session, { observed: true, value: session.target }, freshAt)
+  const observations = plan.observations.map((observation) => {
+    if (observation.source === "record") return recordObservation(record)
+    if (observation.source === "handle") return handle
+    return observation
+  })
+  const classification = classifySituation(record, observations)
+  const provider = observations.find((observation) => observation.source === "provider")
+  const effectiveTarget = effectiveTargetFor(record, session.target, plan.workspace.value, plan.provider.value, provider ?? plan.provider.observation, handle)
+  const work = workFromInspection(record, plan.git.value, classification)
+  return successResponse("recover", record, "runtime recovered", undefined, role, {
+    observations,
+    classification,
+    effectiveTarget,
+    work,
+    allowedActions: allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, true, false, false, recoveryAvailable),
+    recommendedAction: recommendedAction(record, role, classification, provider, captureAvailable, contextAvailable, true, false, false, recoveryAvailable),
+  })
+}
+
+function sessionWorktreePath(session: RuntimeSession | undefined): string | undefined {
+  if (!session) return undefined
+  if (session.worktreePath) return session.worktreePath
+  const worktree = (session as unknown as { worktree?: { worktreePath?: unknown } }).worktree
+  return typeof worktree?.worktreePath === "string" ? worktree.worktreePath : undefined
 }
 
 function sameRetryRecord(current: SandboxRecord, expected: SandboxRecord): boolean {
@@ -1615,6 +2447,9 @@ interface ResultOptions {
   captureAvailable?: boolean
   contextAvailable?: boolean
   mutationsAllowed?: boolean
+  preservationVerified?: boolean
+  repairAvailable?: boolean
+  recoveryAvailable?: boolean
 }
 
 interface Probe<T> {
@@ -1715,9 +2550,31 @@ function baseResult(operation: PublicOperation, ok: boolean, message: string, op
     observations,
     classification,
     work: options.work ?? workFromRecord(record, classification),
-    allowedActions: options.allowedActions ?? allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed),
+    allowedActions: options.allowedActions ?? allowedActions(
+      record,
+      role,
+      classification,
+      provider,
+      captureAvailable,
+      contextAvailable,
+      mutationsAllowed,
+      options.preservationVerified ?? false,
+      options.repairAvailable ?? false,
+      options.recoveryAvailable ?? false,
+    ),
     recommendedAction: options.recommendedAction === undefined
-      ? recommendedAction(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed)
+      ? recommendedAction(
+          record,
+          role,
+          classification,
+          provider,
+          captureAvailable,
+          contextAvailable,
+          mutationsAllowed,
+          options.preservationVerified ?? false,
+          options.repairAvailable ?? false,
+          options.recoveryAvailable ?? false,
+        )
       : options.recommendedAction,
     error: options.error === undefined ? recordedError(record) : options.error,
   }
@@ -1759,7 +2616,7 @@ function intentFor(record: SandboxRecord | undefined): SandboxResultV2["intent"]
   else if (record.state === "delete_pending") phase = "deleting"
   else if (record.state === "sync_failed") phase = "syncing"
   else if (record.state === "recovery_pending") {
-    phase = record.operation?.kind === "start" ? "activating" : record.operation?.kind === "stop" ? "detaching" : record.operation?.kind === "delete" ? "deleting" : "idle"
+    phase = record.operation?.kind === "start" || record.operation?.kind === "recover" ? "activating" : record.operation?.kind === "stop" ? "detaching" : record.operation?.kind === "delete" ? "deleting" : "idle"
   }
   return { desiredLocation, phase }
 }
@@ -1825,6 +2682,86 @@ function recordOnlyClassification(record: SandboxRecord | undefined): SandboxRes
   return "unknown"
 }
 
+function reconciliationRecordIdentity(record: SandboxRecord): ReconciliationRecordIdentity {
+  return {
+    sessionId: record.sessionId,
+    projectId: record.projectId,
+    workspaceId: record.workspaceId,
+    provider: record.provider,
+    generation: record.generation,
+    directory: record.directory,
+    branch: record.branch,
+    baseSha: record.baseSha,
+    state: record.state,
+    updatedAt: record.updatedAt,
+  }
+}
+
+function sameObservationPlanRecord(record: SandboxRecord, identity: ReconciliationRecordIdentity): boolean {
+  return (
+    record.sessionId === identity.sessionId &&
+    record.projectId === identity.projectId &&
+    record.workspaceId === identity.workspaceId &&
+    record.provider === identity.provider &&
+    record.generation === identity.generation &&
+    record.directory === identity.directory &&
+    record.branch === identity.branch &&
+    record.baseSha === identity.baseSha &&
+    record.state === identity.state &&
+    record.updatedAt === identity.updatedAt
+  )
+}
+
+function reconciliationPlanIsSafe(plan: ObservationPlan): boolean {
+  return (
+    !plan.probeError &&
+    !["conflict", "unknown", "control_lost"].includes(plan.classification) &&
+    plan.observations
+      .filter((observation) => observation.source !== "git")
+      .every((observation) => observation.observed)
+  )
+}
+
+function verifiedPendingRuntime(record: SandboxRecord, plan: ObservationPlan): boolean {
+  const resource = runtimeResourceReference(record)
+  const provider = plan.provider.observation
+  return (
+    resource !== undefined &&
+    provider.observed &&
+    provider.resource === "present" &&
+    provider.ownership === "verified" &&
+    plan.provider.value?.resourceId === resource.resourceId &&
+    plan.handle.observed &&
+    plan.handle.resource === "absent" &&
+    workspaceEvidenceError(record, plan, record.operation?.kind === "stop" ? "stop" : "delete") === undefined
+  )
+}
+
+function repairAvailable(record: SandboxRecord, plan: ObservationPlan): boolean {
+  const provider = plan.provider.observation
+  const handle = plan.handle
+  const workspace = plan.workspace.observation
+  const workspaceAbsent = workspace.observed && workspace.resource === "absent" && workspace.ownership !== "conflict"
+  const workspaceExact = workspace.observed && workspace.resource === "present" && plan.workspace.value !== undefined && workspaceMatchesExactly(record, plan.workspace.value)
+  const staleControlPlane = workspaceExact || !["local", "detached", "deleted"].includes(record.state)
+  return (
+    provider.observed && provider.resource === "absent" && provider.ownership !== "conflict" &&
+    handle.observed && handle.resource === "absent" && handle.ownership !== "conflict" &&
+    staleControlPlane && (workspaceAbsent || workspaceExact)
+  )
+}
+
+function repairEvidenceError(plan: ObservationPlan): SandboxError {
+  if (plan.observations.some((observation) => observation.ownership === "conflict")) {
+    return new SandboxError("reconcile", "repair is blocked by conflicting ownership evidence", "REPAIR_CONFLICT")
+  }
+  return new SandboxError("reconcile", "repair requires fresh provider, runtime handle, and workspace absence evidence", "REPAIR_EVIDENCE")
+}
+
+function repairedState(record: SandboxRecord): "local" | "detached" {
+  return record.state === "local" ? "local" : "detached"
+}
+
 function workFromRecord(record: SandboxRecord | undefined, classification: SandboxResultV2["classification"]): SandboxResultV2["work"] {
   if (!record) return emptyWork()
   const failed = record.state === "sync_failed"
@@ -1858,6 +2795,8 @@ function allowedActions(
   contextAvailable = false,
   mutationsAllowed = true,
   preservationVerified = false,
+  repairAvailable = false,
+  recoveryAvailable = false,
 ): SandboxAllowedAction[] {
   const actions: SandboxAllowedAction[] = [
     action("status", role, [], [], "none"),
@@ -1878,6 +2817,19 @@ function allowedActions(
   }
   if (
     mutationsAllowed &&
+    classification === "orphan" &&
+    record.state !== "deleted" &&
+    recoveryAvailable &&
+    role === "host"
+  ) {
+    actions.push(action("delete", "host", [], [
+      "provider resource is present",
+      "provider ownership is verified",
+      "runtime driver can adopt the exact resource before preservation",
+    ], "operation_completion"))
+  }
+  if (
+    mutationsAllowed &&
     classification === "leaked_resource" &&
     record.state === "detached" &&
     provider?.observed === true &&
@@ -1891,9 +2843,9 @@ function allowedActions(
     mutationsAllowed &&
     (record.state === "error" || record.state === "sync_failed" || record.state === "recovery_pending") &&
     record.operation &&
-    ["start", "stop", "delete"].includes(record.operation.kind)
+    ["start", "stop", "delete", "recover"].includes(record.operation.kind)
   ) {
-    const requiredRole = record.operation?.kind === "start" || isForceDelete(record) ? "host" : role
+    const requiredRole = record.operation?.kind === "start" || record.operation?.kind === "recover" || isForceDelete(record) ? "host" : role
     if (classification !== "conflict") actions.push(action("retry", requiredRole, [], ["recorded operation is retryable"], "operation_completion"))
   }
   if (
@@ -1908,6 +2860,20 @@ function allowedActions(
   ) {
     actions.push(action("start", "host", [], ["no observed runtime requires preservation", "session context is available", "working tree is available"], "none"))
   }
+  if (mutationsAllowed && repairAvailable && role === "host") {
+    actions.push(action("repair", "host", [], [
+      "provider absence is freshly observed",
+      "runtime handle absence is freshly observed",
+      "workspace is absent or exactly owned by this session",
+    ], "operation_completion"))
+  }
+  if (mutationsAllowed && recoveryAvailable && classification === "orphan" && role === "host") {
+    actions.push(action("recover", "host", [], [
+      "provider resource is present",
+      "provider ownership is verified",
+      "no live runtime handle is present",
+    ], "operation_completion"))
+  }
   return actions
 }
 
@@ -1920,16 +2886,22 @@ function recommendedAction(
   contextAvailable = false,
   mutationsAllowed = true,
   preservationVerified = false,
+  repairAvailable = false,
+  recoveryAvailable = false,
 ): SandboxResultV2["recommendedAction"] {
-  const actions = allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed, preservationVerified)
+  const actions = allowedActions(record, role, classification, provider, captureAvailable, contextAvailable, mutationsAllowed, preservationVerified, repairAvailable, recoveryAvailable)
   const can = (operation: PublicOperation, requiredRole?: CapabilityRole) => actions.some((item) => item.operation === operation && (!requiredRole || item.role === requiredRole))
   if (classification === "attached" && can("stop")) return { operation: "stop", reasonCode: "ATTACHED_RUNTIME" }
+  if (classification === "orphan" && can("recover", "host")) return { operation: "recover", reasonCode: "VERIFIED_ORPHAN" }
+  if (classification === "work_at_risk" && can("retry")) return { operation: "retry", reasonCode: "WORK_AT_RISK" }
+  if (repairAvailable && can("repair", "host")) return { operation: "repair", reasonCode: "STALE_CONTROL_PLANE" }
+  if (can("retry")) return { operation: "retry", reasonCode: "RECOVERY_RETRY" }
   if (classification === "leaked_resource" && can("delete", "host")) return { operation: "delete", reasonCode: "VERIFIED_LEAK" }
   if (classification === "leaked_resource") return { operation: "inspect", reasonCode: "PRESERVATION_UNVERIFIED" }
-  if (classification === "work_at_risk" && can("retry")) return { operation: "retry", reasonCode: "WORK_AT_RISK" }
   if (classification === "clean" && can("start", "host")) return { operation: "start", reasonCode: "NO_RUNTIME" }
   if (classification === "control_lost") return { operation: "inspect", reasonCode: "RESOURCE_STATE_UNKNOWN" }
   if (classification === "stale_record") return { operation: "inspect", reasonCode: "STALE_RECORD_NEEDS_EVIDENCE" }
+  if (classification === "orphan" && can("delete", "host")) return { operation: "delete", reasonCode: "VERIFIED_ORPHAN_DELETE" }
   if (classification === "orphan") return { operation: "inspect", reasonCode: "VERIFIED_ORPHAN_READ_ONLY" }
   if (classification === "conflict") return { operation: "inspect", reasonCode: "OWNERSHIP_CONFLICT" }
   if (classification === "unknown" && can("inspect")) return { operation: "inspect", reasonCode: "INSUFFICIENT_EVIDENCE" }
@@ -2010,7 +2982,13 @@ function unknownObservation(source: SandboxObservation["source"], freshAt: strin
 }
 
 function workspaceMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
-  if (info.id !== record.workspaceId || info.projectID !== record.projectId || info.type !== record.provider || info.branch !== record.branch) return false
+  if (
+    info.id !== record.workspaceId ||
+    info.projectID !== record.projectId ||
+    info.type !== record.provider ||
+    info.branch !== record.branch ||
+    info.directory !== record.directory
+  ) return false
   const extra = isRecord(info.extra) ? info.extra : {}
   const state = isRecord(extra.providerState) ? extra.providerState : extra
   for (const [key, expected] of [
@@ -2023,7 +3001,14 @@ function workspaceMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
     const actual = extra[key] ?? state[key]
     if (actual !== undefined && actual !== expected) return false
   }
+  if (extra.owner !== undefined && extra.owner !== "opencode-sandbox") return false
   return true
+}
+
+function workspaceMatchesExactly(record: SandboxRecord, info: WorkspaceInfo): boolean {
+  if (!workspaceMatches(record, info)) return false
+  const extra = isRecord(info.extra) ? info.extra : undefined
+  return extra?.owner === "opencode-sandbox"
 }
 
 function classifySituation(record: SandboxRecord, observations: SandboxObservation[]): SandboxResultV2["classification"] {
@@ -2038,6 +3023,10 @@ function classifySituation(record: SandboxRecord, observations: SandboxObservati
   const handlePresent = handle?.observed === true && handle.resource === "present"
   const handleAbsent = handle?.observed === true && handle.resource === "absent"
   const workspaceAbsent = workspace?.observed === true && workspace.resource === "absent"
+  const workspaceSafe = workspace?.observed === true && (
+    workspace.resource === "absent" ||
+    (workspace.resource === "present" && workspace.ownership === "verified")
+  )
   const desired = intentFor(record).desiredLocation
   if (handlePresent && present && provider.health !== "unknown") return "attached"
   if (handlePresent) return "unknown"
@@ -2045,7 +3034,10 @@ function classifySituation(record: SandboxRecord, observations: SandboxObservati
     return record.state === "local" || record.state === "detached" || record.state === "deleted" ? "unknown" : "control_lost"
   }
   if (provider.resource === "present" && provider.ownership !== "verified") return "unknown"
-  if (handleAbsent && present) return desired === "local" || desired === "deleted" ? "leaked_resource" : "orphan"
+  if (handleAbsent && present) {
+    if (!workspaceSafe) return "unknown"
+    return desired === "local" || desired === "deleted" ? "leaked_resource" : "orphan"
+  }
   if (handleAbsent && record.state !== "local" && record.state !== "detached" && record.state !== "deleted") {
     if (absent && workspaceAbsent) return "stale_record"
     return "control_lost"
@@ -2103,7 +3095,7 @@ interface TargetProbe {
 }
 
 function runtimeHandleObservation(
-  session: SandcastleSession | undefined,
+  session: RuntimeSession | undefined,
   target: TargetProbe,
   freshAt: string,
 ): SandboxObservation {

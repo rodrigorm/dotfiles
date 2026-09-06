@@ -34,6 +34,12 @@ export function parseCliArgs(argv: readonly string[], remote: boolean): { operat
   if (remote && operation === "inventory") {
     throw new SandboxError("validate", "inventory is only available from the host", "CLI_INVENTORY")
   }
+  if (remote && operation === "repair") {
+    throw new SandboxError("validate", "repair is only available from the host", "CLI_REPAIR")
+  }
+  if (remote && operation === "recover") {
+    throw new SandboxError("validate", "recover is only available from the host", "CLI_RECOVER")
+  }
   return { operation, force: false }
 }
 

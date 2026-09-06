@@ -438,7 +438,7 @@ describe("Sandcastle lifecycle", () => {
     }
   })
 
-  it("marks active Sandcastle records orphaned after restart", async () => {
+  it("does not guess an orphan from a missing restart handle", async () => {
     const setup = await setupFakeLifecycle()
     const record = {
       sessionId: "ses_1",
@@ -482,16 +482,24 @@ describe("Sandcastle lifecycle", () => {
     await restarted.reconcile("prj_1")
 
     expect(provisioned).toBe(false)
-    expect(await setup.store.get("ses_1")).toMatchObject({
-      state: "orphaned",
-      lastError: { stage: "reconcile" },
+    expect(await setup.store.get("ses_1")).toMatchObject({ state: "remote" })
+    expect((await setup.store.get("ses_1"))?.lastError).toBeUndefined()
+    const inspection = await restarted.handle({
+      operation: "inspect",
+      force: false,
+      capability: createCapability({ sessionId: "ses_1", generation: 1, role: "host" }),
     })
+    expect(inspection).toMatchObject({
+      classification: "control_lost",
+      recommendedAction: { operation: "inspect", reasonCode: "RESOURCE_STATE_UNKNOWN" },
+    })
+    expect(inspection.allowedActions?.some((action) => action.operation === "recover")).toBe(false)
     const status = await restarted.handle({
       operation: "status",
       force: false,
       capability: createCapability({ sessionId: "ses_1", generation: 1, role: "host" }),
     })
-    expect(status).toMatchObject({ state: "orphaned" })
+    expect(status).toMatchObject({ state: "remote" })
     expect(status.details).toMatchObject({
       branch: record.branch,
       provider: "fake",
@@ -531,10 +539,7 @@ describe("Sandcastle lifecycle", () => {
 
     await restarted.onSessionIdle("ses_1")
 
-    expect(await setup.store.get("ses_1")).toMatchObject({
-      state: "orphaned",
-      lastError: { code: "SANDCASTLE_HANDLE" },
-    })
+    expect(await setup.store.get("ses_1")).toMatchObject({ state: "error", lastError: { code: "SANDCASTLE_HANDLE" } })
     expect(calls).toEqual([])
   })
 

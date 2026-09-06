@@ -9,7 +9,7 @@ import { dirname, isAbsolute, join, posix } from "node:path"
 import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 
 import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
-import { assertAbsolutePath, basicAuthHeader, buildRemoteFrame, generateRemoteCredentials, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
+import { assertAbsolutePath, basicAuthHeader, buildRemoteFrame, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
 import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment } from "./process"
 import { redactError, redactText } from "./redaction"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
@@ -23,6 +23,12 @@ import {
   type ProcessRunner,
   type ProcessSupervisor,
   type ProviderResourceObservation,
+  type RuntimeAdoptionInput,
+  type RuntimeCloseResult,
+  type RuntimeDriver,
+  type RuntimeOwner,
+  type RuntimeResourceReference,
+  type RuntimeSession,
   type WorkspaceInfo,
   type WorkspaceProviderBase,
   type WorkspaceRuntimeMetadata,
@@ -201,6 +207,8 @@ export interface SbxProviderOptions {
   revokeControlToken?: (token: string) => void
   assetDirectory?: string
   deferActivation?: boolean
+  authContent?: string
+  ownerForResource?: (resourceId: string, owner?: RuntimeOwner) => Promise<SbxOwner | undefined>
   writeOwnership?: (sandbox: string, ownershipId: string) => Promise<void>
   readOwnership?: (sandbox: string) => Promise<string | undefined>
 }
@@ -242,7 +250,7 @@ interface EnsuredSandbox {
   created: boolean
 }
 
-interface SbxOwner {
+export interface SbxOwner {
   provider: "sbx"
   ownershipId: string
   sessionId: string
@@ -270,10 +278,13 @@ export class SbxProvider implements WorkspaceProviderBase {
   private readonly revokeControlToken?: (token: string) => void
   private readonly assetDirectory: string
   private readonly deferActivation: boolean
+  private readonly authContent?: string
+  private readonly ownerForResource?: (resourceId: string, owner?: RuntimeOwner) => Promise<SbxOwner | undefined>
   private readonly writeOwnershipOverride?: (sandbox: string, ownershipId: string) => Promise<void>
   private readonly readOwnershipOverride?: (sandbox: string) => Promise<string | undefined>
   private readonly active = new Map<string, Activation>()
   private readonly owned = new Map<string, SbxOwner>()
+  private readonly runtimeSessions = new WeakMap<RuntimeSession, Activation>()
   private controlProxy: Server | undefined
   private controlProxyPort: number | undefined
   private controlProxyCreation: Promise<number> | undefined
@@ -296,6 +307,8 @@ export class SbxProvider implements WorkspaceProviderBase {
     this.revokeControlToken = options.revokeControlToken
     this.assetDirectory = options.assetDirectory ?? fileURLToPath(new URL(".", import.meta.url))
     this.deferActivation = options.deferActivation ?? false
+    this.authContent = options.authContent
+    this.ownerForResource = options.ownerForResource
     this.writeOwnershipOverride = options.writeOwnership
     this.readOwnershipOverride = options.readOwnership
   }
@@ -457,7 +470,28 @@ export class SbxProvider implements WorkspaceProviderBase {
     const metadata = readMetadata(info)
     const sandbox = metadata.sandbox
     if (!sandbox) throw new SandboxError("inspect", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
-    const expected = ownerFromMetadata(metadata)
+    return this.inspectResource(sandbox, ownerFromMetadata(metadata))
+  }
+
+  runtimeDriver(): RuntimeDriver {
+    return {
+      inspect: (resource) => this.inspectRuntime(resource),
+      adopt: (input) => this.adoptRuntime(input),
+      sync: (session) => this.syncRuntime(session),
+      close: (session) => this.closeRuntime(session),
+      abort: (session) => this.abortRuntime(session),
+      destroy: (resource, owner) => this.destroyRuntime(resource, owner),
+    }
+  }
+
+  private async inspectRuntime(resource: RuntimeResourceReference): Promise<ProviderResourceObservation> {
+    if (resource.provider !== "sbx") throw new SandboxError("inspect", "runtime provider does not match SBX", "SBX_PROVIDER_MISMATCH")
+    assertSandboxName(resource.resourceId)
+    const expected = await this.expectedRuntimeOwner(resource.resourceId)
+    return this.inspectResource(resource.resourceId, expected, true)
+  }
+
+  private async inspectResource(sandbox: string, expected?: SbxOwner, durableOnly = false): Promise<ProviderResourceObservation> {
     const inventory = await this.runSbx(["ls", "--json"], "inspect", undefined, { timeoutMs: INSPECTION_TIMEOUT_MS })
     const items = parseSbxInventory(inventory.stdout).filter((candidate) => candidate.name === sandbox)
     const evidence = [`sbx inventory:${sandbox}`]
@@ -476,10 +510,209 @@ export class SbxProvider implements WorkspaceProviderBase {
     return {
       resourceId: sandbox,
       resource: "present",
-      ownership: classifyOwnership(marker, this.owned.get(sandbox), expected),
+      ownership: classifyOwnership(marker, this.owned.get(sandbox), expected, durableOnly),
       health: classifySbxHealth(item.status),
       evidence,
     }
+  }
+
+  private async adoptRuntime(input: RuntimeAdoptionInput): Promise<RuntimeSession> {
+    if (input.resource.provider !== "sbx" || input.owner.provider !== "sbx") {
+      throw new SandboxError("adopt", "runtime adoption is not supported for this provider", "SBX_ADOPT_UNSUPPORTED")
+    }
+    assertSandboxName(input.resource.resourceId)
+    assertSafeBranch(input.owner.branch)
+    assertSha(input.owner.baseSha)
+    if ([...this.active.values()].some((activation) => activation.sandbox === input.resource.resourceId)) {
+      throw new SandboxError("adopt", "SBX runtime is already controlled by this process", "SBX_ADOPT_CONFLICT")
+    }
+
+    const expected = await this.expectedRuntimeOwner(input.resource.resourceId, input.owner)
+    let observation: ProviderResourceObservation
+    try {
+      observation = await this.inspectResource(input.resource.resourceId, expected, true)
+    } catch (error) {
+      throw adoptionUnknown(error)
+    }
+    if (!expected || !sameRuntimeOwner(expected, input.owner)) {
+      throw new SandboxError("adopt", "SBX runtime ownership is unavailable", "SBX_ADOPT_UNKNOWN")
+    }
+    assertAdoptable(observation)
+
+    let hostPort: number | undefined
+    try {
+      hostPort = await this.publishedPort(input.resource.resourceId)
+    } catch (error) {
+      throw adoptionUnknown(error)
+    }
+    if (hostPort === undefined) {
+      throw new SandboxError("adopt", "running SBX runtime has no published OpenCode port", "SBX_ADOPT_UNSUPPORTED")
+    }
+    if (!this.localControlSocket || !this.controlTokenFor || !this.authContent) {
+      throw new SandboxError("adopt", "SBX control runtime is unavailable", "SBX_ADOPT_UNSUPPORTED")
+    }
+
+    let directory: string
+    try {
+      const cloneRoot = await this.cloneDirectory(input.resource.resourceId)
+      directory = this.deferActivation ? join(cloneRoot, ".opencode-worktree") : cloneRoot
+      assertSandboxPath(directory, "sandbox checkout")
+      const branchResult = await this.runSbxRaw(
+        ["exec", input.resource.resourceId, "git", "-C", directory, "symbolic-ref", "--short", "HEAD"],
+        "adopt",
+      )
+      if (branchResult.exitCode !== 0 || branchResult.stdout.trim() !== input.owner.branch) {
+        throw new SandboxError("adopt", "SBX checkout branch does not match the lifecycle record", "SBX_ADOPT_CHECKOUT")
+      }
+      const headResult = await this.runSbxRaw(
+        ["exec", input.resource.resourceId, "git", "-C", directory, "rev-parse", "HEAD"],
+        "adopt",
+      )
+      if (headResult.exitCode !== 0) {
+        throw new SandboxError("adopt", "SBX checkout revision is unavailable", "SBX_ADOPT_CHECKOUT")
+      }
+      const head = headResult.stdout.trim()
+      try {
+        assertSha(head)
+      } catch {
+        throw new SandboxError("adopt", "SBX checkout revision is invalid", "SBX_ADOPT_CHECKOUT")
+      }
+      const lineage = await this.runSbxRaw(
+        ["exec", input.resource.resourceId, "git", "-C", directory, "merge-base", "--is-ancestor", input.owner.baseSha, head],
+        "adopt",
+      )
+      if (lineage.exitCode !== 0) {
+        throw new SandboxError("adopt", "SBX checkout history does not contain the lifecycle base revision", "SBX_ADOPT_CHECKOUT")
+      }
+    } catch (error) {
+      if (error instanceof SandboxError && error.code === "SBX_ADOPT_CHECKOUT") throw error
+      throw adoptionUnknown(error)
+    }
+
+    const previousOwner = this.owned.get(input.resource.resourceId)
+    const activation: Activation = {
+      ...expected,
+      sandbox: input.resource.resourceId,
+      directory,
+      branch: input.owner.branch,
+      baseSha: input.owner.baseSha,
+      hostPort,
+      password: randomBytes(32).toString("base64url"),
+    }
+    try {
+      activation.paths = makeRuntimePaths(input.owner.sessionId, input.owner.generation)
+      activation.controlToken = await this.controlTokenFor(input.owner.sessionId)
+      activation.authContent = this.authContent
+      this.owned.set(activation.sandbox, expected)
+      await this.assertRuntimeOwned(activation.sandbox, expected)
+      this.active.set(activation.workspaceId, activation)
+      await this.startControlledServer(activation)
+      await this.waitForHealth(activation)
+
+      let aborting: Promise<RuntimeCloseResult> | undefined
+      let session!: RuntimeSession
+      session = {
+        workspaceId: activation.workspaceId,
+        target: {
+          type: "remote",
+          url: `http://127.0.0.1:${activation.hostPort}`,
+          headers: { Authorization: basicAuthHeader(activation.password) },
+        },
+        remoteWorktreePath: activation.directory,
+        recoveryMetadata: metadataFor(activation),
+        inspect: () => this.inspectRuntime({ provider: "sbx", resourceId: activation.sandbox }),
+        abort: () => {
+          aborting ??= this.abortRuntime(session).catch((error) => {
+            aborting = undefined
+            throw error
+          })
+          return aborting
+        },
+      }
+      this.runtimeSessions.set(session, activation)
+      return session
+    } catch (error) {
+      await this.cleanupAdoption(activation)
+      if (previousOwner) this.owned.set(activation.sandbox, previousOwner)
+      else this.owned.delete(activation.sandbox)
+      throw error instanceof SandboxError ? error : new SandboxError("adopt", redactError(error), "SBX_ADOPT_UNKNOWN")
+    }
+  }
+
+  private async syncRuntime(session: RuntimeSession): Promise<void> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) throw new SandboxError("sync", "adopted SBX runtime is not active", "RUNTIME_UNAVAILABLE")
+    await this.assertRuntimeOwned(activation.sandbox, activation)
+    await this.syncOut({ workspaceId: activation.workspaceId, directory: this.worktree, baseSha: activation.baseSha })
+  }
+
+  private async closeRuntime(session: RuntimeSession): Promise<RuntimeCloseResult> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) throw new SandboxError("remove", "adopted SBX runtime is not active", "RUNTIME_UNAVAILABLE")
+    try {
+      await this.assertRuntimeOwned(activation.sandbox, activation)
+      await this.release(workspaceInfoForActivation(activation))
+      return {}
+    } catch (error) {
+      await this.cleanupAdoption(activation).catch(() => undefined)
+      throw error
+    } finally {
+      this.runtimeSessions.delete(session)
+    }
+  }
+
+  private async abortRuntime(session: RuntimeSession): Promise<RuntimeCloseResult> {
+    const activation = this.runtimeSessions.get(session)
+    if (!activation) return {}
+    try {
+      await this.cleanupAdoption(activation)
+      return {}
+    } finally {
+      this.runtimeSessions.delete(session)
+      this.owned.delete(activation.sandbox)
+    }
+  }
+
+  private async destroyRuntime(resource: RuntimeResourceReference, owner: RuntimeOwner): Promise<void> {
+    if (resource.provider !== "sbx" || owner.provider !== "sbx") {
+      throw new SandboxError("remove", "runtime destruction is not supported for this provider", "SBX_ADOPT_UNSUPPORTED")
+    }
+    assertSandboxName(resource.resourceId)
+    const expected = await this.expectedRuntimeOwner(resource.resourceId, owner)
+    const observation = await this.inspectResource(resource.resourceId, expected, true)
+    if (!expected || !sameRuntimeOwner(expected, owner)) throw new SandboxError("remove", "SBX runtime ownership is unavailable", "SBX_OWNERSHIP_UNVERIFIED")
+    assertDestructible(observation)
+    this.owned.set(resource.resourceId, expected)
+    await this.assertRuntimeOwned(resource.resourceId, expected)
+    await this.destroy(workspaceInfoForOwner(expected, resource.resourceId))
+  }
+
+  private async assertRuntimeOwned(sandbox: string, expected: SbxOwner): Promise<void> {
+    const marker = this.readOwnershipOverride
+      ? await this.readOwnershipOverride(sandbox)
+      : await this.readOwnership(sandbox, INSPECTION_TIMEOUT_MS)
+    if (!sameOwner(this.owned.get(sandbox), expected) || !marker || typeof marker === "string" || !sameOwner(marker, expected)) {
+      throw ownershipError()
+    }
+  }
+
+  private async expectedRuntimeOwner(resourceId: string, owner?: RuntimeOwner): Promise<SbxOwner | undefined> {
+    const expected = this.ownerForResource
+      ? await this.ownerForResource(resourceId, owner)
+      : this.owned.get(resourceId)
+    if (expected && owner && !sameRuntimeOwner(expected, owner)) return undefined
+    return expected
+  }
+
+  private async cleanupAdoption(activation: Activation): Promise<void> {
+    if (activation.process) {
+      activation.process.terminate()
+      await waitForProcess(activation.process).catch(() => undefined)
+      activation.process = undefined
+    }
+    if (activation.controlToken) this.revokeControlToken?.(activation.controlToken)
+    this.active.delete(activation.workspaceId)
+    if (this.active.size === 0) await this.closeControlProxy()
   }
 
   async inventory(): Promise<ProviderResourceObservation[]> {
@@ -1066,11 +1299,12 @@ async function readHealthResponse(response: Response): Promise<unknown> {
 export interface SbxSandcastleAdapterOptions extends SbxProviderOptions {
   input: SandcastleAdapterInput
   authContent?: string
+  provider?: SbxProvider
 }
 
 export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions): OpenCodeSandboxAdapter {
-  const { input, authContent, ...providerOptions } = options
-  const provider = new SbxProvider({ ...providerOptions, deferActivation: true })
+  const { input, authContent, provider: suppliedProvider, ...providerOptions } = options
+  const provider = suppliedProvider ?? new SbxProvider({ ...providerOptions, deferActivation: true, authContent })
   const info: WorkspaceInfo = {
     id: input.workspaceId,
     type: "sbx",
@@ -1237,9 +1471,10 @@ function parseSbxOwner(value: string): string | SbxOwner | undefined {
   }
 }
 
-function classifyOwnership(marker: string | SbxOwner | undefined, local: SbxOwner | undefined, expected: SbxOwner): ProviderResourceObservation["ownership"] {
-  if (!expected.ownershipId) return "unknown"
+function classifyOwnership(marker: string | SbxOwner | undefined, local: SbxOwner | undefined, expected?: SbxOwner, durableOnly = false): ProviderResourceObservation["ownership"] {
+  if (!expected?.ownershipId) return "unknown"
   if (typeof marker === "string") {
+    if (durableOnly) return "unknown"
     if (marker !== expected.ownershipId) return "conflict"
     return sameOwner(local, expected) ? "verified" : "unknown"
   }
@@ -1289,7 +1524,79 @@ function invalidSbxInventory(): SandboxError {
 
 function classifySbxHealth(status: string | undefined): ProviderResourceObservation["health"] {
   if (!status) return "unknown"
-  return status.toLowerCase() === "running" ? "healthy" : "degraded"
+  const normalized = status.trim().toLowerCase()
+  if (normalized === "running") return "healthy"
+  if (["created", "dead", "exited", "paused", "stopped"].includes(normalized)) return "degraded"
+  return "unknown"
+}
+
+function assertAdoptable(observation: ProviderResourceObservation): void {
+  if (observation.ownership === "conflict") {
+    throw new SandboxError("adopt", "SBX runtime ownership conflicts with the lifecycle record", "SBX_ADOPT_CONFLICT")
+  }
+  if (observation.resource !== "present" || observation.ownership !== "verified" || observation.health === "unknown") {
+    throw new SandboxError("adopt", "SBX runtime ownership or health is unknown", "SBX_ADOPT_UNKNOWN")
+  }
+  if (observation.health !== "healthy") {
+    throw new SandboxError("adopt", "stopped SBX runtimes cannot be resumed without provider mutation", "SBX_ADOPT_UNSUPPORTED")
+  }
+}
+
+function assertDestructible(observation: ProviderResourceObservation): void {
+  if (observation.ownership === "conflict") {
+    throw new SandboxError("remove", "SBX runtime ownership conflicts with the lifecycle record", "SBX_OWNERSHIP_UNVERIFIED")
+  }
+  if (observation.resource !== "present" || observation.ownership !== "verified") {
+    throw new SandboxError("remove", "SBX runtime ownership could not be verified", "SBX_OWNERSHIP_UNVERIFIED")
+  }
+}
+
+function adoptionUnknown(error: unknown): SandboxError {
+  if (error instanceof SandboxError && error.code === "SBX_ADOPT_CHECKOUT") return error
+  return new SandboxError("adopt", "SBX runtime state is unknown", "SBX_ADOPT_UNKNOWN")
+}
+
+function sameRuntimeOwner(actual: SbxOwner, expected: RuntimeOwner): boolean {
+  return (
+    actual.provider === expected.provider &&
+    actual.sessionId === expected.sessionId &&
+    actual.generation === expected.generation &&
+    actual.workspaceId === expected.workspaceId &&
+    actual.projectId === expected.projectId
+  )
+}
+
+function workspaceInfoForActivation(activation: Activation): WorkspaceInfo {
+  return {
+    id: activation.workspaceId,
+    type: "sbx",
+    name: activation.sandbox,
+    branch: activation.branch,
+    directory: activation.directory,
+    projectID: activation.projectId,
+    extra: { providerState: metadataFor(activation) },
+  }
+}
+
+function workspaceInfoForOwner(owner: SbxOwner, sandbox: string): WorkspaceInfo {
+  const metadata = {
+    provider: "sbx" as const,
+    ownershipId: owner.ownershipId,
+    sessionId: owner.sessionId,
+    generation: owner.generation,
+    workspaceId: owner.workspaceId,
+    projectId: owner.projectId,
+    sandbox,
+  }
+  return {
+    id: owner.workspaceId,
+    type: "sbx",
+    name: sandbox,
+    branch: null,
+    directory: null,
+    projectID: owner.projectId,
+    extra: { providerState: metadata },
+  }
 }
 
 function ownershipError(): SandboxError {

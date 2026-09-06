@@ -225,6 +225,12 @@ export function parseControlRequest(value: unknown, capability: ControlCapabilit
   if (value.operation === "start" && capability.role !== "host") {
     throw new SandboxError("validate", "start is only authorized from the host", "REQUEST_START")
   }
+  if (value.operation === "repair" && capability.role !== "host") {
+    throw new SandboxError("validate", "repair is only authorized from the host", "REQUEST_REPAIR")
+  }
+  if (value.operation === "recover" && capability.role !== "host") {
+    throw new SandboxError("validate", "recover is only authorized from the host", "REQUEST_RECOVER")
+  }
   return { operation: value.operation, force }
 }
 

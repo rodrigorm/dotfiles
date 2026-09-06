@@ -35,7 +35,7 @@ import {
 import { runSyncBarrier } from "./sync-barrier"
 import type { ExeControl } from "./exe-control"
 import { isWorkspaceSyncResult } from "./types"
-import { SandboxError, type SandboxRecord, type ProcessHandle, type ProcessResult, type ProcessRunner, type ProcessSupervisor, type VmInfo } from "./types"
+import { SandboxError, type GitWorkingTreeObservation, type ProviderResourceObservation, type RuntimeDriver, type SandboxRecord, type ProcessHandle, type ProcessResult, type ProcessRunner, type ProcessSupervisor, type VmInfo } from "./types"
 
 const temporaryDirectories: string[] = []
 const cleanups: Array<() => Promise<void>> = []
@@ -55,6 +55,9 @@ describe("sandboxctl parser", () => {
   it("accepts only the documented operations", () => {
     expect(parseCliArgs(["start"], false)).toEqual({ operation: "start", force: false })
     expect(parseCliArgs(["delete", "--force"], false)).toEqual({ operation: "delete", force: true })
+    expect(parseCliArgs(["repair"], false)).toEqual({ operation: "repair", force: false })
+    expect(parseCliArgs(["recover"], false)).toEqual({ operation: "recover", force: false })
+    expect(() => parseCliArgs(["recover"], true)).toThrow(/host/i)
     expect(parseCliArgs(["stop"], true)).toEqual({ operation: "stop", force: false })
   })
 
@@ -79,6 +82,8 @@ describe("sandboxctl parser", () => {
       { argv: ["delete", "--force"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_FORCE" },
       { argv: ["start"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_START" },
       { argv: ["inventory"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_INVENTORY" },
+      { argv: ["repair"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_REPAIR" },
+      { argv: ["recover"], env: { SANDBOX_CONTROL_ROLE: "remote" }, code: "CLI_RECOVER" },
       { argv: ["status", "unexpected"], env: {}, code: "CLI_ARGUMENT" },
     ] as const
 
@@ -147,6 +152,7 @@ describe("lifecycle state", () => {
     expect(canTransition("sync_failed", "stop_pending")).toBe(true)
     expect(canTransition("sync_failed", "orphaned")).toBe(true)
     expect(canTransition("recovery_pending", "remote")).toBe(true)
+    expect(canTransition("orphaned", "delete_pending")).toBe(true)
   })
 })
 
@@ -815,6 +821,9 @@ describe("control channel", () => {
     expect(() => parseControlRequest({ operation: "status" }, project)).toThrow()
     expect(() => parseControlRequest({ operation: "inventory" }, createCapability({ sessionId: "ses_1", generation: 1, role: "host" }))).toThrow()
     expect(() => parseControlRequest({ operation: "inventory" }, createCapability({ sessionId: "ses_1", generation: 1, role: "remote" }))).toThrow()
+    expect(() => parseControlRequest({ operation: "repair" }, project)).toThrow(/project/i)
+    expect(() => parseControlRequest({ operation: "repair" }, createCapability({ sessionId: "ses_1", generation: 1, role: "remote" }))).toThrow(/host/i)
+    expect(() => parseControlRequest({ operation: "recover" }, createCapability({ sessionId: "ses_1", generation: 1, role: "remote" }))).toThrow(/host/i)
   })
 
   it("returns bounded V2 envelopes with stable transport and handler codes", async () => {
@@ -856,11 +865,11 @@ describe("lifecycle controller", () => {
       { state: "local", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "clean", action: "start" },
       { state: "local", provider: { resource: "present", ownership: "unknown", health: "unknown" }, workspace: false, classification: "unknown", action: "inspect" },
       { state: "remote", provider: { resource: "unknown", ownership: "unknown", health: "unknown" }, workspace: false, classification: "control_lost", action: "inspect" },
-      { state: "remote", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "inspect" },
+      { state: "remote", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "repair" },
       { state: "remote", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, classification: "orphan", action: "inspect" },
       { state: "detached", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, preservedWorktreePath: "/tmp/preserved", classification: "leaked_resource", action: "delete" },
       { state: "detached", provider: { resource: "present", ownership: "verified", health: "healthy" }, workspace: false, classification: "leaked_resource", action: "inspect" },
-      { state: "recovery_pending", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "inspect", retryable: true },
+      { state: "recovery_pending", provider: { resource: "absent", ownership: "unknown", health: "unknown" }, workspace: false, classification: "stale_record", action: "repair", retryable: true },
       { state: "remote", provider: { resource: "present", ownership: "conflict", health: "unknown" }, workspace: false, classification: "conflict", action: "inspect" },
       { state: "sync_failed", provider: { resource: "unknown", ownership: "unknown", health: "unknown" }, workspace: false, classification: "work_at_risk", action: "retry" },
     ] as const
@@ -916,6 +925,208 @@ describe("lifecycle controller", () => {
       }
       expect(providerCalls).toBe(1)
     }
+  })
+
+  it("repairs a stale record after fresh provider, handle, and workspace absence", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "remote" as const,
+      operation: { kind: "stop" as const, phase: "remote" },
+      lastError: { stage: "reconcile", message: "stale" },
+    }
+    await store.write(record)
+    let removed = 0
+    let providerMutations = 0
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      providerTarget: async () => { throw new SandboxError("tunnel", "runtime is not active", "RUNTIME_UNAVAILABLE") },
+      providerRelease: async () => { providerMutations++ },
+      providerDestroy: async () => { providerMutations++ },
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() { throw new Error("must not warp") },
+        async remove() { removed++ },
+        async inspect() { return undefined },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    const inspection = await controller.handle({ operation: "inspect", force: false, capability })
+    expect(inspection).toMatchObject({
+      classification: "stale_record",
+      recommendedAction: { operation: "repair", reasonCode: "STALE_CONTROL_PLANE" },
+    })
+    expect(inspection.allowedActions).toContainEqual(expect.objectContaining({ operation: "repair", role: "host" }))
+
+    const repaired = await controller.handle({ operation: "repair", force: false, capability })
+
+    expect(repaired).toMatchObject({ schemaVersion: 2, ok: true, operation: "repair", state: "detached", classification: "clean" })
+    expect(repaired.observations?.find((observation) => observation.source === "provider")).toMatchObject({ observed: true, resource: "absent" })
+    expect(repaired.observations?.find((observation) => observation.source === "handle")).toMatchObject({ observed: true, resource: "absent" })
+    expect(repaired.observations?.find((observation) => observation.source === "workspace")).toMatchObject({ observed: true, resource: "absent" })
+    expect(removed).toBe(0)
+    expect(providerMutations).toBe(0)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached", providerState: {} })
+    expect((await store.get(record.sessionId))?.operation).toBeUndefined()
+    expect((await store.get(record.sessionId))?.lastError).toBeUndefined()
+  })
+
+  it("removes only an exactly owned stale workspace during repair", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "remote" as const }
+    await store.write(record)
+    let inspections = 0
+    let removedInput: { workspaceId: string; directory: string } | undefined
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove(input) { removedInput = input },
+        async inspect() {
+          inspections++
+          return matchingWorkspace(record)
+        },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "repair",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    })
+
+    expect(result).toMatchObject({ ok: true, state: "detached", classification: "clean" })
+    expect(inspections).toBe(2)
+    expect(removedInput).toEqual({ workspaceId: record.workspaceId, directory: record.directory })
+  })
+
+  it("does not repair mismatched, unknown, or conflicting observations", async () => {
+    const cases: Array<{
+      provider?: ProviderResourceObservation
+      providerError?: SandboxError
+      workspace: (record: SandboxRecord) => ReturnType<typeof matchingWorkspace> | undefined
+    }> = [
+      {
+        provider: { resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] },
+        workspace: (record: SandboxRecord) => matchingWorkspace(record, { directory: "/foreign/project" }),
+      },
+      {
+        provider: undefined,
+        providerError: new SandboxError("inspect", "provider unavailable", "PROVIDER_UNAVAILABLE"),
+        workspace: () => undefined,
+      },
+      {
+        provider: { resourceId: "resource-1", resource: "present", ownership: "conflict", health: "unknown", evidence: ["fixture"] },
+        workspace: () => undefined,
+      },
+    ]
+
+    for (const testCase of cases) {
+      const store = new FileStateStore(await temporaryDirectory())
+      const record = { ...makeRecord(), state: "remote" as const }
+      await store.write(record)
+      let removed = 0
+      const controller = new LifecycleController({
+        store,
+        providerInspect: async () => {
+          if (testCase.providerError) throw testCase.providerError
+          return testCase.provider!
+        },
+        providerTarget: async () => undefined,
+        workspace: {
+          async create() { throw new Error("must not create") },
+          async warp() {},
+          async remove() { removed++ },
+          async inspect() { return testCase.workspace(record) },
+        },
+      })
+      const before = JSON.stringify(await store.get(record.sessionId))
+
+      const result = await controller.handle({
+        operation: "repair",
+        force: false,
+        capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.code).toMatch(/^REPAIR_(?:EVIDENCE|CONFLICT)$/)
+      expect(removed).toBe(0)
+      expect(JSON.stringify(await store.get(record.sessionId))).toBe(before)
+    }
+  })
+
+  it("denies repair to a remote lifecycle capability", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = { ...makeRecord(), state: "remote" as const }
+    await store.write(record)
+    let inspected = false
+    const controller = new LifecycleController({
+      store,
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async inspect() { inspected = true; return undefined },
+      },
+    })
+
+    const result = await controller.handle({
+      operation: "repair",
+      force: false,
+      capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "remote" }),
+    })
+
+    expect(result).toMatchObject({ ok: false, error: { code: "REQUEST_REPAIR", stage: "validate" } })
+    expect(inspected).toBe(false)
+  })
+
+  it("rejects a reconciliation plan when the record changes before the lock", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const record = {
+      ...makeRecord(),
+      state: "remote" as const,
+      operation: { kind: "stop" as const, phase: "remote" },
+    }
+    await store.write(record)
+    let releaseProvider!: () => void
+    let providerStarted!: () => void
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve })
+    const started = new Promise<void>((resolve) => { providerStarted = resolve })
+    let syncOutCalls = 0
+    const controller = new LifecycleController({
+      store,
+      providerInspect: async () => {
+        providerStarted()
+        await providerGate
+        return { resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }
+      },
+      providerTarget: async () => ({ type: "remote", url: "https://remote.example.test" }),
+      workspace: {
+        async create() { throw new Error("must not create") },
+        async warp() {},
+        async remove() {},
+        async syncOut(input) {
+          syncOutCalls++
+          return { kind: "control-plane", baseSha: input.baseSha }
+        },
+        async inspect() { return undefined },
+      },
+    })
+
+    const reconciliation = controller.reconcile(record.projectId)
+    await providerStarted
+    const changed = { ...record, updatedAt: new Date(2000).toISOString() }
+    await store.write(changed)
+    releaseProvider()
+    await reconciliation
+
+    expect(syncOutCalls).toBe(0)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "remote", updatedAt: changed.updatedAt, operation: record.operation })
   })
 
   it("classifies a live direct provider only when its target is observed", async () => {
@@ -1215,7 +1426,624 @@ describe("lifecycle controller", () => {
     expect(result.effectiveTarget).toEqual({ kind: "local", directory: record.directory })
   })
 
-  it("replays a persisted recovery operation instead of leaving recovery_pending stranded", async () => {
+  it("recovers a verified orphan through the runtime driver and stops it without creating", async () => {
+    const fixture = await setupRecoveryFixture()
+    const inspection = await fixture.controller.handle({ operation: "inspect", force: false, capability: fixture.capability })
+
+    expect(inspection).toMatchObject({
+      classification: "orphan",
+      recommendedAction: { operation: "recover", reasonCode: "VERIFIED_ORPHAN" },
+    })
+    expect(inspection.allowedActions).toContainEqual(expect.objectContaining({ operation: "recover", role: "host" }))
+
+    const recovered = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+    expect(recovered).toMatchObject({
+      ok: true,
+      operation: "recover",
+      state: "remote",
+      classification: "attached",
+      effectiveTarget: { kind: "remote", resourceId: "resource-1" },
+    })
+    expect(fixture.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "warp:remote",
+      "sync:start",
+      "sync:connected",
+      "replay",
+    ])
+    expect(fixture.calls).not.toContain("worktree:create")
+    expect(fixture.calls).not.toContain("sandbox:create")
+    expect(JSON.stringify(await fixture.store.get(fixture.record.sessionId))).not.toContain("https://")
+
+    await expect(fixture.controller.handle({ operation: "stop", force: false, capability: fixture.capability })).resolves.toMatchObject({ state: "stop_pending" })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({ state: "detached" })
+    expect(fixture.calls.slice(-4)).toEqual(["sync", "warp:local", "close", "workspace:remove"])
+    expect(fixture.calls).not.toContain("destroy")
+
+    await expect(fixture.controller.handle({ operation: "delete", force: true, capability: fixture.capability })).resolves.toMatchObject({ state: "deleted" })
+    expect(fixture.calls.slice(-3)).toEqual(["workspace:remove", "inspect:resource-1", "destroy"])
+  })
+
+  it("denies recover to a remote capability with a stable V2 error", async () => {
+    const fixture = await setupRecoveryFixture()
+
+    const result = await fixture.controller.handle({
+      operation: "recover",
+      force: false,
+      capability: createCapability({ sessionId: fixture.record.sessionId, generation: fixture.record.generation, role: "remote" }),
+    })
+
+    expect(result).toMatchObject({ ok: false, operation: "recover", error: { code: "REQUEST_RECOVER", stage: "validate", retryable: false } })
+    expect(fixture.calls).toEqual([])
+  })
+
+  it("does not adopt an unknown or conflicting resource", async () => {
+    for (const observation of [
+      { resource: "unknown", ownership: "unknown" },
+      { resource: "present", ownership: "conflict" },
+    ] as const) {
+      const fixture = await setupRecoveryFixture({ observation: { ...observation, health: "unknown" } })
+
+      const result = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+      expect(result.ok).toBe(false)
+      expect(result.error?.code).toMatch(/^RECOVER_(?:EVIDENCE|CONFLICT)$/)
+      expect(fixture.calls).toEqual(["inspect:resource-1"])
+      expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({ state: "orphaned" })
+      expect(fixture.calls).not.toContain("adopt")
+    }
+  })
+
+  it("blocks recovery and orphan deletion without fresh workspace ownership evidence", async () => {
+    for (const scenario of [
+      { workspaceObservation: "foreign" as const, recoverCode: "RECOVER_CONFLICT", deleteCode: "DELETE_CONFLICT" },
+      { workspaceObservation: "unavailable" as const, recoverCode: "RECOVER_EVIDENCE", deleteCode: "DELETE_EVIDENCE" },
+    ]) {
+      const recovery = await setupRecoveryFixture(scenario)
+      const recovered = await recovery.controller.handle({ operation: "recover", force: false, capability: recovery.capability })
+
+      expect(recovered).toMatchObject({ ok: false, error: { code: scenario.recoverCode } })
+      expect(recovered.allowedActions?.some((action) => action.operation === "recover")).toBe(false)
+      expect(recovered.recommendedAction?.operation).not.toBe("recover")
+      expect(recovery.calls).not.toContain("adopt")
+      expect(recovery.calls).not.toContain("workspace:remove")
+      expect(recovery.calls).not.toContain("destroy")
+
+      const deletion = await setupRecoveryFixture(scenario)
+      const deleted = await deletion.controller.handle({ operation: "delete", force: false, capability: deletion.capability })
+
+      expect(deleted).toMatchObject({ ok: false, state: "orphaned", error: { code: scenario.deleteCode } })
+      expect(deletion.calls).not.toContain("adopt")
+      expect(deletion.calls).not.toContain("workspace:remove")
+      expect(deletion.calls).not.toContain("destroy")
+    }
+  })
+
+  it("single-flights concurrent recovery and adopts the resource once", async () => {
+    let releaseAdoption!: () => void
+    let signalAdoptionStarted!: () => void
+    const adoptionStarted = new Promise<void>((resolve) => { signalAdoptionStarted = resolve })
+    const adoptionReleased = new Promise<void>((resolve) => { releaseAdoption = resolve })
+    const fixture = await setupRecoveryFixture({ adoptGate: { started: signalAdoptionStarted, wait: adoptionReleased } })
+
+    const first = fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+    await adoptionStarted
+    const second = fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+    releaseAdoption()
+    const results = await Promise.all([first, second])
+
+    expect(results[0]).toMatchObject({ ok: true, operation: "recover", state: "remote" })
+    expect(results[1]).toMatchObject({ ok: true, operation: "recover", state: "remote" })
+    expect(fixture.calls.filter((call) => call === "adopt")).toHaveLength(1)
+  })
+
+  it("rejects Cloudflare recovery before runtime inspection", async () => {
+    const fixture = await setupRecoveryFixture()
+    await fixture.store.write({ ...fixture.record, provider: "cloudflare" })
+
+    const result = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+    expect(result).toMatchObject({ ok: false, error: { code: "RECOVER_UNSUPPORTED", stage: "reconcile" } })
+    expect(fixture.calls).toEqual([])
+  })
+
+  it("fails a stale recovery plan before claiming the adopted session", async () => {
+    const fixture = await setupRecoveryFixture({
+      onAdopt: async () => {
+        await writeFile(fixture.store.recordPath(fixture.record.sessionId), `${JSON.stringify({ ...fixture.record, updatedAt: new Date(2000).toISOString() })}\n`)
+      },
+    })
+
+    const result = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+    expect(result).toMatchObject({ ok: false, operation: "recover", error: { code: "RECOVER_STALE", stage: "validate" } })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "abort"])
+    expect(fixture.calls).not.toContain("warp:remote")
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({ state: "orphaned", updatedAt: new Date(2000).toISOString() })
+  })
+
+  it("aborts a failed recovered session without closing the provider resource", async () => {
+    const fixture = await setupRecoveryFixture({
+      routeError: new SandboxError("tunnel", "recovered target failed", "RECOVER_ROUTE"),
+      abortPreservedWorktreePath: "/tmp/aborted-recovery",
+    })
+
+    const result = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+    expect(result).toMatchObject({
+      ok: false,
+      state: "recovery_pending",
+      error: { code: "RECOVER_ROUTE" },
+      work: { preservedWorktreePath: "/tmp/aborted-recovery" },
+    })
+    expect(result.allowedActions).toContainEqual(expect.objectContaining({ operation: "recover", role: "host" }))
+    expect(result.allowedActions).toContainEqual(expect.objectContaining({ operation: "retry", role: "host" }))
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "recovery_pending",
+      operation: { kind: "recover", phase: "adopt_failed" },
+      preservedWorktreePath: "/tmp/aborted-recovery",
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "warp:remote", "abort"])
+    expect(fixture.calls).not.toContain("close")
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("keeps adoption failure inspectable and recoverable without destroying the resource", async () => {
+    const fixture = await setupRecoveryFixture({ adoptError: new SandboxError("adopt", "fake adoption failed", "FAKE_ADOPT") })
+
+    const result = await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+
+    expect(result).toMatchObject({ ok: false, state: "recovery_pending", error: { code: "FAKE_ADOPT" } })
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "recovery_pending",
+      operation: { kind: "recover", phase: "adopt_failed" },
+      lastError: { code: "FAKE_ADOPT" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt"])
+    expect(fixture.calls).not.toContain("destroy")
+
+    const inspection = await fixture.controller.handle({ operation: "inspect", force: false, capability: fixture.capability })
+    expect(inspection).toMatchObject({ classification: "orphan", recommendedAction: { operation: "recover" } })
+    expect(inspection.allowedActions).toContainEqual(expect.objectContaining({ operation: "recover", role: "host" }))
+  })
+
+  it("does not host-inspect a provider-local adopted checkout", async () => {
+    const inspectedPaths: string[] = []
+    const fixture = await setupRecoveryFixture({
+      gitInspect: async (_record, worktreePath) => {
+        inspectedPaths.push(worktreePath)
+        return { head: "0123456789012345678901234567890123456789", branch: "opencode/recovered", dirty: false, evidence: ["fixture"] }
+      },
+    })
+
+    await expect(fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "remote",
+    })
+    const result = await fixture.controller.handle({ operation: "inspect", force: false, capability: fixture.capability })
+
+    expect(inspectedPaths).toEqual([])
+    expect(result.observations?.find((observation) => observation.source === "git")).toMatchObject({
+      observed: false,
+      evidence: ["runtime worktree is unavailable"],
+    })
+  })
+
+  it("deletes a freshly observed orphan only after adoption and preservation", async () => {
+    const fixture = await setupRecoveryFixture({ state: "remote" })
+
+    await expect(fixture.controller.handle({ operation: "delete", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "delete_pending",
+    })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "deleted",
+      operation: { kind: "delete", phase: "deleted", providerDestroyed: true },
+    })
+    expect(fixture.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect:resource-1",
+      "destroy",
+    ])
+  })
+
+  it("does not destroy an orphan when preservation sync fails", async () => {
+    const fixture = await setupRecoveryFixture({
+      syncError: new SandboxError("sync", "fake sync failed", "FAKE_SYNC"),
+    })
+
+    await fixture.controller.handle({ operation: "delete", force: false, capability: fixture.capability })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "sync_failed",
+      operation: { kind: "delete", phase: "adopting" },
+      lastError: { code: "FAKE_SYNC" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "inspect:resource-1", "adopt", "sync"])
+    expect(fixture.calls).not.toContain("close")
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("keeps orphan deletion adoption failure retryable without destroying", async () => {
+    const fixture = await setupRecoveryFixture({ adoptError: new SandboxError("adopt", "fake adoption failed", "FAKE_ADOPT") })
+
+    await fixture.controller.handle({ operation: "delete", force: false, capability: fixture.capability })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "error",
+      operation: { kind: "delete", phase: "adopting" },
+      lastError: { code: "FAKE_ADOPT" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "inspect:resource-1", "adopt"])
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("blocks destruction when ownership changes after preservation", async () => {
+    const fixture = await setupRecoveryFixture({
+      observations: [
+        { resource: "present", ownership: "verified", health: "healthy" },
+        { resource: "present", ownership: "verified", health: "healthy" },
+        { resource: "present", ownership: "conflict", health: "unknown" },
+      ],
+    })
+
+    await fixture.controller.handle({ operation: "delete", force: false, capability: fixture.capability })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "error",
+      operation: { kind: "delete", phase: "destroying" },
+      lastError: { code: "DELETE_OWNERSHIP_UNVERIFIED" },
+    })
+    expect(fixture.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect:resource-1",
+    ])
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("requires ownership proof before force-discarding an orphan and skips sync only after adoption", async () => {
+    const blocked = await setupRecoveryFixture({
+      observations: [{ resource: "present", ownership: "conflict", health: "unknown" }],
+    })
+
+    await expect(blocked.controller.handle({ operation: "delete", force: true, capability: blocked.capability })).resolves.toMatchObject({
+      ok: false,
+      state: "orphaned",
+      error: { code: "DELETE_CONFLICT" },
+    })
+    expect(blocked.calls).toEqual(["inspect:resource-1"])
+
+    const discarded = await setupRecoveryFixture()
+    await expect(discarded.controller.handle({ operation: "delete", force: true, capability: discarded.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "deleted",
+    })
+    expect(discarded.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect:resource-1",
+      "destroy",
+    ])
+    expect(discarded.calls).not.toContain("sync")
+  })
+
+  it("retries orphan deletion after workspace cleanup fails without readopting", async () => {
+    const fixture = await setupRecoveryFixture({ workspaceRemoveFailures: 1 })
+
+    await fixture.controller.handle({ operation: "delete", force: false, capability: fixture.capability })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "error",
+      operation: { kind: "delete", phase: "removing" },
+    })
+
+    await expect(fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "deleted",
+    })
+    expect(fixture.calls.filter((call) => call === "adopt")).toHaveLength(1)
+    expect(fixture.calls.filter((call) => call === "sync")).toHaveLength(1)
+    expect(fixture.calls.filter((call) => call === "destroy")).toHaveLength(1)
+    expect(fixture.calls.filter((call) => call === "workspace:remove")).toHaveLength(2)
+  })
+
+  it("does not repeat a persisted provider destruction while finalizing delete", async () => {
+    const fixture = await setupRecoveryFixture()
+    await fixture.store.write({
+      ...fixture.record,
+      state: "delete_pending",
+      operation: { kind: "delete", phase: "destroying", providerDestroyed: true },
+    })
+
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({ state: "deleted" })
+    expect(fixture.calls).toEqual([])
+  })
+
+  it("completes a persisted delete after fresh provider absence", async () => {
+    const fixture = await setupRecoveryFixture({
+      observation: { resource: "absent", ownership: "unknown", health: "unknown" },
+    })
+    const record = {
+      ...fixture.record,
+      state: "delete_pending" as const,
+      operation: { kind: "delete" as const, phase: "destroying", providerDestroyed: true },
+    }
+    await fixture.store.write(record)
+
+    await fixture.controller.reconcile(record.projectId)
+
+    expect(await fixture.store.get(record.sessionId)).toMatchObject({
+      state: "deleted",
+      operation: { kind: "delete", phase: "deleted", providerDestroyed: true },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "workspace:remove"])
+    expect(fixture.calls).not.toContain("adopt")
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("does not clean up an unknown or conflicting workspace during persisted delete recovery", async () => {
+    for (const workspaceObservation of ["unavailable", "foreign"] as const) {
+      const fixture = await setupRecoveryFixture({
+        observation: { resource: "absent", ownership: "unknown", health: "unknown" },
+        workspaceObservation,
+      })
+      const record = {
+        ...fixture.record,
+        state: "delete_pending" as const,
+        operation: { kind: "delete" as const, phase: "destroying", providerDestroyed: true },
+      }
+      await fixture.store.write(record)
+      const before = await fixture.store.get(record.sessionId)
+
+      await fixture.controller.reconcile(record.projectId)
+
+      expect(await fixture.store.get(record.sessionId)).toEqual(before)
+      expect(fixture.calls).toEqual(["inspect:resource-1"])
+      expect(fixture.calls).not.toContain("workspace:remove")
+      expect(fixture.calls).not.toContain("destroy")
+    }
+  })
+
+  it("does not destroy again when retry finishes a provider-absent delete", async () => {
+    const fixture = await setupRecoveryFixture({
+      observation: { resource: "absent", ownership: "unknown", health: "unknown" },
+    })
+    const record = {
+      ...fixture.record,
+      state: "error" as const,
+      operation: { kind: "delete" as const, phase: "removing", providerDestroyed: true },
+    }
+    await fixture.store.write(record)
+
+    await expect(fixture.controller.handle({
+      operation: "retry",
+      force: false,
+      capability: fixture.capability,
+    })).resolves.toMatchObject({ ok: true, operation: "retry", state: "deleted" })
+
+    expect(fixture.calls).toEqual(["inspect:resource-1", "workspace:remove"])
+    expect(fixture.calls).not.toContain("adopt")
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("normalizes a crashed adopting delete into a fresh retry", async () => {
+    const fixture = await setupRecoveryFixture()
+    await fixture.store.write({
+      ...fixture.record,
+      state: "delete_pending",
+      operation: { kind: "delete", phase: "adopting" },
+    })
+
+    await fixture.controller.reconcile("prj_1")
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "recovery_pending",
+      operation: { kind: "delete", phase: "adopting" },
+      lastError: { code: "DELETE_RECOVERY_REQUIRED" },
+    })
+    const inspection = await fixture.controller.handle({ operation: "inspect", force: false, capability: fixture.capability })
+    expect(inspection.allowedActions).toContainEqual(expect.objectContaining({ operation: "retry", role: "host" }))
+
+    const retry = await fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })
+
+    expect(retry).toMatchObject({ ok: true, operation: "retry", state: "deleted" })
+    expect(fixture.calls.filter((call) => call === "adopt")).toHaveLength(1)
+    expect(fixture.calls).toContain("destroy")
+  })
+
+  it("preserves the close path when final workspace cleanup fails", async () => {
+    const fixture = await setupRecoveryFixture({ closePreservedWorktreePath: "/tmp/closed-recovery", workspaceRemoveFailures: 1 })
+
+    await fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })
+    await fixture.controller.handle({ operation: "stop", force: false, capability: fixture.capability })
+    await fixture.controller.onSessionIdle(fixture.record.sessionId)
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({
+      state: "error",
+      preservedWorktreePath: "/tmp/closed-recovery",
+    })
+    expect(fixture.calls).toContain("close")
+  })
+
+  it("does not mutate a record during conflict reconciliation", async () => {
+    const fixture = await setupRecoveryFixture({ state: "remote", workspaceObservation: "foreign" })
+    const before = await fixture.store.get(fixture.record.sessionId)
+
+    await fixture.controller.reconcile("prj_1")
+
+    expect(await fixture.store.get(fixture.record.sessionId)).toEqual(before)
+    expect(fixture.calls).not.toContain("adopt")
+    expect(fixture.calls).not.toContain("workspace:remove")
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("leaves an unknown pending deletion unchanged during reconciliation", async () => {
+    const fixture = await setupRecoveryFixture({
+      observation: { resource: "unknown", ownership: "unknown", health: "unknown" },
+    })
+    const record = {
+      ...fixture.record,
+      state: "delete_pending" as const,
+      operation: { kind: "delete" as const, phase: "awaiting_idle", force: true },
+    }
+    await fixture.store.write(record)
+    const before = await fixture.store.get(record.sessionId)
+
+    await fixture.controller.reconcile(record.projectId)
+
+    expect(await fixture.store.get(record.sessionId)).toEqual(before)
+    expect(fixture.calls).toEqual(["inspect:resource-1"])
+  })
+
+  it("leaves a conflicting pending deletion unchanged during reconciliation", async () => {
+    const fixture = await setupRecoveryFixture({
+      observation: { resource: "present", ownership: "conflict", health: "unknown" },
+    })
+    const record = {
+      ...fixture.record,
+      state: "delete_pending" as const,
+      operation: { kind: "delete" as const, phase: "awaiting_idle", force: false },
+    }
+    await fixture.store.write(record)
+    const before = await fixture.store.get(record.sessionId)
+
+    await fixture.controller.reconcile(record.projectId)
+
+    expect(await fixture.store.get(record.sessionId)).toEqual(before)
+    expect(fixture.calls).toEqual(["inspect:resource-1"])
+  })
+
+  it("turns a verified pending stop into retryable recovery without provider mutation", async () => {
+    const fixture = await setupRecoveryFixture({ state: "remote" })
+    const record = {
+      ...fixture.record,
+      state: "stop_pending" as const,
+      operation: { kind: "stop" as const, phase: "awaiting_idle" },
+    }
+    await fixture.store.write(record)
+
+    await fixture.controller.reconcile(record.projectId)
+
+    expect(await fixture.store.get(record.sessionId)).toMatchObject({
+      state: "recovery_pending",
+      operation: { kind: "stop", phase: "adopting" },
+      lastError: { code: "STOP_RECOVERY_REQUIRED" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1"])
+    const inspection = await fixture.controller.handle({
+      operation: "inspect",
+      force: false,
+      capability: fixture.capability,
+    })
+    expect(inspection.allowedActions).toContainEqual(expect.objectContaining({ operation: "retry", role: "host" }))
+
+    const retry = await fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })
+
+    expect(retry).toMatchObject({ ok: true, operation: "retry", state: "detached" })
+    expect(fixture.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+    ])
+    expect(fixture.calls).not.toContain("destroy")
+  })
+
+  it("resumes verified pending deletion by adopting, preserving, and destroying once", async () => {
+    const fixture = await setupRecoveryFixture({ state: "remote" })
+    const record = {
+      ...fixture.record,
+      state: "delete_pending" as const,
+      operation: { kind: "delete" as const, phase: "awaiting_idle", force: false },
+    }
+    await fixture.store.write(record)
+
+    await fixture.controller.reconcile(record.projectId)
+
+    expect(await fixture.store.get(record.sessionId)).toMatchObject({
+      state: "recovery_pending",
+      operation: { kind: "delete", phase: "adopting", force: false },
+      lastError: { code: "DELETE_RECOVERY_REQUIRED" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1"])
+
+    const retry = await fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })
+
+    expect(retry).toMatchObject({ ok: true, operation: "retry", state: "deleted" })
+    expect(fixture.calls).toEqual([
+      "inspect:resource-1",
+      "inspect:resource-1",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect:resource-1",
+      "destroy",
+    ])
+  })
+
+  it("does not duplicate verified pending deletion effects across reconciliation and retry", async () => {
+    const fixture = await setupRecoveryFixture({ state: "remote" })
+    const record = {
+      ...fixture.record,
+      state: "delete_pending" as const,
+      operation: { kind: "delete" as const, phase: "awaiting_idle", force: true },
+    }
+    await fixture.store.write(record)
+
+    await fixture.controller.reconcile(record.projectId)
+    await fixture.controller.reconcile(record.projectId)
+    expect(fixture.calls).toEqual(["inspect:resource-1", "inspect:resource-1"])
+
+    await expect(fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "deleted",
+    })
+    await expect(fixture.controller.handle({ operation: "retry", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: true,
+      state: "deleted",
+    })
+
+    expect(fixture.calls.filter((call) => call === "adopt")).toHaveLength(1)
+    expect(fixture.calls.filter((call) => call === "sync")).toHaveLength(0)
+    expect(fixture.calls.filter((call) => call === "close")).toHaveLength(1)
+    expect(fixture.calls.filter((call) => call === "destroy")).toHaveLength(1)
+  })
+
+  it("does not replay a recovery operation without fresh observations", async () => {
     const store = new FileStateStore(await temporaryDirectory())
     const record = {
       ...makeRecord(),
@@ -1240,8 +2068,8 @@ describe("lifecycle controller", () => {
 
     await controller.reconcile("prj_1")
 
-    expect(calls).toEqual(["sync", "warp", "release", "remove"])
-    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached", operation: { kind: "stop", phase: "detached" } })
+    expect(calls).toEqual([])
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "recovery_pending", operation: record.operation })
   })
 
   it("replays Sandcastle recovery when its in-memory session handle is still available", async () => {
@@ -1260,6 +2088,7 @@ describe("lifecycle controller", () => {
         async create() { throw new Error("must not create") },
         async warp() { calls.push("warp") },
         async remove() { calls.push("remove") },
+        async inspect() { return undefined },
       },
     })
     const session = {
@@ -1269,6 +2098,9 @@ describe("lifecycle controller", () => {
       sandbox: {},
       target: { type: "remote", url: "https://sandbox.example.test" },
       recoveryMetadata: {},
+      async inspect() {
+        return { resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }
+      },
       async sync() { calls.push("sync"); return {} },
       async applyCapture() {},
       async close() { calls.push("close"); return {} },
@@ -1329,7 +2161,7 @@ describe("lifecycle controller", () => {
     await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({ state: "delete_pending" })
     await controller.onSessionIdle(record.sessionId)
 
-    expect(await store.get(record.sessionId)).toMatchObject({ state: "orphaned", lastError: { code: "SANDCASTLE_HANDLE" } })
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "error", lastError: { code: "SANDCASTLE_HANDLE" } })
   })
 
   it("allows Sandcastle deletion after a stopped session recorded provider destruction", async () => {
@@ -1845,6 +2677,8 @@ describe("lifecycle controller", () => {
     const started = new Promise<void>((resolve) => { releaseStarted = resolve })
     const controller = new LifecycleController({
       store,
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => ({ type: "remote", url: "https://remote.example.test" }),
       providerRelease: async () => {
         releaseStarted()
         await new Promise<void>((resolve) => { unblockRelease = resolve })
@@ -1854,6 +2688,7 @@ describe("lifecycle controller", () => {
         async warp() {},
         async syncOut(input) { return { kind: "control-plane", baseSha: input.baseSha } },
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
@@ -1869,7 +2704,7 @@ describe("lifecycle controller", () => {
     expect(await store.get("ses_1")).toMatchObject({ state: "detached" })
   })
 
-  it("fails closed when restart recovery has no operation proving preservation", async () => {
+  it("leaves an unobserved restart recovery record unchanged", async () => {
     const store = new FileStateStore(await temporaryDirectory())
     await store.write({ ...makeRecord(), state: "remote" })
     const calls: string[] = []
@@ -1887,13 +2722,10 @@ describe("lifecycle controller", () => {
     await controller.reconcile("prj_1")
 
     expect(calls).toEqual([])
-    expect(await store.get("ses_1")).toMatchObject({
-      state: "error",
-      lastError: { code: "RECOVERY_PRESERVATION_UNVERIFIED" },
-    })
+    expect(await store.get("ses_1")).toMatchObject({ state: "remote" })
   })
 
-  it("reconciles the latest record instead of a stale list snapshot", async () => {
+  it("does not apply a plan made from a stale list snapshot", async () => {
     let unblockList!: () => void
     let listStarted!: () => void
     const started = new Promise<void>((resolve) => { listStarted = resolve })
@@ -1925,8 +2757,8 @@ describe("lifecycle controller", () => {
     unblockList()
     await reconciliation
 
-    expect(await store.get("ses_1")).toMatchObject({ state: "deleted" })
-    expect(destroyCalls).toBe(1)
+    expect(await store.get("ses_1")).toMatchObject({ state: "delete_pending" })
+    expect(destroyCalls).toBe(0)
   })
 
   it("does not let a remote capability retry a failed start", async () => {
@@ -2109,7 +2941,7 @@ describe("lifecycle controller", () => {
     expect(`${JSON.stringify(logs)}${JSON.stringify(diagnostics)}`).not.toContain("private")
   })
 
-  it("finishes a detached delete recovery", async () => {
+  it("does not finish detached delete recovery without fresh observations", async () => {
     const store = new FileStateStore(await temporaryDirectory())
     await store.write({
       ...makeRecord(),
@@ -2129,8 +2961,11 @@ describe("lifecycle controller", () => {
 
     await controller.reconcile("prj_1")
 
-    expect(destroyed).toBe(true)
-    expect((await store.get("ses_1"))?.state).toBe("deleted")
+    expect(destroyed).toBe(false)
+    expect(await store.get("ses_1")).toMatchObject({
+      state: "delete_pending",
+      operation: { kind: "delete", phase: "destroying" },
+    })
   })
 })
 
@@ -2447,12 +3282,281 @@ describe("exe.dev provisioner", () => {
     expect(removed).toBe(false)
   })
 
+  it("restarts an owned exe.dev runtime through inspect, adopt, sync, close, and destroy without creating", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const resource = { provider: "exedev", resourceId: fixture.vm.identity.name }
+
+    await expect(fixture.driver.inspect(resource)).resolves.toMatchObject({
+      resource: "present",
+      ownership: "verified",
+      health: "healthy",
+    })
+    const session = await fixture.driver.adopt({ resource, owner: fixture.owner })
+    expect(session.target).toMatchObject({ type: "remote", url: "http://127.0.0.1:4100" })
+    expect(session.worktreePath).toBeUndefined()
+    expect(session.remoteWorktreePath).toBe(remoteWorkspaceDirectory(fixture.owner.workspaceId))
+    expect(session.recoveryMetadata).toMatchObject({
+      provider: "exedev",
+      remoteDirectory: fixture.remoteDirectory,
+      vmName: fixture.vm.identity.name,
+    })
+    expect(session.recoveryMetadata).not.toHaveProperty("localPort")
+    expect(session.recoveryMetadata).not.toHaveProperty("controlToken")
+
+    await fixture.driver.sync(session)
+    await expect(fixture.driver.close(session)).resolves.toEqual({})
+    expect(fixture.created).toBe(0)
+    expect(fixture.copied).toBe(0)
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+    expect(fixture.revoked).toBe(1)
+    expect(fixture.removed).toBe(0)
+    expect(fixture.calls.some((argv) => argv.includes("git") && argv.includes("add"))).toBe(true)
+    expect(fixture.calls.some((argv) => argv.includes("rm") && argv.includes("-rf"))).toBe(true)
+
+    await fixture.driver.destroy(resource, fixture.owner)
+    expect(fixture.removed).toBe(1)
+  })
+
+  it("rejects exe.dev adoption for divergent or unrelated history before local control starts", async () => {
+    for (const head of [
+      "fedcba9876543210fedcba9876543210fedcba98",
+      "abcdef0123456789abcdef0123456789abcdef01",
+    ]) {
+      const fixture = await createExedevRuntimeFixture()
+      fixture.setRemoteState({ head, lineage: false })
+
+      await expect(fixture.driver.adopt({
+        resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+        owner: fixture.owner,
+      })).rejects.toMatchObject({ code: "EXEDEV_ADOPT_CHECKOUT" })
+
+      const lineageProbe = fixture.calls.find((argv) => argv.includes("merge-base"))
+      expect(lineageProbe).toEqual(expect.arrayContaining(["--is-ancestor", fixture.owner.baseSha, head]))
+      expect(fixture.started).toBe(0)
+      expect(fixture.created).toBe(0)
+      expect(fixture.copied).toBe(0)
+      expect(fixture.removed).toBe(0)
+    }
+  })
+
+  it("adopts an exe.dev checkout whose HEAD is a valid descendant of the lifecycle base", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const head = "fedcba9876543210fedcba9876543210fedcba98"
+    fixture.setRemoteState({ head, lineage: true })
+
+    const session = await fixture.driver.adopt({
+      resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+      owner: fixture.owner,
+    })
+
+    const lineageProbe = fixture.calls.find((argv) => argv.includes("merge-base"))
+    expect(lineageProbe).toEqual(expect.arrayContaining(["--is-ancestor", fixture.owner.baseSha, head]))
+    expect(fixture.started).toBe(1)
+    await session.abort?.()
+    expect(fixture.removed).toBe(0)
+  })
+
+  it("aborts an adopted exe.dev runtime locally and is idempotent", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const session = await fixture.driver.adopt({
+      resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+      owner: fixture.owner,
+    })
+    if (!session.abort) throw new Error("adopted exe.dev session did not expose abort")
+
+    await session.abort()
+    await session.abort()
+
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+    expect(fixture.revoked).toBe(1)
+    expect(fixture.removed).toBe(0)
+    expect(fixture.calls.some((argv) => argv.includes("rm") && argv.includes("-rf"))).toBe(false)
+  })
+
+  it("rejects exe.dev preservation before staging when the adopted branch changes", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const session = await fixture.driver.adopt({
+      resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+      owner: fixture.owner,
+    })
+    fixture.setRemoteState({ branch: "opencode/foreign" })
+
+    await expect(fixture.driver.sync(session)).rejects.toMatchObject({ code: "BRANCH_MISMATCH" })
+    expect(fixture.calls.some((argv) => argv.includes("add"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("commit"))).toBe(false)
+  })
+
+  it("rejects exe.dev preservation before staging when the adopted history diverges", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const session = await fixture.driver.adopt({
+      resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+      owner: fixture.owner,
+    })
+    fixture.setRemoteState({ head: "fedcba9876543210fedcba9876543210fedcba98", lineage: false })
+
+    await expect(fixture.driver.sync(session)).rejects.toMatchObject({ code: "REMOTE_LINEAGE_MISMATCH" })
+    expect(fixture.calls.some((argv) => argv.includes("add"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("commit"))).toBe(false)
+  })
+
+  it("reconciles and recovers a persisted exe.dev runtime without recreating the VM", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const record: SandboxRecord = {
+      ...makeRecord(),
+      sessionId: fixture.owner.sessionId,
+      workspaceId: fixture.owner.workspaceId,
+      projectId: fixture.owner.projectId,
+      provider: "exedev",
+      providerState: fixture.metadata,
+      vmName: fixture.vm.identity.name,
+      vmIdentity: fixture.vm.identity,
+      generation: fixture.owner.generation,
+      directory: fixture.owner.directory,
+      branch: fixture.owner.branch,
+      baseSha: fixture.owner.baseSha,
+      state: "remote",
+    }
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write(record)
+    const calls: string[] = []
+    const controller = new LifecycleController({
+      store,
+      providerType: "exedev",
+      runtimeDriver: fixture.driver,
+      workspace: {
+        async create() { throw new Error("must not create a workspace") },
+        async warp(input) { calls.push(input.workspaceId ? "warp:remote" : "warp:local") },
+        async startSync() { calls.push("sync:start") },
+        async waitForSync() { calls.push("sync:connected") },
+        async replaySession() { calls.push("replay") },
+        async remove() { calls.push("workspace:remove") },
+        async inspect() { return matchingWorkspace(record) },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await controller.reconcile(record.projectId)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "orphaned", lastError: { code: "SANDCASTLE_HANDLE" } })
+    await expect(controller.handle({ operation: "inspect", force: false, capability })).resolves.toMatchObject({
+      classification: "orphan",
+      recommendedAction: { operation: "recover", reasonCode: "VERIFIED_ORPHAN" },
+    })
+    await expect(controller.handle({ operation: "recover", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      state: "remote",
+      effectiveTarget: { kind: "remote", resourceId: fixture.vm.identity.name },
+    })
+    expect(calls).toEqual(["warp:remote", "sync:start", "sync:connected", "replay"])
+    expect(fixture.created).toBe(0)
+    expect(fixture.copied).toBe(0)
+
+    await expect(controller.handle({ operation: "stop", force: false, capability })).resolves.toMatchObject({ state: "stop_pending" })
+    await controller.onSessionIdle(record.sessionId)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached" })
+    expect(calls.slice(-2)).toEqual(["warp:local", "workspace:remove"])
+    expect(fixture.removed).toBe(0)
+
+    await expect(controller.handle({ operation: "delete", force: true, capability })).resolves.toMatchObject({ state: "deleted" })
+    expect(fixture.removed).toBe(1)
+  })
+
+  it("deletes a verified exe.dev orphan directly through adoption and destruction", async () => {
+    const fixture = await createExedevRuntimeFixture()
+    const record: SandboxRecord = {
+      ...makeRecord(),
+      sessionId: fixture.owner.sessionId,
+      workspaceId: fixture.owner.workspaceId,
+      projectId: fixture.owner.projectId,
+      provider: "exedev",
+      providerState: fixture.metadata,
+      vmName: fixture.vm.identity.name,
+      vmIdentity: fixture.vm.identity,
+      generation: fixture.owner.generation,
+      directory: fixture.owner.directory,
+      branch: fixture.owner.branch,
+      baseSha: fixture.owner.baseSha,
+      state: "orphaned",
+    }
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write(record)
+    const events: string[] = []
+    const controller = createOrphanDeletionController(store, record, fixture.driver, events)
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      state: "delete_pending",
+    })
+    await controller.onSessionIdle(record.sessionId)
+
+    expect(await store.get(record.sessionId)).toMatchObject({
+      state: "deleted",
+      operation: { kind: "delete", phase: "deleted", providerDestroyed: true },
+    })
+    expect(events).toEqual([
+      "inspect",
+      "inspect",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect",
+      "destroy",
+    ])
+    expect(fixture.created).toBe(0)
+    expect(fixture.copied).toBe(0)
+    expect(fixture.removed).toBe(1)
+  })
+
+  it("never mutates an exe.dev VM when adoption evidence is conflicting, stopped, unknown, or unreachable", async () => {
+    const cases = [
+      { foreign: true, code: "EXEDEV_ADOPT_CONFLICT" },
+      { status: "stopped", code: "EXEDEV_ADOPT_UNSUPPORTED" },
+      { status: "mystery", code: "EXEDEV_ADOPT_UNKNOWN" },
+      { listError: true, code: "EXEDEV_ADOPT_UNKNOWN" },
+    ] as const
+
+    for (const testCase of cases) {
+      const fixture = await createExedevRuntimeFixture(testCase)
+      await expect(fixture.driver.adopt({
+        resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+        owner: fixture.owner,
+      })).rejects.toMatchObject({ code: testCase.code })
+      expect(fixture.created).toBe(0)
+      expect(fixture.copied).toBe(0)
+      expect(fixture.started).toBe(0)
+      expect(fixture.removed).toBe(0)
+      expect(fixture.calls.some((argv) => argv.some((part) => part.endsWith("/ssh")))).toBe(false)
+    }
+  })
+
+  it("cleans partial exe.dev adoption locally when health fails without touching the VM", async () => {
+    const fixture = await createExedevRuntimeFixture({ healthy: false })
+
+    await expect(fixture.driver.adopt({
+      resource: { provider: "exedev", resourceId: fixture.vm.identity.name },
+      owner: fixture.owner,
+    })).rejects.toMatchObject({ code: "REMOTE_HEALTH_TIMEOUT" })
+
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+    expect(fixture.revoked).toBe(1)
+    expect(fixture.created).toBe(0)
+    expect(fixture.copied).toBe(0)
+    expect(fixture.removed).toBe(0)
+    expect(fixture.calls.some((argv) => argv.includes("rm") && argv.includes("-rf"))).toBe(false)
+  })
+
   it("creates a VM, checks out the local revision, starts the target, and preserves untracked files", async () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
     const commands: string[][] = []
     let failRemote = false
     let removedVm = false
+    let removeCalls = 0
     let supervisorInput: { argv: string[]; stdin?: string | Uint8Array } | undefined
     let terminated = false
     let finishProcess: ((result: { exitCode: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }) => void) | undefined
@@ -2508,6 +3612,7 @@ describe("exe.dev provisioner", () => {
       },
       async remove() {
         removedVm = true
+        removeCalls++
       },
       async tag() {},
     }
@@ -2600,6 +3705,7 @@ describe("exe.dev provisioner", () => {
     failRemote = true
     await expect(provisioner.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_COMMAND" })
     expect(removedVm).toBe(false)
+    expect(removeCalls).toBe(0)
     await expect(provisioner.target(info)).rejects.toMatchObject({ code: "RUNTIME_UNAVAILABLE" })
   })
 
@@ -3277,6 +4383,239 @@ describe("Docker Sandbox provider", () => {
     sandboxes = [{ status: "running" }]
     await expect(provider.inspect(info)).rejects.toMatchObject({ code: "SBX_INVENTORY_INVALID" })
     expect(calls.some((argv) => argv.includes("exec"))).toBe(false)
+  })
+
+  it("reconciles and recovers a persisted SBX runtime without recreating the sandbox", async () => {
+    const fixture = await createSbxRuntimeFixture()
+    const store = new FileStateStore(await temporaryDirectory())
+    const record: SandboxRecord = {
+      ...makeRecord(),
+      sessionId: fixture.owner.sessionId,
+      workspaceId: fixture.owner.workspaceId,
+      projectId: fixture.owner.projectId,
+      provider: "sbx",
+      providerState: {
+        provider: "sbx",
+        ownershipId: fixture.owner.ownershipId,
+        sessionId: fixture.owner.sessionId,
+        generation: fixture.owner.generation,
+        workspaceId: fixture.owner.workspaceId,
+        projectId: fixture.owner.projectId,
+        sandbox: fixture.sandbox,
+        hostPort: fixture.hostPort,
+        branch: fixture.owner.branch,
+        baseSha: fixture.owner.baseSha,
+      },
+      generation: fixture.owner.generation,
+      directory: fixture.owner.directory,
+      branch: fixture.owner.branch,
+      baseSha: fixture.owner.baseSha,
+      state: "remote",
+    }
+    await store.write(record)
+    const calls: string[] = []
+    const controller = new LifecycleController({
+      store,
+      providerType: "sbx",
+      runtimeDriver: fixture.driver,
+      workspace: {
+        async create() { throw new Error("must not create a workspace") },
+        async warp(input) { calls.push(input.workspaceId ? "warp:remote" : "warp:local") },
+        async startSync() { calls.push("sync:start") },
+        async waitForSync() { calls.push("sync:connected") },
+        async replaySession() { calls.push("replay") },
+        async remove() { calls.push("workspace:remove") },
+        async inspect() { return matchingWorkspace(record) },
+      },
+    })
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await controller.reconcile(record.projectId)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "orphaned", lastError: { code: "SANDCASTLE_HANDLE" } })
+    await expect(controller.handle({ operation: "inspect", force: false, capability })).resolves.toMatchObject({
+      classification: "orphan",
+      recommendedAction: { operation: "recover", reasonCode: "VERIFIED_ORPHAN" },
+    })
+    await expect(controller.handle({ operation: "recover", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      state: "remote",
+      effectiveTarget: { kind: "remote", resourceId: fixture.sandbox },
+    })
+    expect(await controller.targetFor(record.sessionId)).toEqual({
+      type: "remote",
+      url: `http://127.0.0.1:${fixture.hostPort}`,
+      headers: { Authorization: expect.any(String) },
+    })
+    expect(calls).toEqual(["warp:remote", "sync:start", "sync:connected", "replay"])
+
+    await expect(controller.handle({ operation: "stop", force: false, capability })).resolves.toMatchObject({ state: "stop_pending" })
+    await controller.onSessionIdle(record.sessionId)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "detached" })
+    expect(calls.slice(-2)).toEqual(["warp:local", "workspace:remove"])
+    expect(fixture.calls.some((argv) => argv.includes("create"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("rm"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("exec"))).toBe(true)
+    expect(fixture.calls.some((argv) => argv.includes(fixture.remoteDirectory))).toBe(true)
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+
+    await expect(controller.handle({ operation: "delete", force: true, capability })).resolves.toMatchObject({ state: "deleted" })
+    expect(fixture.calls.filter((argv) => argv.includes("rm") && argv.includes("--force"))).toHaveLength(1)
+  })
+
+  it("deletes a verified SBX orphan directly through adoption and destruction", async () => {
+    const fixture = await createSbxRuntimeFixture()
+    const record: SandboxRecord = {
+      ...makeRecord(),
+      sessionId: fixture.owner.sessionId,
+      workspaceId: fixture.owner.workspaceId,
+      projectId: fixture.owner.projectId,
+      provider: "sbx",
+      providerState: {
+        provider: "sbx",
+        ownershipId: fixture.owner.ownershipId,
+        sessionId: fixture.owner.sessionId,
+        generation: fixture.owner.generation,
+        workspaceId: fixture.owner.workspaceId,
+        projectId: fixture.owner.projectId,
+        sandbox: fixture.sandbox,
+        hostPort: fixture.hostPort,
+        branch: fixture.owner.branch,
+        baseSha: fixture.owner.baseSha,
+      },
+      vmName: undefined,
+      vmIdentity: undefined,
+      generation: fixture.owner.generation,
+      directory: fixture.owner.directory,
+      branch: fixture.owner.branch,
+      baseSha: fixture.owner.baseSha,
+      state: "orphaned",
+    }
+    const store = new FileStateStore(await temporaryDirectory())
+    await store.write(record)
+    const events: string[] = []
+    const controller = createOrphanDeletionController(store, record, fixture.driver, events)
+    const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
+
+    await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      state: "delete_pending",
+    })
+    await controller.onSessionIdle(record.sessionId)
+
+    expect(await store.get(record.sessionId)).toMatchObject({
+      state: "deleted",
+      operation: { kind: "delete", phase: "deleted", providerDestroyed: true },
+    })
+    expect(events).toEqual([
+      "inspect",
+      "inspect",
+      "adopt",
+      "sync",
+      "warp:local",
+      "close",
+      "workspace:remove",
+      "inspect",
+      "destroy",
+    ])
+    expect(fixture.calls.some((argv) => argv.includes("create"))).toBe(false)
+    expect(fixture.calls.filter((argv) => argv.includes("rm") && argv.includes("--force"))).toHaveLength(1)
+  })
+
+  it("separates the remote SBX checkout path and aborts locally", async () => {
+    const fixture = await createSbxRuntimeFixture()
+    const session = await fixture.driver.adopt({
+      resource: { provider: "sbx", resourceId: fixture.sandbox },
+      owner: fixture.owner,
+    })
+    expect(session.worktreePath).toBeUndefined()
+    expect(session.remoteWorktreePath).toBe(fixture.remoteDirectory)
+    if (!session.abort) throw new Error("adopted SBX session did not expose abort")
+
+    await session.abort()
+    await session.abort()
+
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+    expect(fixture.revoked).toBe(1)
+    expect(fixture.calls.some((argv) => argv.includes("stop"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("rm"))).toBe(false)
+  })
+
+  it("rejects SBX adoption for divergent or unrelated history before local control starts", async () => {
+    for (const head of [
+      "fedcba9876543210fedcba9876543210fedcba98",
+      "abcdef0123456789abcdef0123456789abcdef01",
+    ]) {
+      const fixture = await createSbxRuntimeFixture({ head, lineage: false })
+
+      await expect(fixture.driver.adopt({
+        resource: { provider: "sbx", resourceId: fixture.sandbox },
+        owner: fixture.owner,
+      })).rejects.toMatchObject({ code: "SBX_ADOPT_CHECKOUT" })
+
+      const lineageProbe = fixture.calls.find((argv) => argv.includes("merge-base"))
+      expect(lineageProbe).toEqual(expect.arrayContaining(["--is-ancestor", fixture.owner.baseSha, head]))
+      expect(fixture.started).toBe(0)
+      expect(fixture.revoked).toBe(0)
+      expect(fixture.calls.some((argv) => argv.includes("create") || argv.includes("stop") || argv.includes("rm"))).toBe(false)
+    }
+  })
+
+  it("adopts an SBX checkout whose HEAD is a valid descendant of the lifecycle base", async () => {
+    const head = "fedcba9876543210fedcba9876543210fedcba98"
+    const fixture = await createSbxRuntimeFixture({
+      head,
+      lineage: true,
+    })
+
+    const session = await fixture.driver.adopt({
+      resource: { provider: "sbx", resourceId: fixture.sandbox },
+      owner: fixture.owner,
+    })
+
+    const lineageProbe = fixture.calls.find((argv) => argv.includes("merge-base"))
+    expect(lineageProbe).toEqual(expect.arrayContaining(["--is-ancestor", fixture.owner.baseSha, head]))
+    expect(fixture.started).toBe(1)
+    await session.abort?.()
+    expect(fixture.calls.some((argv) => argv.includes("stop") || argv.includes("rm"))).toBe(false)
+  })
+
+  it("never starts an SBX runtime from conflicting, legacy, stopped, or unknown evidence", async () => {
+    const cases = [
+      { marker: { sessionId: "ses_foreign" }, status: "running", code: "SBX_ADOPT_CONFLICT" },
+      { marker: "x".repeat(43), status: "running", code: "SBX_ADOPT_UNKNOWN" },
+      { marker: undefined, status: "stopped", code: "SBX_ADOPT_UNSUPPORTED" },
+      { marker: undefined, status: "mystery", code: "SBX_ADOPT_UNKNOWN" },
+    ] as const
+
+    for (const testCase of cases) {
+      const fixture = await createSbxRuntimeFixture(testCase)
+      await expect(fixture.driver.adopt({
+        resource: { provider: "sbx", resourceId: fixture.sandbox },
+        owner: fixture.owner,
+      })).rejects.toMatchObject({ code: testCase.code })
+      expect(fixture.started).toBe(0)
+      expect(fixture.calls.some((argv) => argv.includes("create"))).toBe(false)
+      expect(fixture.calls.some((argv) => argv.includes("exec"))).toBe(false)
+      expect(fixture.calls.some((argv) => argv.includes("stop"))).toBe(false)
+      expect(fixture.calls.some((argv) => argv.includes("rm"))).toBe(false)
+    }
+  })
+
+  it("cleans partial adoption locally without stopping or destroying the owned sandbox", async () => {
+    const fixture = await createSbxRuntimeFixture({ healthy: false })
+
+    await expect(fixture.driver.adopt({
+      resource: { provider: "sbx", resourceId: fixture.sandbox },
+      owner: fixture.owner,
+    })).rejects.toMatchObject({ code: "REMOTE_HEALTH_TIMEOUT" })
+
+    expect(fixture.started).toBe(1)
+    expect(fixture.terminated).toBe(1)
+    expect(fixture.revoked).toBe(1)
+    expect(fixture.calls.some((argv) => argv.includes("stop"))).toBe(false)
+    expect(fixture.calls.some((argv) => argv.includes("rm"))).toBe(false)
   })
 
   it("keeps the shared control proxy alive while another workspace is active", async () => {
@@ -4204,6 +5543,201 @@ function oversizedHealthFetcher(): { fetcher: typeof fetch; cancelled: () => boo
   }
 }
 
+function createOrphanDeletionController(
+  store: FileStateStore,
+  record: SandboxRecord,
+  driver: RuntimeDriver,
+  events: string[],
+): LifecycleController {
+  return new LifecycleController({
+    store,
+    providerType: record.provider,
+    runtimeDriver: instrumentRuntimeDriver(driver, events),
+    workspace: {
+      async create() {
+        events.push("workspace:create")
+        throw new Error("orphan deletion must not create a workspace")
+      },
+      async warp(input) {
+        events.push(input.workspaceId ? "warp:remote" : "warp:local")
+      },
+      async remove() {
+        events.push("workspace:remove")
+      },
+      async inspect() {
+        return matchingWorkspace(record)
+      },
+    },
+  })
+}
+
+function instrumentRuntimeDriver(driver: RuntimeDriver, events: string[]): RuntimeDriver {
+  return {
+    async inspect(resource) {
+      events.push("inspect")
+      return driver.inspect(resource)
+    },
+    async adopt(input) {
+      events.push("adopt")
+      return driver.adopt(input)
+    },
+    async sync(session) {
+      events.push("sync")
+      return driver.sync(session)
+    },
+    async close(session) {
+      events.push("close")
+      return driver.close(session)
+    },
+    async destroy(resource, owner) {
+      events.push("destroy")
+      return driver.destroy(resource, owner)
+    },
+  }
+}
+
+interface RecoveryFixture {
+  controller: LifecycleController
+  capability: ReturnType<typeof createCapability>
+  store: FileStateStore
+  record: SandboxRecord
+  calls: string[]
+}
+
+async function setupRecoveryFixture(options: {
+  observation?: Pick<ProviderResourceObservation, "resource" | "ownership" | "health">
+  observations?: Array<Pick<ProviderResourceObservation, "resource" | "ownership" | "health">>
+  state?: "orphaned" | "remote"
+  adoptError?: SandboxError
+  syncError?: SandboxError
+  workspaceRemoveFailures?: number
+  destroyFailures?: number
+  onAdopt?: () => Promise<void>
+  workspaceObservation?: "matching" | "foreign" | "unavailable"
+  routeError?: SandboxError
+  abortPreservedWorktreePath?: string
+  closePreservedWorktreePath?: string
+  adoptGate?: { started(): void; wait: Promise<void> }
+  gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
+} = {}): Promise<RecoveryFixture> {
+  const store = new FileStateStore(await temporaryDirectory())
+  const record: SandboxRecord = {
+    ...makeRecord(),
+    provider: "fake",
+    providerState: { resourceId: "resource-1" },
+    state: options.state ?? "orphaned",
+  }
+  await store.write(record)
+  const calls: string[] = []
+  const observation: ProviderResourceObservation = {
+    resourceId: "resource-1",
+    resource: options.observation?.resource ?? "present",
+    ownership: options.observation?.ownership ?? "verified",
+    health: options.observation?.health ?? "healthy",
+    evidence: ["fake runtime driver"],
+  }
+  let inspection = 0
+  const runtimeDriver: RuntimeDriver = {
+    async inspect(resource) {
+      calls.push(`inspect:${resource.resourceId}`)
+      const next = options.observations?.[inspection++]
+      return next ? { resourceId: "resource-1", ...next, evidence: ["fake runtime driver"] } : observation
+    },
+    async adopt({ owner }) {
+      calls.push("adopt")
+      options.adoptGate?.started()
+      if (options.adoptGate) await options.adoptGate.wait
+      await options.onAdopt?.()
+      if (options.adoptError) throw options.adoptError
+      return {
+        workspaceId: owner.workspaceId,
+        target: { type: "remote" as const, url: "https://runtime.example.test", headers: { Authorization: "private" } },
+        remoteWorktreePath: "/tmp/recovered-runtime",
+        async abort() {
+          calls.push("abort")
+          return options.abortPreservedWorktreePath
+            ? { preservedWorktreePath: options.abortPreservedWorktreePath }
+            : {}
+        },
+      }
+    },
+    async sync() {
+      calls.push("sync")
+      if (options.syncError) throw options.syncError
+    },
+    async close() {
+      calls.push("close")
+      return options.closePreservedWorktreePath
+        ? { preservedWorktreePath: options.closePreservedWorktreePath }
+        : {}
+    },
+    async destroy() {
+      calls.push("destroy")
+      if ((options.destroyFailures ?? 0) > 0) {
+        options.destroyFailures!--
+        throw new SandboxError("remove", "fake destroy failed", "FAKE_DESTROY")
+      }
+    },
+  }
+  const controller = new LifecycleController({
+    store,
+    providerType: "fake",
+    runtimeDriver,
+    sandcastle: {
+      createAdapter: async () => {
+        calls.push("adapter:create")
+        throw new Error("recovery must not create an adapter")
+      },
+      createWorktree: async () => {
+        calls.push("worktree:create")
+        throw new Error("recovery must not create a worktree")
+      },
+    },
+    gitInspect: options.gitInspect,
+    workspace: {
+      async create() {
+        calls.push("workspace:create")
+        throw new Error("recovery must not create a workspace")
+      },
+      async warp(input) {
+        calls.push(input.workspaceId ? "warp:remote" : "warp:local")
+        if (input.workspaceId && options.routeError) throw options.routeError
+      },
+      async startSync() {
+        calls.push("sync:start")
+      },
+      async waitForSync() {
+        calls.push("sync:connected")
+      },
+      async replaySession() {
+        calls.push("replay")
+      },
+      async remove() {
+        calls.push("workspace:remove")
+        if ((options.workspaceRemoveFailures ?? 0) > 0) {
+          options.workspaceRemoveFailures!--
+          throw new Error("fake workspace removal failed")
+        }
+      },
+      ...(options.workspaceObservation === "unavailable" ? {} : {
+        async inspect() {
+          return options.workspaceObservation === "foreign"
+            ? matchingWorkspace(record, { directory: "/foreign/project" })
+            : matchingWorkspace(record)
+        },
+      }),
+    },
+  })
+
+  return {
+    controller,
+    capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+    store,
+    record,
+    calls,
+  }
+}
+
 function invokeHealthCheck(provider: unknown, activation: unknown): Promise<void> {
   return (provider as { waitForHealth(activation: unknown): Promise<void> }).waitForHealth(activation)
 }
@@ -4285,6 +5819,279 @@ function makeRecord(): SandboxRecord {
     state: "local",
     createdAt: new Date(1000).toISOString(),
     updatedAt: new Date(1000).toISOString(),
+  }
+}
+
+function matchingWorkspace(record: SandboxRecord, overrides: Record<string, unknown> = {}) {
+  return {
+    id: record.workspaceId,
+    type: record.provider,
+    name: "workspace",
+    branch: record.branch,
+    directory: record.directory,
+    projectID: record.projectId,
+    extra: {
+      owner: "opencode-sandbox",
+      sessionId: record.sessionId,
+      generation: record.generation,
+      workspaceId: record.workspaceId,
+      projectId: record.projectId,
+      provider: record.provider,
+    },
+    ...overrides,
+  }
+}
+
+async function createExedevRuntimeFixture(options: {
+  status?: string
+  foreign?: boolean
+  healthy?: boolean
+  listError?: boolean
+} = {}) {
+  const root = await temporaryDirectory()
+  const owner = {
+    provider: "exedev" as const,
+    projectId: "prj_1",
+    sessionId: "ses_exedev_restart",
+    generation: 2,
+    workspaceId: "wrk_exedev_restart",
+    directory: root,
+    branch: "opencode/exedev-restart",
+    baseSha: "0123456789012345678901234567890123456789",
+  }
+  const identity = {
+    id: "vm_exedev_1",
+    name: "oc-exedev-restart",
+    sshDest: "vm.exe.xyz",
+    tags: ["opencode-sandbox", `opencode-owner-${shortHash(`${owner.projectId}:${owner.sessionId}:${owner.workspaceId}:${owner.generation}`)}`],
+    comment: "opencode-test",
+  }
+  const vm: VmInfo = {
+    identity,
+    status: options.status ?? "running",
+  }
+  const foreign = { ...vm, identity: { ...identity, sshDest: "foreign.exe.xyz" } }
+  const metadata = {
+    provider: "exedev",
+    projectId: owner.projectId,
+    sessionId: owner.sessionId,
+    generation: owner.generation,
+    workspaceId: owner.workspaceId,
+    branch: owner.branch,
+    baseSha: owner.baseSha,
+    remoteDirectory: "/tmp/oe-0123456789ab",
+    vmName: identity.name,
+    vmIdentity: identity,
+  }
+  const remoteState = {
+    branch: owner.branch,
+    head: owner.baseSha,
+    lineage: true,
+  }
+  const calls: string[][] = []
+  let started = 0
+  let terminated = 0
+  let revoked = 0
+  let created = 0
+  let copied = 0
+  let removed = 0
+  let finishProcess!: (result: ProcessResult) => void
+  const process: ProcessHandle = {
+    pid: 901,
+    result: new Promise((resolve) => { finishProcess = resolve }),
+    terminate() {
+      terminated++
+      finishProcess({ exitCode: null, signal: "SIGTERM", stdout: "", stderr: "" })
+    },
+  }
+  const runner: ProcessRunner = {
+    async run(input) {
+      calls.push(input.argv)
+      if (input.argv[0] === "git") return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      if (input.argv.some((part) => part.endsWith("/ssh"))) {
+        if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: `${remoteState.branch}\n`, stderr: "" }
+        if (input.argv.includes("merge-base")) return { exitCode: remoteState.lineage ? 0 : 1, signal: null, stdout: "", stderr: "" }
+        if (input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${remoteState.head}\n`, stderr: "" }
+        if (input.argv.includes("diff") && input.argv.includes("--cached")) return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      }
+      return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+    },
+  }
+  const provider = new ExedevProvider({
+    config: parseConfig({ healthTimeoutMs: 1 }, { HOME: root }),
+    control: {
+      async create() {
+        created++
+        throw new Error("exe.dev create must not be called during adoption")
+      },
+      async copy() {
+        copied++
+        throw new Error("exe.dev copy must not be called during adoption")
+      },
+      async list() {
+        if (options.listError) throw new SandboxError("discover", "inventory unavailable", "EXEDEV_COMMAND")
+        return options.foreign ? [vm, foreign] : [vm]
+      },
+      async remove() {
+        removed++
+      },
+      async tag() {},
+    },
+    worktree: root,
+    localControlSocket: join(root, "control.sock"),
+    runner,
+    supervisor: {
+      async start() {
+        started++
+        return process
+      },
+    },
+    reservePort: async () => 4100,
+    ensureVmHostKey: async () => {},
+    controlTokenFor: async () => "remote-token",
+    revokeControlToken: () => { revoked++ },
+    authContent: "{}",
+    durableMetadataForResource: async (resourceId, requested) => {
+      if (resourceId !== identity.name && resourceId !== identity.id) return undefined
+      if (requested && (
+        requested.projectId !== owner.projectId ||
+        requested.sessionId !== owner.sessionId ||
+        requested.generation !== owner.generation ||
+        requested.workspaceId !== owner.workspaceId ||
+        requested.directory !== owner.directory ||
+        requested.branch !== owner.branch ||
+        requested.baseSha !== owner.baseSha
+      )) return undefined
+      return metadata
+    },
+    fetcher: (async () => Response.json({ healthy: options.healthy ?? true, version: "1.18.23" })) as unknown as typeof fetch,
+  })
+
+  return {
+    driver: provider.runtimeDriver(),
+    owner,
+    vm,
+    metadata,
+    remoteDirectory: metadata.remoteDirectory,
+    calls,
+    setRemoteState(state: Partial<typeof remoteState>) {
+      Object.assign(remoteState, state)
+    },
+    get started() { return started },
+    get terminated() { return terminated },
+    get revoked() { return revoked },
+    get created() { return created },
+    get copied() { return copied },
+    get removed() { return removed },
+  }
+}
+
+async function createSbxRuntimeFixture(options: { marker?: unknown; status?: string; healthy?: boolean; head?: string; lineage?: boolean } = {}) {
+  const root = await temporaryDirectory()
+  const owner = {
+    provider: "sbx" as const,
+    ownershipId: "o".repeat(43),
+    sessionId: "ses_sbx_restart",
+    generation: 2,
+    workspaceId: "wrk_sbx_restart",
+    projectId: "prj_1",
+    directory: root,
+    branch: "opencode/sbx-restart",
+    baseSha: "0123456789012345678901234567890123456789",
+  }
+  const marker = options.marker && typeof options.marker === "object" && !Array.isArray(options.marker)
+    ? { ...owner, ...(options.marker as Record<string, unknown>) }
+    : options.marker ?? { ...owner }
+  const sandbox = "oc-sbx-restart"
+  const hostPort = 4101
+  const remoteDirectory = "/workspace/project/.opencode-worktree"
+  const remoteState = {
+    head: options.head ?? owner.baseSha,
+    lineage: options.lineage ?? true,
+  }
+  const calls: string[][] = []
+  let started = 0
+  let terminated = 0
+  let revoked = 0
+  let finishProcess!: (result: ProcessResult) => void
+  const process: ProcessHandle = {
+    pid: 900,
+    result: new Promise((resolve) => { finishProcess = resolve }),
+    terminate() {
+      terminated++
+      finishProcess({ exitCode: null, signal: "SIGTERM", stdout: "", stderr: "" })
+    },
+  }
+  const provider = new SbxProvider({
+    worktree: root,
+    deferActivation: true,
+    localControlSocket: join(root, "control.sock"),
+    remotePort: 4096,
+    healthTimeoutMs: 100,
+    authContent: "{}",
+    ownerForResource: async (resourceId, requested) => {
+      if (resourceId !== sandbox) return undefined
+      if (requested && (
+        requested.sessionId !== owner.sessionId ||
+        requested.generation !== owner.generation ||
+        requested.workspaceId !== owner.workspaceId ||
+        requested.projectId !== owner.projectId
+      )) return undefined
+      return owner
+    },
+    controlTokenFor: async () => "t".repeat(43),
+    revokeControlToken: () => { revoked++ },
+    supervisor: {
+      async start() {
+        started++
+        return process
+      },
+    },
+    fetcher: (async () => Response.json({ healthy: options.healthy ?? true })) as unknown as typeof fetch,
+    runner: {
+      async run(input) {
+        calls.push(input.argv)
+        if (input.argv[0] === "git") {
+          if (input.argv.includes("remote")) return { exitCode: 0, signal: null, stdout: "sandbox remote\n", stderr: "" }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        }
+        if (input.argv[0] !== "sbx") return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        const args = input.argv.slice(1)
+        if (args[0] === "ls") {
+          return { exitCode: 0, signal: null, stdout: JSON.stringify({ sandboxes: [{ name: sandbox, status: options.status ?? "running" }] }), stderr: "" }
+        }
+        if (args[0] === "cp") {
+          await writeFile(input.argv.at(-1)!, JSON.stringify(marker))
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        }
+        if (args[0] === "ports") {
+          return { exitCode: 0, signal: null, stdout: JSON.stringify([{ hostIp: "127.0.0.1", hostPort, sandboxPort: 4096 }]), stderr: "" }
+        }
+        if (args[0] === "create") throw new Error("SBX create must not be called during adoption")
+        if (args[0] === "exec") {
+          if (input.argv.includes("--show-toplevel")) return { exitCode: 0, signal: null, stdout: "/workspace/project\n", stderr: "" }
+          if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: `${owner.branch}\n`, stderr: "" }
+          if (input.argv.includes("merge-base")) return { exitCode: remoteState.lineage ? 0 : 1, signal: null, stdout: "", stderr: "" }
+          if (input.argv.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${remoteState.head}\n`, stderr: "" }
+          if (input.argv.includes("diff") && input.argv.includes("--cached")) return { exitCode: 1, signal: null, stdout: "", stderr: "" }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    },
+  })
+
+  return {
+    driver: provider.runtimeDriver(),
+    provider,
+    owner,
+    sandbox,
+    hostPort,
+    remoteDirectory,
+    calls,
+    get started() { return started },
+    get terminated() { return terminated },
+    get revoked() { return revoked },
   }
 }
 

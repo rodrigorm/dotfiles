@@ -28,6 +28,7 @@ import {
   isRecord,
   SandboxError,
   type ControlCapability,
+  type RuntimeOwner,
   type SandboxRecord,
   type SessionContext,
   type WorkspaceInfo,
@@ -63,6 +64,8 @@ export interface SandboxPluginOptions {
   sandcastle?: SandcastleWorkspaceOptions
   control?: ExeControl
   ensureHostKey?: () => Promise<void>
+  ensureVmHostKey?: (identity: import("./types").VmIdentity) => Promise<void>
+  runner?: import("./types").ProcessRunner
   supervisor?: import("./types").ProcessSupervisor
   fetcher?: typeof fetch
   infrastructure?: InfrastructureOperations
@@ -102,8 +105,143 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
     const exeControl = options.control ?? new SshExeControl({
       lobby: config.sshLobby,
       knownHostsFile: config.knownHostsFile,
+      runner: options.runner,
     })
-    const ensureHostKey = options.ensureHostKey ?? (() => ensureExeDevHostKey(config.knownHostsFile, config.sshLobby))
+    const ensureHostKey = options.ensureHostKey ?? (() => ensureExeDevHostKey(config.knownHostsFile, config.sshLobby, options.runner))
+    const controlTokenFor = async (sessionId: string): Promise<string> => {
+      const controller = controllerRef.current
+      const channel = controlChannel
+      if (!channel || !controller) throw new SandboxError("control_channel", "control channel is not ready", "CONTROL_CHANNEL")
+      const capability = await controller.capabilityFor(sessionId, "remote")
+      channel.register(capability)
+      return capability.token
+    }
+    const defaultSbx = config.provider === "sbx" && !options.provisioner && !options.sandcastle
+    const defaultExedev = config.provider === "exedev" && !options.provisioner && !options.sandcastle
+    const sbxOwnerForResource = defaultSbx
+      ? async (resourceId: string, owner?: RuntimeOwner) => {
+          const matches = (await store.list()).filter((record) => {
+            if (record.provider !== "sbx") return false
+            if (owner && (
+              owner.provider !== record.provider ||
+              owner.projectId !== record.projectId ||
+              owner.sessionId !== record.sessionId ||
+              owner.generation !== record.generation ||
+              owner.workspaceId !== record.workspaceId
+            )) return false
+            const state = record.providerState
+            const candidate = [state.sandbox, state.resourceId, state.sandboxId].find((value): value is string => typeof value === "string" && value.length > 0)
+            return candidate === resourceId
+          })
+          if (matches.length !== 1) return undefined
+          const record = matches[0]!
+          const ownershipId = record.providerState.ownershipId
+          if (typeof ownershipId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(ownershipId)) return undefined
+          return {
+            provider: "sbx" as const,
+            ownershipId,
+            sessionId: record.sessionId,
+            generation: record.generation,
+            workspaceId: record.workspaceId,
+            projectId: record.projectId,
+          }
+        }
+      : undefined
+    const defaultSbxProvider = defaultSbx
+        ? new SbxProvider({
+          worktree: input.worktree,
+          runner: options.runner,
+          localControlSocket: controlSocket,
+          supervisor: options.supervisor,
+          fetcher: options.fetcher,
+          remotePort: config.remotePort,
+          healthTimeoutMs: config.healthTimeoutMs,
+          bootstrapTimeoutMs: config.bootstrapTimeoutMs,
+          openCodeVersion: config.openCodeVersion,
+          deferActivation: true,
+          authContent,
+          ownerForResource: sbxOwnerForResource,
+          controlTokenFor,
+          revokeControlToken: (token) => controlChannel?.revoke(token),
+        })
+      : undefined
+    const defaultSbxRuntimeDriver = defaultSbxProvider?.runtimeDriver()
+    const exedevMetadataForResource = defaultExedev
+      ? async (resourceId: string, owner?: RuntimeOwner): Promise<unknown> => {
+          const matches = (await store.list()).filter((record) => {
+            if (record.provider !== "exedev") return false
+            if (owner && (
+              owner.provider !== record.provider ||
+              owner.projectId !== record.projectId ||
+              owner.sessionId !== record.sessionId ||
+              owner.generation !== record.generation ||
+              owner.workspaceId !== record.workspaceId ||
+              owner.directory !== record.directory ||
+              owner.branch !== record.branch ||
+              owner.baseSha !== record.baseSha
+            )) return false
+            const state = record.providerState
+            const identity = isRecord(state.vmIdentity) ? state.vmIdentity : record.vmIdentity
+            const candidates = [
+              state.resourceId,
+              state.vmName,
+              record.vmName,
+              record.vmIdentity?.id,
+              record.vmIdentity?.name,
+              isRecord(identity) && typeof identity.id === "string" ? identity.id : undefined,
+              isRecord(identity) && typeof identity.name === "string" ? identity.name : undefined,
+            ]
+            return candidates.includes(resourceId)
+          })
+          if (matches.length !== 1) return undefined
+          const record = matches[0]!
+          const state = record.providerState
+          const identity = isRecord(state.vmIdentity) ? state.vmIdentity : record.vmIdentity
+          if (
+            state.provider !== "exedev" ||
+            state.projectId !== record.projectId ||
+            state.sessionId !== record.sessionId ||
+            state.generation !== record.generation ||
+            state.workspaceId !== record.workspaceId ||
+            state.branch !== record.branch ||
+            state.baseSha !== record.baseSha ||
+            typeof state.remoteDirectory !== "string" ||
+            typeof state.vmName !== "string" ||
+            !identity
+          ) return undefined
+          return {
+            provider: "exedev",
+            projectId: record.projectId,
+            sessionId: record.sessionId,
+            generation: record.generation,
+            workspaceId: record.workspaceId,
+            branch: record.branch,
+            baseSha: record.baseSha,
+            remoteDirectory: state.remoteDirectory,
+            vmName: state.vmName,
+            vmIdentity: identity,
+          }
+        }
+      : undefined
+    const defaultExedevProvider = defaultExedev
+      ? new ExedevProvider({
+          config,
+          control: exeControl,
+          worktree: input.worktree,
+          runner: options.runner,
+          localControlSocket: controlSocket,
+          supervisor: options.supervisor,
+          fetcher: options.fetcher,
+          ensureHostKey,
+          ensureVmHostKey: options.ensureVmHostKey,
+          authContent,
+          durableMetadataForResource: exedevMetadataForResource,
+          controlTokenFor,
+          revokeControlToken: (token) => controlChannel?.revoke(token),
+          deferActivation: true,
+        })
+      : undefined
+    const defaultExedevRuntimeDriver = defaultExedevProvider?.runtimeDriver()
     const sandcastle: SandcastleWorkspaceOptions | undefined = options.sandcastle ?? (
       config.provider === "cloudflare" || ((config.provider === "exedev" || config.provider === "sbx") && !options.provisioner)
         ? {
@@ -114,15 +252,9 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
               : config.provider === "cloudflare"
                 ? `OpenCode workspace backed by a Cloudflare Sandbox (OpenCode ${config.openCodeVersion})`
                 : `OpenCode workspace backed by an exe.dev VM (OpenCode ${config.openCodeVersion})`,
+            ...(defaultSbxRuntimeDriver ? { runtimeDriver: defaultSbxRuntimeDriver } : {}),
+            ...(defaultExedevRuntimeDriver ? { runtimeDriver: defaultExedevRuntimeDriver } : {}),
             createAdapter: (adapterInput: SandcastleAdapterInput) => {
-              const controlTokenFor = async (sessionId: string): Promise<string> => {
-                const controller = controllerRef.current
-                const channel = controlChannel
-                if (!channel || !controller) throw new SandboxError("control_channel", "control channel is not ready", "CONTROL_CHANNEL")
-                const capability = await controller.capabilityFor(sessionId, "remote")
-                channel.register(capability)
-                return capability.token
-              }
               if (config.provider === "sbx") {
                 return createSbxSandcastleAdapter({
                   input: adapterInput,
@@ -137,6 +269,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
                   authContent,
                   controlTokenFor,
                   revokeControlToken: (token) => controlChannel?.revoke(token),
+                  provider: defaultSbxProvider,
                 })
               }
               if (config.provider === "cloudflare") {
@@ -166,11 +299,13 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
                 config,
                 control: exeControl,
                 worktree: input.worktree,
+                runner: options.runner,
                 localControlSocket: controlSocket,
                 supervisor: options.supervisor,
                 fetcher: options.fetcher,
                 ensureHostKey,
                 authContent,
+                provider: defaultExedevProvider,
                 controlTokenFor,
                 revokeControlToken: (token) => controlChannel?.revoke(token),
               })
@@ -192,7 +327,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
           controllerRef,
           getControlChannel: () => controlChannel,
         })
-    const inspectionProvider = provider ?? (!options.sandcastle ? createInspectionProvider(config.provider, {
+    const inspectionProvider = provider ?? defaultSbxProvider ?? defaultExedevProvider ?? (!options.sandcastle ? createInspectionProvider(config.provider, {
       config,
       worktree: input.worktree,
       control: exeControl,

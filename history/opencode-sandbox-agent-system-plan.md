@@ -1,6 +1,6 @@
 # Plan: make the OpenCode sandbox agent-native
 
-Status: Phase 1 completed on 2026-09-02; Phase 2 and later work remains deferred. This file lives in `history/` for the remaining proposal and its concise delivery record. Current behavior is documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
+Status: Phase 2 SBX and exe.dev adoption plus verified-orphan deletion completed on 2026-09-06 for the default Sandcastle path; Cloudflare recovery remains deferred. This file lives in `history/` for the remaining proposal and its concise delivery record. Current behavior is documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
 
 ## Outcome
 
@@ -40,7 +40,7 @@ ownership: verified | unknown | conflict
 
 Keep the last operation and stable error code beside these dimensions. Persist `schemaVersion` and migrate existing records because they already exist outside the repository.
 
-Derive situation labels such as attached, orphan, stale record, leaked resource, and conflict from those facts. A verified orphan can be adopted, preserved and removed, or explicitly discarded only after the deferred recovery work exists. Control loss without provider observation remains unknown. A conflict remains blocked.
+Derive situation labels such as attached, orphan, stale record, leaked resource, and conflict from those facts. A verified orphan can be adopted only through a configured runtime driver; preservation and destruction remain separate actions. Control loss without provider observation remains unknown. A conflict remains blocked.
 
 ## Target module seams
 
@@ -77,13 +77,12 @@ Build a read-only view by joining the lifecycle record, workspace registry, runt
 
 | Layer | Verbs | Meaning |
 |---|---|---|
-| Current public commands | `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, `retry` | Lifecycle operations plus the Phase 1 read paths |
-| Deferred public session command | `recover` | Reacquire a verified runtime; not accepted by the current CLI |
-| Deferred public host command | `repair` | Reconcile stale control-plane records; not accepted by the current CLI |
-| Controller operations | Current verbs; future `recover` and `repair` | Authorize roles, serialize decisions, and return the versioned result contract |
-| Provider methods | `create`, `inspect`, future `adopt`, `sync`, `close`, `destroy` | Implement provider behavior; provider methods never appear in `/sandbox` output as user actions |
+| Current public commands | `start`, `stop`, `status`, `inspect`, `inventory`, `delete`, `logs`, `diagnose`, `retry`, `recover`, `repair` | Lifecycle operations plus the Phase 1 read paths, verified orphan recovery, and stale-record repair |
+| Host-only runtime commands | `recover` when advertised; `repair` | Reacquire an exact runtime or reconcile only a freshly proven stale control-plane record |
+| Controller operations | Current verbs | Authorize roles, serialize decisions, and return the versioned result contract |
+| Provider methods | `create`, `inspect`, `adopt`, `sync`, `close`, `destroy` | Implement provider behavior; provider methods never appear in `/sandbox` output as user actions |
 
-`adopt` is provider vocabulary. The deferred public intent is `recover`. `inventory` is host-only and read-only. The deferred `repair` operation is also host-only and may change control-plane records only after inspection proves the external situation. `delete` remains the sole public destruction verb.
+`adopt` is provider vocabulary. The public intent is host-only `recover`, advertised only when the configured runtime driver can reacquire the exact resource. `inventory` is host-only and read-only. `repair` is host-only and may change only the control plane after fresh inspection proves provider and handle absence plus workspace absence or an exact owned registration. `delete` remains the sole public destruction verb for provider resources.
 
 The capability gains `scope: "session" | "project"`. Normal commands use session scope. Host `inventory` requires project scope and remains read-only. No remote capability receives project scope.
 
@@ -94,6 +93,8 @@ The capability gains `scope: "session" | "project"`. Normal commands use session
 | `stop` | host or remote | session | yes | Existing control channel |
 | `retry` | role required by the recorded operation | session | yes | Existing control channel |
 | `delete` | host or remote without force; host with force | session | yes | Existing control channel |
+| `repair` | host | session | yes, control plane only | Existing control channel |
+| `recover` | host, when advertised | session | yes, runtime adoption only | Existing control channel |
 | `inventory` | host | project | no | Existing control channel with project capability |
 
 ## Delivery sequence
@@ -116,28 +117,32 @@ The completed vertical path is recorded here; its current contract and operating
 - Added bounded parallel workspace, provider, runtime-target, and Git probes, a 5-second per-probe inspection deadline, and a 10-second provider inventory deadline.
 - Added exe.dev identity/owner-tag inspection and SBX inventory/ownership-marker inspection. Provider inventory remains a listing, not session ownership proof.
 - Added session/project capability authorization, redaction, response bounds, and inventory bounds.
-- Deferred recovery, adoption, repair, and destructive control of a post-restart control-lost runtime to Phase 2. Cloudflare has no Phase 1 provider inspection or inventory adapter and remains unknown-safe.
+- Deferred recovery, adoption, and destructive control of a post-restart control-lost runtime to Phase 2. Cloudflare has no Phase 1 provider inspection or inventory adapter and remains unknown-safe.
 
-### Phase 2: close the recovery loop (deferred)
+### Phase 2: close the recovery loop (completed 2026-09-06 for SBX and exe.dev)
 
-Changes:
+Delivered in this slice:
 
-- Add durable lookup and `adopt` behavior where a provider cannot yet reacquire a runtime; expose it only through host-only `recover`.
-- Add a Cloudflare resource lookup with owner metadata before claiming Cloudflare inspection or recovery support.
-- Permit deletion of a verified orphan through the lifecycle controller only after preservation and ownership checks are available.
-- Preserve or name the worktree before destroying any recoverable runtime.
-- Add a host-only repair path for stale records and workspace registrations.
-- Add destructive post-restart control only after recovery and ownership proof are durable; control-lost/orphaned resources remain read-only until then.
-- Make reconciliation produce a plan first; apply only actions allowed by ownership and preservation checks.
+- Added host-only `repair` for stale records and exactly owned workspace registrations; it writes a safe `local` or `detached` record and does not delete state files.
+- Made startup reconciliation produce a read-only observation plan first, then apply only an attached or provider-verified orphan decision after locked record identity/generation/`updatedAt` revalidation. Unknown and conflicting plans do not mutate.
+- Added the five-method `RuntimeDriver` seam (`inspect`, `adopt`, `sync`, `close`, `destroy`) and extended Sandcastle sessions with default SBX and exe.dev implementations.
+- Added host-only `recover` with locked fresh preflight, exact resource/ownership checks, stale-plan rejection, existing-workspace routing, safe adoption failure persistence, and fake-driver tests proving normal creation is not called.
+- Added exe.dev restart adoption with durable VM identity/owner-tag proof, read-only checkout verification, fresh local credentials and supervisor state, VM-preserving sync/close, and exact-identity destruction tests.
+- Added verified-orphan deletion with host-only runtime adoption, preservation-before-destruction ordering, fresh ownership rechecks, explicit force-discard semantics, persisted destruction state, and retry-safe lifecycle tests.
+
+Deferred:
+
+- Add a Cloudflare bridge resource lookup returning the durable sandbox ID and owner tuple, then add a runtime driver before claiming Cloudflare recovery or deletion support. The current bridge can query `running(sandboxId)` only; `CloudflareProvider` keeps ownership in a process-local map, so a restarted record cannot prove ownership.
+- Add destructive post-restart control only after Cloudflare passes recovery and ownership proof; unsupported control-lost/orphaned resources remain read-only until then.
 
 Completion criteria:
 
-- Restart an active session, observe the resource, recover control, stop it, and return to the host in an integration test.
-- Restart an active session with a missing provider resource and repair the stale record.
-- Present a conflicting resource and prove that reconciliation performs no mutation.
-- Remove a verified orphan without invoking provider commands outside the controller.
+- Met: restart an active SBX session, observe the resource, recover control, stop it, and return to the host without create commands.
+- Met: restart an active session with a missing provider resource and repair the stale record.
+- Met: present a conflicting resource and prove that reconciliation performs no mutation.
+- Met: remove a verified orphan without invoking provider commands outside the controller for SBX and exe.dev.
 
-No Phase 2 behavior is exposed by the current `sandboxctl` command set.
+`recover` and `repair` are exposed by `sandboxctl`; `recover` and verified-orphan deletion are actionable only when a runtime driver is configured. SBX and exe.dev adoption and deletion are now available for exact running resources; Cloudflare recovery and deletion remain deferred.
 
 ### Phase 3: separate state dimensions
 
@@ -146,7 +151,7 @@ Changes:
 - Introduce the versioned situation model and migrate current records.
 - Derive compatibility responses for existing operations during the migration.
 - Make transitions functions of desired location plus observed situation, rather than a growing graph of mixed states.
-- Remove `recovery_pending` and terminal `orphaned` only after all provider recovery paths pass.
+- Remove `recovery_pending` and simplify the `orphaned` recovery gate only after all provider recovery paths pass.
 
 Completion criteria:
 
@@ -188,7 +193,7 @@ Test legal combinations and derived classifications, not the unconstrained Carte
 
 | Current seam | Migration | Removal gate |
 |---|---|---|
-| `LifecycleDependencies.sandcastle` | Runtime driver creates and adopts runtime handles | All providers pass create, restart-recover, sync, and destroy scenarios |
+| `LifecycleDependencies.sandcastle` | Optional runtime driver creates and adopts runtime handles | All providers pass create, restart-recover, sync, and destroy scenarios |
 | `providerRelease` / `providerDestroy` | Runtime driver `close` / `destroy` | No lifecycle branch calls provider closures directly |
 | `InfrastructureOperations` | Runtime driver inspection, diagnostics, and destruction preflight | Logs, diagnosis, ownership, and deletion tests use only the runtime driver |
 | `WorkspaceProviderBase` direct path | Provider adapters behind the runtime driver | Injected provider tests use the same lifecycle path as production |
@@ -213,13 +218,13 @@ Completion criteria:
 
 ## Command vocabulary decision
 
-Phase 1 adds `inspect` where an adapter can observe a provider and `inventory` as a host-only project read. Use `retry` for repeating an unchanged failed operation. Add `recover` only for reacquiring a verified external resource and `repair` only for reconciling stale control-plane records. These verbs describe different actions and should not be aliases.
+Phase 1 adds `inspect` where an adapter can observe a provider and `inventory` as a host-only project read. Phase 2 adds host-only `recover` where a runtime driver can reacquire a verified external resource. Use `retry` for repeating an unchanged failed operation and `repair` only for reconciling stale control-plane records. These verbs describe different actions and should not be aliases.
 
-System-wide inventory and future repair must be host-only. Remote capabilities remain session-scoped and cannot start, force-delete, adopt, recover, or repair resources.
+System-wide inventory and repair must be host-only. Remote capabilities remain session-scoped and cannot start, force-delete, adopt, recover, or repair resources.
 
 ## Resource budget
 
-The implemented Phase 1 read budgets and output bounds are maintained in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md). Future recovery and repair must retain bounded, read-before-mutate behavior.
+The implemented read budgets and output bounds are maintained in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md). Future recovery, and any expansion of repair, must retain bounded, read-before-mutate behavior.
 
 Do not poll when an operation can wait on an existing event or process result. Do not retain provider clients after their owning lifecycle scope closes. Do not copy full logs into state; retain references and stable result codes.
 
