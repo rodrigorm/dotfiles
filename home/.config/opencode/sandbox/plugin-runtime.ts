@@ -8,7 +8,6 @@ import { ControlChannel } from "./control-channel"
 import { SshExeControl, type ExeControl } from "./exe-control"
 import { LifecycleController, type InfrastructureOperations } from "./lifecycle"
 import { shortHash } from "./naming"
-import { isTransitionPending } from "./state"
 import { createExedevSandcastleAdapter, ExedevProvider, ensureExeDevHostKey } from "./exedev-provider"
 import { createSbxSandcastleAdapter, SbxProvider } from "./sbx-provider"
 import { createCloudflareSandcastleAdapter } from "./cloudflare-provider"
@@ -487,7 +486,7 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
           // ponytail: drain trailing events for 500 ms; replace with a durable idle fence when OpenCode exposes one.
           controller.scheduleSessionIdle(sessionId, async () => {
             const record = await store.get(sessionId)
-            if (record && !isTransitionPending(record.state)) revokeHostCapability(sessionId)
+            if (record && record.phase === "idle" && !record.lastError) revokeHostCapability(sessionId)
           })
         }
       },

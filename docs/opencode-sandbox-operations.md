@@ -14,19 +14,21 @@ Inside an OpenCode session, use `/sandbox <operation>`. The command delegates to
 | Move execution to a runtime | `/sandbox start` | Response says activation is pending or remote; the next message confirms the remote target |
 | Return execution to the host | `/sandbox stop` | A later status is `detached`, and preserved worktree details are reported if present |
 | Inspect a failure | `/sandbox diagnose` | Provider-safe details are captured when diagnostics are configured; `{ "configured": false }` means no diagnostics hook is configured |
-| Repeat the recorded failed operation | `/sandbox retry` using the role in `allowedActions` | State leaves `error`, `sync_failed`, or `recovery_pending`; start and force-delete retries require the host |
+| Repeat the recorded failed operation | `/sandbox retry` using the role in `allowedActions` | The recorded `start`, `stop`, `delete`, or `recover` operation is retried only when the typed action is advertised; start and force-delete retries require the host |
 | Recover a verified orphan | `/sandbox recover` from the host when advertised | The exact resource is adopted through the configured runtime driver and the existing workspace returns to `remote`; failed or stale recovery remains inspectable without destruction |
 | Reconcile a proved stale control-plane record | `/sandbox repair` from the host | State becomes `local` or `detached`; an exact stale workspace registration is removed and no provider resource is mutated |
 | Preserve changes and remove | `/sandbox delete` | A verified orphan is adopted first; state becomes `deleted` after synchronization, close/preservation, exact workspace removal, and a fresh ownership check |
 | Discard a `sync_failed`, detached, or verified orphan runtime | `/sandbox delete --force` from host | State becomes `deleted`; force may skip synchronization only after verified adoption, and unknown ownership remains blocked |
 
-`/sandbox status` remains record-only and does not query provider, workspace, runtime-target, or Git sources. Use `/sandbox inspect` for one session or `/sandbox inventory` for the project. Do not read `intent.desiredLocation`, `remote`, or `orphaned` state as proof that a resource is healthy or stopped.
+`/sandbox status` remains record-only and does not query provider, workspace, runtime-target, or Git sources. Use `/sandbox inspect` for one session or `/sandbox inventory` for the project. Do not read `intent.desiredLocation`, `remote`, or the compatibility projections `orphaned` and `recovery_pending` as proof that a resource is healthy or stopped.
 
 ## Decision fields
 
-Every result is `SandboxResultV2` with `schemaVersion: 2`. Read `effectiveTarget` for the proved execution target; `null` means no target was proved. Read `observations` for the five sources (`record`, `handle`, `workspace`, `provider`, and `git`); an `observed: false` entry is not evidence of absence. Read `classification` for the situation, `work` for preservation risk, `allowedActions` for the complete permitted action set, `recommendedAction` for the controller's recommendation, and `error` for a stable failure code, stage, and retryability.
+Every result is `SandboxResultV2` with response `schemaVersion: 2`. Disk records use `schemaVersion: 1`; they persist only canonical intent (`desiredLocation` and `phase`) plus lifecycle metadata. Read `effectiveTarget` for the proved execution target; `null` means no target was proved. Read `observations` for the five sources (`record`, `handle`, `workspace`, `provider`, and `git`); an `observed: false` entry is not evidence of absence. Read `classification` for the situation, `work` for preservation risk, `allowedActions` for the complete permitted action set, `recommendedAction` for the controller's recommendation, and `error` for a stable failure code, stage, and retryability.
 
-The result also includes `requestId`, `ok`, `operation`, `message`, `session`, and `intent`. Compatibility fields `state`, `stage`, and non-secret `details` may also be present. The desired location is intent, not a target proof, and prose never overrides `allowedActions`.
+The result also includes `requestId`, `ok`, `operation`, `message`, `session`, and `intent`. Compatibility fields `state`, `stage`, and non-secret `details` may also be present. The desired location is intent, not a target proof, and prose never overrides `allowedActions`. Observations are fresh response facts, not durable state.
+
+Legacy state-only records are migrated on read under the per-session lock. The store validates the old record, derives canonical intent and phase, writes a private temporary file, syncs it, and renames it atomically. The migration is idempotent and does not query a provider. A normal write omits the compatibility `state` field.
 
 ## Observation budget
 
@@ -44,12 +46,12 @@ Provider resource inspection and inventory are implemented for exe.dev and SBX. 
 Before mutating provider resources, collect this minimal report:
 
 1. Run `/sandbox status` or read the private lifecycle record when the session command is unavailable.
-2. Record `sessionId`, `workspaceId`, `generation`, `provider`, branch, `baseSha`, operation phase, and last error.
+2. Record `sessionId`, `workspaceId`, `generation`, `provider`, branch, `baseSha`, desired location, phase, operation, and last error.
 3. Run `/sandbox inspect` for the session and retain all five observation entries.
 4. Inspect the Git branch and `.sandcastle/worktrees/` path for unpreserved changes when the result names a worktree or preservation risk.
 5. Classify the result using the table below.
 
-Completion means every known resource is assigned to an ownership tuple or marked unknown. A provider name match by itself does not complete the report.
+Completion means every known resource is assigned to an ownership tuple or marked unknown. A provider name match, persisted intent, or compatibility state by itself does not complete the report.
 
 Treat a present or unavailable workspace registration, and a failed runtime-target probe, as unknown evidence. Do not classify the session as clean or recommend starting it until provider, runtime handle, and workspace absence are all observed. A provider inventory result with unscoped resources is also unknown for this project.
 
@@ -64,20 +66,20 @@ Treat a present or unavailable workspace registration, and a failed runtime-targ
 | `stale_record` | Non-local record with observed absence of provider, handle, and workspace | Host repair when fresh observations prove the preconditions; otherwise inspect |
 | `leaked_resource` | Desired location local or deleted; handle absent; provider present with verified ownership | Delete only when `allowedActions` includes host delete and preservation is verified or explicit discard is recorded |
 | `conflict` | Any ownership evidence conflicts | Read-only actions; require a human decision |
-| `work_at_risk` | Recorded state is `sync_failed` | Retry the recorded operation when listed; preserve work before discard |
+| `work_at_risk` | Compatibility projection is `sync_failed` or the durable record has a sync error | Retry the recorded operation when listed; preserve work before discard |
 | `unknown` | Required evidence is missing, unavailable, or inconsistent | Inspect again or require an operator; take no inferred provider action |
 
-`allowedActions` is authoritative. Each action carries its role, arguments, preconditions, and `waitFor` behavior. Use `recommendedAction` only when it is present in that list. A `null` recommendation means the controller has no safe next action to automate.
+`allowedActions` is authoritative. Each action carries its role, arguments, preconditions, and `waitFor` behavior. Use `recommendedAction` only when it is present in that list. A `null` recommendation means the controller has no safe next action to automate. `error.retryable` describes whether repeating the operation may be useful; it does not authorize a retry, and `retry` is allowed only for the recorded operation when the typed action lists it.
 
 ## Restart boundary
 
-`adopt` remains provider vocabulary. Host `repair` is available only after fresh inspection proves provider absence, runtime-handle absence, and either workspace absence or an exactly owned workspace registration. It removes only that exact registration, never a mismatch, then writes a safe `local` or `detached` record. After a plugin restart, an active Sandcastle record with only a missing handle remains unchanged; verified provider presence may be recorded as `orphaned`, and `recover` or `delete` may reacquire it only when `allowedActions` advertises the configured runtime-driver path. Orphan deletion preserves work before removing the exact workspace, rechecks ownership immediately before destruction, and records completed destruction for retry safety. Recovery itself never destroys a provider resource.
+`adopt` remains provider vocabulary. Host `repair` is available only after fresh inspection proves provider absence, runtime-handle absence, and either workspace absence or an exactly owned workspace registration. It removes only that exact registration, never a mismatch, then writes a safe `local` or `detached` record. After a plugin restart, an active Sandcastle record with only a missing handle remains unchanged; verified provider presence may produce the compatibility label `orphaned`, and `recover` or `delete` may reacquire it only when `allowedActions` advertises the configured runtime-driver path. Orphan deletion preserves work before removing the exact workspace, rechecks ownership immediately before destruction, and records completed destruction for retry safety. Recovery itself never destroys a provider resource.
 
-The Cloudflare path has no provider inspection or inventory adapter. Its provider observation remains unavailable or unknown, and no Cloudflare command is implied by an `allowedActions` or recommendation field.
+The Cloudflare path has no provider inspection, inventory, or runtime-adoption adapter. Its provider observation remains unavailable or unknown, and no Cloudflare command, recovery, or destructive action is implied by an `allowedActions` or recommendation field.
 
 ## Current SBX orphan procedure
 
-This section is a temporary, human operator-only escape hatch for providers without a production runtime driver or for unsupported SBX evidence. Do not execute it from the `/sandbox` command agent. `sandboxctl recover` and verified-orphan `sandboxctl delete` handle an exact running SBX resource through the injected runtime-driver seam; stopped, legacy-marker, duplicate, timed-out, conflicting, or otherwise unknown resources still require an operator to observe the resource and match the state record before manual cleanup. The current `orphaned` state alone is not that proof.
+This section is a temporary, human operator-only escape hatch for providers without a production runtime driver or for unsupported SBX evidence. Do not execute it from the `/sandbox` command agent. `sandboxctl recover` and verified-orphan `sandboxctl delete` handle an exact running SBX resource through the injected runtime-driver seam; stopped, legacy-marker, duplicate, timed-out, conflicting, or otherwise unknown resources still require an operator to observe the resource and match the state record before manual cleanup. The compatibility `orphaned` label alone is not that proof.
 
 ```bash
 sbx ls

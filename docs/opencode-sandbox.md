@@ -50,7 +50,7 @@ This is one control system, not three provider launchers. Provider commands are 
 | Workspace gateway | Create, warp, replay, sync status, remove | OpenCode workspace protocol | Runtime provisioning |
 | Runtime session | Apply capture, expose target, sync, close | One worktree and one runtime handle | Cross-session policy |
 | Provider adapter | Provider-specific runtime behavior | Resource creation, bootstrap, transport, health, destruction | User-facing operation semantics |
-| State store | Snapshot reads plus locked atomic mutation | Durable lifecycle record and file safety | Provider health |
+| State store | Snapshot reads plus locked atomic mutation | Versioned durable intent/phase record and file safety | Provider health or other observed facts |
 
 `LifecycleController` is the deep module. Callers ask for lifecycle outcomes; they do not coordinate the modules beneath it. Tests should cross the same interface unless they exercise a provider adapter directly.
 
@@ -64,7 +64,7 @@ projectId + sessionId + generation + workspaceId + provider
 
 `baseSha` and `branch` bind the Git lineage. Provider metadata binds the external resource. A control capability binds `sessionId`, `generation`, and role. Any destructive operation must establish this chain from the lifecycle record to the observed resource.
 
-SBX and exe.dev require this tuple to match the provider's observed resource metadata before reuse, stop, or destruction. New SBX resources store the tuple and a random ownership ID in an external marker read through `sbx cp`; read-only inspection can therefore verify ownership after restart without starting a stopped sandbox. Legacy fingerprint-only markers remain verifiable only by their creating process. Names are conveniences, not proof of ownership. Cloudflare currently checks this tuple only in the live provider instance; it has no Phase 1 resource inspection or inventory adapter, so a Cloudflare provider observation remains unavailable or unknown.
+SBX and exe.dev require this tuple to match the provider's observed resource metadata before reuse, stop, or destruction. New SBX resources store the tuple and a random ownership ID in an external marker read through `sbx cp`; read-only inspection can therefore verify ownership after restart without starting a stopped sandbox. Legacy fingerprint-only markers remain verifiable only by their creating process. Names are conveniences, not proof of ownership. Cloudflare currently checks this tuple only in the live provider instance; it has no resource inspection, inventory, or runtime-adoption adapter, so a Cloudflare provider observation remains unavailable or unknown.
 
 ## Authoritative state
 
@@ -72,7 +72,7 @@ No single current data source proves the whole situation:
 
 | Source | Proves | Cannot prove |
 |---|---|---|
-| Lifecycle record | Last committed intent, phase, identity, provider metadata, error | Current provider health or a live handle |
+| Lifecycle record | Last committed intent, phase, identity, provider metadata, and last error | Current provider health, ownership, resource state, or a live handle |
 | In-memory runtime session | This plugin instance can control the runtime | Survival across plugin restart |
 | OpenCode workspace registry | Session routing association | Provider resource ownership |
 | Provider inventory and ownership metadata | Resource existence and provider status; durable SBX or exe.dev ownership only when the provider-specific proof matches | Runtime control or unpreserved work |
@@ -81,6 +81,19 @@ No single current data source proves the whole situation:
 Reconciliation means comparing these sources. `status` intentionally reads only the record; `inspect` joins the record with bounded workspace, provider, runtime-handle, and Git observations, while host-only `inventory` lists project records and provider resources when the configured provider exposes an inventory adapter. The current contract is described below; the remaining recovery design is recorded in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
 
 `clean` requires observed absence of the provider resource, runtime handle, and workspace registration. A failed or unavailable ownership or resource probe remains unknown and cannot authorize a destructive action or a new start.
+
+## Persistence and response schemas
+
+The disk and response schemas are intentionally different:
+
+| Surface | Schema | Canonical fields | Compatibility or observed fields |
+|---|---:|---|---|
+| Private `*.json` lifecycle record | `schemaVersion: 1` | `desiredLocation` and `phase`, plus identity, operation, and error data | `state` is not emitted by normal writes |
+| `SandboxResultV2` control response | `schemaVersion: 2` | `intent.desiredLocation` and `intent.phase` | Compatibility `state`, plus fresh `observations`, classification, target, work, actions, and error |
+
+Legacy records that contain only `state` are validated, deterministically mapped to schema-1 intent and phase, and rewritten under the per-session state lock. The rewrite is atomic: the store writes and syncs a private temporary file, then renames it into place. Migration is idempotent, does not probe a provider, and returns the compatibility state for the current response. A schema-1 record with an extra legacy `state` field still uses canonical intent; the next normal write removes that non-canonical field.
+
+`desiredLocation` and `phase` are durable intent. Control, resource, ownership, health, classification, and effective target are observations or derivations and are not durable truth. An `observed: false` or unknown response entry is not evidence of absence. In particular, a persisted `remote` intent or compatibility `state` never proves that a runtime exists, is healthy, or is stopped.
 
 ## Phase 1 decision contract
 
@@ -98,16 +111,16 @@ Every normal control response is a `SandboxResultV2` with `schemaVersion: 2`. Th
 |---|---|
 | `requestId`, `ok`, `operation`, `message` | Correlation, outcome, requested operation, and redacted human-readable summary. |
 | `session` | `null` or the project, session, workspace, generation, and provider identity. |
-| `intent` | Persisted desired location (`local`, `remote`, or `deleted`) and derived phase (`idle`, `capturing`, `provisioning`, `activating`, `syncing`, `detaching`, or `deleting`). |
+| `intent` | Canonical desired location (`local`, `remote`, or `deleted`) and persisted phase (`idle`, `capturing`, `provisioning`, `activating`, `syncing`, `detaching`, or `deleting`). |
 | `effectiveTarget` | `null`, a proved local directory, or a proved remote resource ID. Desired location alone never fills this field; remote targets also require a verified provider observation. URLs, headers, and credentials are excluded. |
-| `observations` | One entry for each `record`, `handle`, `workspace`, `provider`, and `git` source. Each entry has `observed`, `freshAt`, bounded evidence, and any applicable resource, ownership, and health values. |
+| `observations` | One entry for each `record`, `handle`, `workspace`, `provider`, and `git` source. Each entry has `observed`, `freshAt`, bounded evidence, and any applicable resource, ownership, and health values. These facts exist in the response only. |
 | `classification` | One of `clean`, `attached`, `control_lost`, `orphan`, `stale_record`, `leaked_resource`, `conflict`, `work_at_risk`, or `unknown`. |
 | `work` | Capture base SHA, observed runtime HEAD, sync state (`clean`, `dirty`, `failed`, or `unknown`), preservation state, and any preserved worktree path. |
 | `allowedActions` | The controller's complete action set. Each action names the public operation, required role, arguments, preconditions, and wait behavior (`none`, `session_idle`, or `operation_completion`). |
 | `recommendedAction` | One allowed operation plus a reason code, or `null` when no safe recommendation exists. It is a recommendation, not permission to invent another operation. |
-| `error` | `null` or a stable code, stage, and retryability flag. Probe failures are represented as unknown evidence rather than guessed facts. |
+| `error` | `null` or a stable code, stage, and retryability flag. Probe failures are represented as unknown evidence rather than guessed facts; retryability never grants permission by itself. |
 
-`status` and `inspect` use session capabilities. `inventory` uses a host-only project capability; remote capabilities cannot request it. `recover`, `repair`, and verified-orphan deletion use host session capabilities and are host-only. Inventory details contain bounded `records` and `providerResources` arrays. The CLI still exposes the compatibility fields `state`, `stage`, and non-secret `details` where present. `recover` and orphan deletion are available only when an injected runtime driver and fresh inspection prove their preconditions; `repair` remains the stale-control-plane operation.
+`status` and `inspect` use session capabilities. `inventory` uses a host-only project capability; remote capabilities cannot request it. `recover`, `repair`, and verified-orphan deletion use host session capabilities and are host-only. Inventory details contain bounded `records` and `providerResources` arrays. The CLI still exposes the compatibility projection `state`, `stage`, and non-secret `details` where present. `recover` and orphan deletion are available only when an injected runtime driver and fresh inspection prove their preconditions; `repair` remains the stale-control-plane operation.
 
 ### Observation budgets
 
@@ -126,12 +139,12 @@ Provider inspection is currently available through the exe.dev and SBX adapters.
 |---|---|---|
 | `clean` | Provider, runtime handle, and workspace are all observed absent for a local, detached, or deleted record | `start` may be advertised only to a host with session context and capture available; otherwise read-only inspection remains the choice. |
 | `attached` | Runtime handle is present, provider resource is present and ownership-verified, and provider health is known | `stop` is recommended; normal `stop` or `delete` waits for session idle and preserves work first. |
-| `control_lost` | A non-local record has no handle and provider state is unavailable or unknown | Inspect only; do not treat `remote` or `orphaned` state as proof that the resource exists or stopped. |
+| `control_lost` | A non-local record has no handle and provider state is unavailable or unknown | Inspect only; do not treat `remote` intent or the compatibility `orphaned` label as proof that the resource exists or stopped. |
 | `orphan` | Handle is absent, provider resource is present, ownership is verified, and the desired location is remote | Host `recover` can adopt the exact resource without destruction; host `delete` can adopt it, preserve or explicitly discard its work, remove the exact workspace, and then destroy it. |
 | `stale_record` | A non-local record has observed absence of its provider resource, handle, and workspace | Host `repair` is allowed only when those observations are fresh and workspace ownership is absent or exact; otherwise inspect. |
 | `leaked_resource` | Desired location is local or deleted, handle is absent, and a provider resource is present with verified ownership | Host `delete` is allowed only after preservation is verified or discard was explicitly recorded; otherwise inspect. |
 | `conflict` | Any ownership evidence conflicts | Read-only actions only. |
-| `work_at_risk` | The recorded state is `sync_failed` | Retry the recorded operation when it is present and allowed; preserve work before any discard. |
+| `work_at_risk` | The compatibility projection is `sync_failed` or the durable record has a sync error | Retry the recorded operation when it is present and allowed; preserve work before any discard. |
 | `unknown` | Required evidence is missing, unavailable, or inconsistent without a more specific safe classification | Inspect again or require an operator; no inferred provider action. |
 
 The action list is authoritative. `recommendedAction` must be present in `allowedActions` when non-null. A post-restart active or control-lost runtime can be recovered or deleted only through an injected runtime driver after exact resource and ownership verification; Cloudflare remains explicitly unsupported. Host `repair` can reconcile only a stale control-plane record after fresh provider and runtime-handle absence plus an absent or exactly owned workspace registration. Orphan deletion adopts before preservation, rechecks ownership immediately before destruction, and persists the destruction phase so retries do not repeat it. Recovery itself never destroys a provider resource.
@@ -145,21 +158,11 @@ The action list is authoritative. `recommendedAction` must be present in `allowe
 
 ## Current lifecycle
 
-The persisted states are defined in `sandbox/state.ts`.
+The durable lifecycle model is `schemaVersion: 1` with canonical `desiredLocation` and `phase`. Legal phases are `idle`, `syncing`, and `detaching` for local intent; `idle`, `capturing`, `provisioning`, `activating`, and `syncing` for remote intent; and `idle`, `syncing`, and `deleting` for deleted intent. The old `state` values remain a compatibility projection for responses and legacy callers, not a second durable state machine.
 
-```text
-local -> provisioning -> activation_pending -> remote
-                                              |
-                                              v
-                                      stop_pending -> detached
-                                              |
-                                              v
-                                      delete_pending -> deleted
+Legacy state-only records migrate on first read under a per-session lock and are atomically replaced with the canonical record. A failed operation keeps its desired intent and phase, records a stable `lastError`, and exposes `retry` only when an unchanged `start`, `stop`, `delete`, or `recover` operation is present and the caller role is authorized. A retryable error is not permission to mutate.
 
-failures -> error | sync_failed | recovery_pending | orphaned
-```
-
-The states currently mix stable location, transition phase, and failure classification. `orphaned` is a recovery and deletion gate in the current state machine; explicit host-authorized recovery can move it to `recovery_pending`, while verified deletion can move it to `delete_pending` only after fresh ownership evidence. Startup reconciliation now reads a bounded observation plan before any recovery mutation, revalidates the record identity, generation, and `updatedAt` under lock, and marks a Sandcastle record orphaned only when provider presence and ownership are observed; a missing handle alone remains unchanged. A proved stale record is repaired explicitly to `local` or `detached`, with no provider mutation.
+Startup reconciliation reads a bounded observation plan before any recovery mutation, revalidates record identity, generation, and `updatedAt` under lock, and mutates only after fresh evidence proves the action. Control, resource, ownership, health, classification, and effective target are derived from observations; missing or conflicting evidence remains unknown-safe. The compatibility labels `recovery_pending` and `orphaned` may still appear in responses while provider recovery support is incomplete.
 
 ### Start
 
@@ -185,7 +188,7 @@ Normal deletion attempts to preserve changes before destruction. A verified orph
 
 ### Recovery
 
-Startup reconciliation does not replay a pending operation when its fresh observation plan is unknown or conflicting. Sandcastle state still depends on an in-memory handle for control; after restart, a missing handle remains control-lost unless provider presence and ownership are verified, in which case it may be recorded as `orphaned`. Host `recover` then performs a locked fresh preflight, adopts the exact resource through the runtime driver, routes the existing workspace, and persists `remote`; host `delete` uses the same adoption gate before preservation and destruction. Stale plans, failed adoption, preservation failures, and ownership changes remain inspectable and retryable without destruction. Host `repair` handles only the proved stale case: provider absent, handle absent, and workspace absent or exactly owned.
+Startup reconciliation does not replay a pending operation when its fresh observation plan is unknown or conflicting. Sandcastle state still depends on an in-memory handle for control; after restart, a missing handle remains `control_lost` unless provider presence and ownership are verified, in which case the response may expose the compatibility label `orphaned`. Host `recover` then performs a locked fresh preflight, adopts the exact resource through the runtime driver, routes the existing workspace, and persists remote intent; host `delete` uses the same adoption gate before preservation and destruction. Stale plans, failed adoption, preservation failures, and ownership changes remain inspectable and retryable without destruction. Host `repair` handles only the proved stale case: provider absent, handle absent, and workspace absent or exactly owned.
 
 ## Control and trust
 
@@ -195,15 +198,15 @@ State files reject credential-shaped keys, use private permissions, write atomic
 
 ## Providers
 
-| Provider | Runtime | Transport | Required host configuration | Phase 1 resource observation |
+| Provider | Runtime | Transport | Required host configuration | Resource observation |
 |---|---|---|---|---|
 | `sbx` | Docker Sandbox clone | Published OpenCode port plus supervised SSH control proxy | `sbx` CLI and Docker Sandbox support | Session inspect plus project inventory; inspect reads the durable ownership marker |
 | `exedev` | exe.dev VM | SSH and remote control socket | exe.dev access, SSH lobby, pinned host key | Session inspect plus project inventory; inspect matches durable VM identity and owner tag |
-| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | No provider inspect or inventory adapter; provider observations stay unavailable or unknown |
+| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Unsupported after restart: no provider inspect, inventory, or runtime-adoption adapter; observations stay unavailable or unknown |
 
 All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
 
-The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare additionally needs a bridge resource lookup returning the durable sandbox ID and owner tuple before it can support recovery; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map.
+The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare needs a bridge resource lookup returning the durable sandbox ID and owner tuple plus a runtime driver before it can support recovery or post-restart deletion; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map. Cloudflare therefore never receives an inferred destructive action.
 
 ## Configuration
 
@@ -262,7 +265,7 @@ The current implementation has documented gaps, not hidden assumptions:
 - Unsupported provider inspection returns unknown observations and no destructive action.
 - Default `diagnose` reports only that diagnostics are not configured.
 
-The remaining recovery plan and the concise Phase 1 completion record live in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
+The remaining provider-seam work and concise completion summary live in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
 
 ## Navigation
 

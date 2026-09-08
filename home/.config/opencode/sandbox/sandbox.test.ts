@@ -11,7 +11,6 @@ import { createWorktree, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 import { DEFAULT_CONFIG, parseConfig } from "./config"
 import { ControlChannel, createCapability, parseControlRequest } from "./control-channel"
 import { buildExeDevSshArgv, DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS, SshExeControl } from "./exe-control"
-import { canTransition } from "./state"
 import { FileStateStore } from "./state-store"
 import { buildRemoteCommandArgv, buildSupervisorArgv } from "./remote-runtime"
 import { parseCliArgs, requestControl, requestControlMailbox, runCli } from "./cli"
@@ -141,18 +140,6 @@ describe("configuration", () => {
     expect(() => parseConfig({ unexpected: true }, { HOME: "/tmp" })).toThrow(/unknown configuration key/i)
     expect(() => parseConfig({ baseVm: "vm; rm -rf /" }, { HOME: "/tmp" })).toThrow(/baseVm/i)
     expect(() => parseConfig({ sshLobby: "exe.dev && whoami" }, { HOME: "/tmp" })).toThrow(/sshLobby/i)
-  })
-})
-
-describe("lifecycle state", () => {
-  it("allows only the documented transitions", () => {
-    expect(canTransition("local", "provisioning")).toBe(true)
-    expect(canTransition("remote", "detached")).toBe(false)
-    expect(canTransition("stop_pending", "sync_failed")).toBe(true)
-    expect(canTransition("sync_failed", "stop_pending")).toBe(true)
-    expect(canTransition("sync_failed", "orphaned")).toBe(true)
-    expect(canTransition("recovery_pending", "remote")).toBe(true)
-    expect(canTransition("orphaned", "delete_pending")).toBe(true)
   })
 })
 
@@ -969,7 +956,7 @@ describe("lifecycle controller", () => {
     expect(removed).toBe(0)
     expect(providerMutations).toBe(0)
     expect(await store.get(record.sessionId)).toMatchObject({ state: "detached", providerState: {} })
-    expect((await store.get(record.sessionId))?.operation).toBeUndefined()
+    expect((await store.get(record.sessionId))?.operation).toMatchObject({ kind: "stop", phase: "detached" })
     expect((await store.get(record.sessionId))?.lastError).toBeUndefined()
   })
 
@@ -1328,6 +1315,7 @@ describe("lifecycle controller", () => {
         async create() { throw new Error("must not create") },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
@@ -2124,11 +2112,14 @@ describe("lifecycle controller", () => {
     let destroyed = false
     const controller = new LifecycleController({
       store,
+      providerInspect: async () => ({ resourceId: "oc-0123456789", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
       providerDestroy: async () => { destroyed = true },
       workspace: {
         async create() { throw new Error("must not create") },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
 
@@ -2145,15 +2136,19 @@ describe("lifecycle controller", () => {
 
   it("does not complete Sandcastle deletion without persisted destruction evidence", async () => {
     const store = new FileStateStore(await temporaryDirectory())
-    const record = { ...makeRecord(), state: "detached" as const }
+    const record = { ...makeRecord(), state: "detached" as const, preservedWorktreePath: "/tmp/preserved" }
     await store.write(record)
     const controller = new LifecycleController({
       store,
       sandcastle: { createAdapter: async () => { throw new Error("must not create") } },
+      providerInspect: async () => ({ resourceId: "oc-0123456789", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
+      gitInspect: async () => ({ head: record.baseSha, branch: record.branch, dirty: false, evidence: ["fixture"] }),
       workspace: {
         async create() { throw new Error("must not create") },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
@@ -2350,6 +2345,8 @@ describe("lifecycle controller", () => {
     const calls: string[] = []
     const controller = new LifecycleController({
       store,
+      providerInspect: async () => ({ resourceId: "oc-0123456789", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => ({ type: "remote", url: "https://remote.example.test" }),
       capture: async () => ({ baseSha: "0123456789012345678901234567890123456789", patch: "", untracked: [] }),
       workspace: {
         async create(input) {
@@ -2455,6 +2452,126 @@ describe("lifecycle controller", () => {
     expect(destroyed).toBe(true)
   })
 
+  it("does not supersede a failed stop, delete, or recover with direct start", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const effects: string[] = []
+    const controller = new LifecycleController({
+      store,
+      capture: async () => {
+        effects.push("capture")
+        return { baseSha: makeRecord().baseSha, patch: "", untracked: [] }
+      },
+      providerInspect: async () => {
+        effects.push("provider:inspect")
+        return { resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }
+      },
+      providerTarget: async () => {
+        effects.push("provider:target")
+        return undefined
+      },
+      gitInspect: async () => {
+        effects.push("git:inspect")
+        return { head: makeRecord().baseSha, branch: makeRecord().branch, dirty: false, evidence: ["fixture"] }
+      },
+      workspace: {
+        async create() {
+          effects.push("workspace:create")
+          throw new Error("must not create")
+        },
+        async warp() { effects.push("workspace:warp") },
+        async remove() { effects.push("workspace:remove") },
+        async inspect() {
+          effects.push("workspace:inspect")
+          return undefined
+        },
+      },
+    })
+    controller.registerContext({ sessionId: "ses_1", projectId: "prj_1", directory: "/tmp/project", worktree: "/tmp/project" })
+
+    for (const kind of ["stop", "delete", "recover"] as const) {
+      const record: SandboxRecord = {
+        ...makeRecord(),
+        generation: 7,
+        state: "error",
+        preservedWorktreePath: "/tmp/preserved",
+        operation: { kind, phase: kind === "recover" ? "adopt_failed" : "awaiting_idle" },
+        lastError: { code: `${kind.toUpperCase()}_FAILED`, stage: "remove", message: `${kind} failed` },
+      }
+      await store.write(record)
+      const before = await store.get(record.sessionId)
+
+      const result = await controller.handle({
+        operation: "start",
+        force: false,
+        capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+      })
+
+      expect(result).toMatchObject({ ok: false, operation: "start", stage: "transition", error: { code: "SESSION_ERROR" } })
+      expect(await store.get(record.sessionId)).toEqual(before)
+      expect(effects).toEqual([])
+    }
+  })
+
+  it("allows an authorized retry of a failed direct start", async () => {
+    const store = new FileStateStore(await temporaryDirectory())
+    const effects: string[] = []
+    let failApply = true
+    const controller = new LifecycleController({
+      store,
+      capture: async () => {
+        effects.push("capture")
+        return { baseSha: makeRecord().baseSha, patch: "patch", untracked: [] }
+      },
+      workspace: {
+        async create(input) {
+          effects.push("workspace:create")
+          return {
+            id: input.id ?? "wrk_1",
+            type: input.type,
+            name: "workspace",
+            branch: input.branch,
+            directory: input.directory,
+            projectID: input.projectId,
+            extra: null,
+          }
+        },
+        async applyCapture() {
+          effects.push("workspace:applyCapture")
+          if (failApply) {
+            failApply = false
+            throw new SandboxError("sync", "initial start failed", "CAPTURE_FAILED")
+          }
+        },
+        async warp() {},
+        async remove() { effects.push("workspace:remove") },
+      },
+    })
+    controller.registerContext({ sessionId: "ses_1", projectId: "prj_1", directory: "/tmp/project", worktree: "/tmp/project" })
+    const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
+
+    await expect(controller.handle({ operation: "start", force: false, capability })).resolves.toMatchObject({ ok: false, state: "error" })
+    const failed = await store.get("ses_1")
+    if (!failed) throw new Error("failed start record was not written")
+
+    await expect(controller.handle({ operation: "retry", force: false, capability })).resolves.toMatchObject({
+      ok: true,
+      operation: "start",
+      state: "activation_pending",
+    })
+
+    const retried = await store.get("ses_1")
+    expect(retried).toMatchObject({
+      generation: failed.generation,
+      workspaceId: failed.workspaceId,
+      operation: { kind: "start", phase: "awaiting_idle" },
+    })
+    expect(retried?.lastError).toBeUndefined()
+    expect(effects.filter((effect) => effect === "capture")).toHaveLength(2)
+    expect(effects.filter((effect) => effect === "workspace:create")).toHaveLength(2)
+    expect(effects.filter((effect) => effect === "workspace:applyCapture")).toHaveLength(2)
+    expect(effects.filter((effect) => effect === "workspace:remove")).toHaveLength(2)
+  })
+
   it("blocks detach when sync returns a different base revision", async () => {
     const root = await temporaryDirectory()
     const store = new FileStateStore(root)
@@ -2463,6 +2580,8 @@ describe("lifecycle controller", () => {
     const calls: string[] = []
     const controller = new LifecycleController({
       store,
+      providerInspect: async () => ({ resourceId: "oc-0123456789", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => ({ type: "remote", url: "https://remote.example.test" }),
       workspace: {
         async create() {
           throw new Error("must not create")
@@ -2491,12 +2610,14 @@ describe("lifecycle controller", () => {
   it("reuses the VM identity and branch when resuming a detached session", async () => {
     const root = await temporaryDirectory()
     const store = new FileStateStore(root)
-  const existing = { ...makeRecord(), state: "detached" as const, vmName: "oc-existing", branch: "opencode/sandbox-existing" }
+    const existing = { ...makeRecord(), state: "detached" as const, vmName: "oc-existing", branch: "opencode/sandbox-existing" }
     await store.write(existing)
     let createdBranch = ""
     const controller = new LifecycleController({
       store,
       capture: async () => ({ baseSha: existing.baseSha, patch: "", untracked: [] }),
+      providerInspect: async () => ({ resourceId: "resource-1", resource: "absent", ownership: "unknown", health: "unknown", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
       workspace: {
         async create(input) {
           createdBranch = input.branch
@@ -2512,6 +2633,7 @@ describe("lifecycle controller", () => {
         },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     controller.registerContext({ sessionId: existing.sessionId, projectId: existing.projectId, directory: existing.directory, worktree: existing.directory })
@@ -2586,6 +2708,8 @@ describe("lifecycle controller", () => {
     const started = new Promise<void>((resolve) => { destroyStarted = resolve })
     const controller = new LifecycleController({
       store,
+      providerInspect: async () => ({ resourceId: "oc-0123456789", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
       providerDestroy: async () => {
         destroyStarted()
         await new Promise<void>((resolve) => { unblockDestroy = resolve })
@@ -2594,6 +2718,7 @@ describe("lifecycle controller", () => {
         async create() { throw new Error("must not create") },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
@@ -2737,16 +2862,24 @@ describe("lifecycle controller", () => {
         return records
       }
     })(await temporaryDirectory())
-    await store.write({ ...makeRecord(), state: "remote" })
+    await store.write({ ...makeRecord(), state: "remote", providerState: { resourceId: "resource-1" } })
     let destroyCalls = 0
     const controller = new LifecycleController({
       store,
+      runtimeDriver: {
+        async inspect() { return { resourceId: "resource-1", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] } },
+        async adopt() { throw new Error("must not adopt") },
+        async sync() {},
+        async close() { return {} },
+        async destroy() {},
+      },
       providerDestroy: async () => { destroyCalls++ },
       workspace: {
         async create() { throw new Error("must not create") },
         async warp() {},
         async syncOut(input) { return { kind: "control-plane", baseSha: input.baseSha } },
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: "ses_1", generation: 1, role: "host" })
@@ -2817,7 +2950,7 @@ describe("lifecycle controller", () => {
     expect((await store.get(record.sessionId))?.state).toBe("error")
   })
 
-  it("does not let a stale retry overwrite a new start", async () => {
+  it("does not let a direct start supersede a pending delete retry", async () => {
     let unblock!: () => void
     let readStarted!: () => void
     const initialRead = new Promise<void>((resolve) => { readStarted = resolve })
@@ -2874,19 +3007,19 @@ describe("lifecycle controller", () => {
       capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "remote" }),
     })
     await initialRead
-    await expect(controller.handle({
+    const directStart = await controller.handle({
       operation: "start",
       force: false,
       capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
-    })).resolves.toMatchObject({ ok: true, state: "activation_pending" })
+    })
+    expect(directStart).toMatchObject({ ok: false, stage: "transition", state: "error", error: { code: "SESSION_ERROR" } })
     unblock()
 
     const result = await remoteRetry
 
-    expect(result).toMatchObject({ ok: false, stage: "validate", state: "activation_pending" })
-    expect(result.message).toMatch(/changed while retry/i)
-    expect(destroyed).toBe(false)
-    expect((await store.get(record.sessionId))?.state).toBe("activation_pending")
+    expect(result).toMatchObject({ ok: true, operation: "retry", state: "deleted" })
+    expect(destroyed).toBe(true)
+    expect(await store.get(record.sessionId)).toMatchObject({ state: "deleted" })
   })
 
   it("redacts credentials from diagnostics while keeping recovery metadata", async () => {
@@ -5300,13 +5433,16 @@ describe("Cloudflare Sandbox provider", () => {
 
 describe("provider-owned deletion", () => {
   it("deletes a non-VM provider through its destroy callback", async () => {
-    const record = { ...makeRecord(), provider: "sbx", providerState: { sandbox: "oc-sbx-test" }, vmName: undefined, vmIdentity: undefined, state: "detached" as const }
+    const record = { ...makeRecord(), provider: "sbx", providerState: { sandbox: "oc-sbx-test" }, vmName: undefined, vmIdentity: undefined, state: "detached" as const, preservedWorktreePath: "/tmp/preserved" }
     const store = new FileStateStore(await temporaryDirectory())
     await store.write(record)
     let destroyed = false
     const controller = new LifecycleController({
       store,
       providerType: "sbx",
+      providerInspect: async () => ({ resourceId: "oc-sbx-test", resource: "present", ownership: "verified", health: "healthy", evidence: ["fixture"] }),
+      providerTarget: async () => undefined,
+      gitInspect: async () => ({ head: record.baseSha, branch: record.branch, dirty: false, evidence: ["fixture"] }),
       providerDestroy: async () => {
         destroyed = true
       },
@@ -5316,6 +5452,7 @@ describe("provider-owned deletion", () => {
         },
         async warp() {},
         async remove() {},
+        async inspect() { return undefined },
       },
     })
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })

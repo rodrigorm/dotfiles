@@ -19,7 +19,7 @@ import { FileStateStore } from "./state-store"
 import { runSyncBarrier } from "./sync-barrier"
 import { captureWorkingTree } from "./working-tree"
 import type { SandcastleSessionFactory } from "./sandcastle-session"
-import type { GitWorkingTreeObservation, SandboxRecord, SessionContext } from "./types"
+import type { GitWorkingTreeObservation, SandboxRecord, SessionContext, WorkspaceInfo } from "./types"
 
 const temporaryDirectories: string[] = []
 
@@ -163,6 +163,78 @@ describe("Sandcastle lifecycle", () => {
     expect(setup.resources.handle?.closed).toBe(false)
     await expect(setup.controller.dispose()).resolves.toBeUndefined()
     expect(setup.resources.handle?.closed).toBe(true)
+  })
+
+  it("does not supersede a failed stop, delete, or recover with direct Sandcastle start", async () => {
+    const captureCalls: string[] = []
+    const setup = await setupFakeLifecycle({ captureCalls })
+    const timestamp = new Date(1000).toISOString()
+
+    for (const kind of ["stop", "delete", "recover"] as const) {
+      const record: SandboxRecord = {
+        sessionId: "ses_1",
+        workspaceId: "wrk_failed",
+        projectId: "prj_1",
+        provider: "fake",
+        providerState: { resourceId: "fake-ses_1" },
+        generation: 7,
+        directory: setup.repository,
+        branch: "opencode/failed-start",
+        baseSha: setup.sourceHead,
+        preservedWorktreePath: join(setup.repository, "preserved-worktree"),
+        state: "error",
+        operation: { kind, phase: kind === "recover" ? "adopt_failed" : "awaiting_idle" },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        lastError: { code: `${kind.toUpperCase()}_FAILED`, stage: "remove", message: `${kind} failed` },
+      }
+      await setup.store.write(record)
+      const before = await setup.store.get(record.sessionId)
+
+      const result = await setup.controller.handle({
+        operation: "start",
+        force: false,
+        capability: createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" }),
+      })
+
+      expect(result).toMatchObject({ ok: false, operation: "start", stage: "transition", error: { code: "SESSION_ERROR" } })
+      expect(await setup.store.get(record.sessionId)).toEqual(before)
+      expect(setup.calls).toEqual([])
+      expect(captureCalls).toEqual([])
+    }
+  })
+
+  it("allows an authorized retry of a failed Sandcastle start", async () => {
+    const options = { workspaceMismatch: true, captureCalls: [] as string[] }
+    const setup = await setupFakeLifecycle(options)
+
+    try {
+      await expect(setup.controller.handle({ operation: "start", force: false, capability: setup.capability })).resolves.toMatchObject({
+        ok: false,
+        state: "error",
+      })
+      const failed = await setup.store.get("ses_1")
+      if (!failed) throw new Error("failed start record was not written")
+
+      options.workspaceMismatch = false
+      await expect(setup.controller.handle({ operation: "retry", force: false, capability: setup.capability })).resolves.toMatchObject({
+        ok: true,
+        operation: "start",
+        state: "activation_pending",
+      })
+
+      const retried = await setup.store.get("ses_1")
+      expect(retried).toMatchObject({
+        generation: failed.generation + 1,
+        operation: { kind: "start", phase: "awaiting_idle" },
+      })
+      expect(retried?.lastError).toBeUndefined()
+      expect(options.captureCalls).toHaveLength(2)
+      expect(setup.calls.filter((call) => call === "worktree:create")).toHaveLength(2)
+      expect(setup.calls.filter((call) => call === "workspace:create")).toHaveLength(2)
+    } finally {
+      await setup.controller.dispose()
+    }
   })
 
   it("starts from dirty input, waits to warp, and stops into a clean branch", async () => {
@@ -661,6 +733,7 @@ async function setupFakeLifecycle(options: {
   workspaceMismatch?: boolean
   workspaceRemoveFailures?: number
   closeFailures?: number
+  captureCalls?: string[]
   gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
 } = {}): Promise<FakeLifecycleSetup> {
   const repository = await createRepository()
@@ -680,6 +753,7 @@ async function setupFakeLifecycle(options: {
   const store = new FileStateStore(stateRoot)
   const calls: string[] = []
   const resources: FakeSessionResources = {}
+  let workspaceInfo: WorkspaceInfo | undefined
   const context: SessionContext = {
     sessionId: "ses_1",
     projectId: "prj_1",
@@ -688,22 +762,33 @@ async function setupFakeLifecycle(options: {
   }
   const controller = new LifecycleController({
     store,
-    capture: (value) => captureWorkingTree(value),
+    capture: (value) => {
+      options.captureCalls?.push("capture")
+      return captureWorkingTree(value)
+    },
     providerType: "fake",
     sandcastle: createFakeSessionFactory(calls, resources, options),
     gitInspect: options.gitInspect,
     workspace: {
       async create(input) {
         calls.push("workspace:create")
-        return {
+        workspaceInfo = {
           id: options.workspaceMismatch ? "wrk_wrong" : input.id ?? "wrk_1",
           type: input.type,
           name: "fake-workspace",
           branch: input.branch,
           directory: input.directory,
           projectID: input.projectId,
-          extra: {},
+          extra: {
+            owner: "opencode-sandbox",
+            sessionId: context.sessionId,
+            generation: 1,
+            workspaceId: input.id ?? "wrk_1",
+            projectId: input.projectId,
+            provider: input.type,
+          },
         }
+        return workspaceInfo
       },
       async warp(input) {
         calls.push(input.workspaceId ? "warp:remote" : "warp:local")
@@ -723,6 +808,10 @@ async function setupFakeLifecycle(options: {
           options.workspaceRemoveFailures = (options.workspaceRemoveFailures ?? 0) - 1
           throw new Error("fake workspace removal failure")
         }
+        workspaceInfo = undefined
+      },
+      async inspect() {
+        return workspaceInfo
       },
     },
   })
@@ -761,6 +850,15 @@ async function setupParallelFakeLifecycle(): Promise<ParallelFakeLifecycleSetup>
         resources.set(input.sessionId, resource)
         return {
           provider: fake.provider,
+          async inspect() {
+            return {
+              resourceId: `fake-${input.sessionId}`,
+              resource: "present",
+              ownership: "verified",
+              health: "healthy",
+              evidence: ["fake provider inventory"],
+            }
+          },
           async applyCapture({ sandbox, capture }) {
             resource.sandbox = sandbox
             const handle = fake.handles.at(-1)

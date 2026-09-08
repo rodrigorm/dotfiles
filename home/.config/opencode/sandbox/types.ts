@@ -70,6 +70,8 @@ export interface CopyVmInput extends CreateVmInput {
   baseVm: string
 }
 
+export const PERSISTED_SANDBOX_SCHEMA_VERSION = 1 as const
+
 export interface SandboxRecord {
   sessionId: string
   workspaceId: string
@@ -83,20 +85,34 @@ export interface SandboxRecord {
   branch: string
   baseSha: string
   preservedWorktreePath?: string
-  state: SandboxState
-  operation?: {
-    kind: SandboxOperation
-    phase: string
-    force?: boolean
-    providerDestroyed?: boolean
-  }
+  /** Compatibility projection for public responses and legacy callers. */
+  state?: SandboxState
+  schemaVersion?: typeof PERSISTED_SANDBOX_SCHEMA_VERSION
+  desiredLocation?: SandboxDesiredLocation
+  phase?: SandboxIntentPhase
+  operation?: SandboxOperationRecord
   createdAt: string
   updatedAt: string
-  lastError?: {
-    stage: string
-    message: string
-    code?: string
-  }
+  lastError?: SandboxErrorRecord
+}
+
+export interface SandboxOperationRecord {
+  kind: SandboxOperation
+  phase: string
+  force?: boolean
+  providerDestroyed?: boolean
+}
+
+export interface SandboxErrorRecord {
+  stage: string
+  message: string
+  code?: string
+}
+
+export type PersistedSandboxRecord = Omit<SandboxRecord, "state" | "schemaVersion" | "desiredLocation" | "phase"> & {
+  schemaVersion: typeof PERSISTED_SANDBOX_SCHEMA_VERSION
+  desiredLocation: SandboxDesiredLocation
+  phase: SandboxIntentPhase
 }
 
 export interface SessionContext {
@@ -291,6 +307,17 @@ export type SandboxIntentPhase =
   | "syncing"
   | "detaching"
   | "deleting"
+
+export const SANDBOX_DESIRED_LOCATIONS = ["local", "remote", "deleted"] as const
+export const SANDBOX_INTENT_PHASES = ["idle", "capturing", "provisioning", "activating", "syncing", "detaching", "deleting"] as const
+
+export function isSandboxDesiredLocation(value: unknown): value is SandboxDesiredLocation {
+  return typeof value === "string" && (SANDBOX_DESIRED_LOCATIONS as readonly string[]).includes(value)
+}
+
+export function isSandboxIntentPhase(value: unknown): value is SandboxIntentPhase {
+  return typeof value === "string" && (SANDBOX_INTENT_PHASES as readonly string[]).includes(value)
+}
 
 export interface SandboxObservation {
   source: "record" | "handle" | "workspace" | "provider" | "git"
