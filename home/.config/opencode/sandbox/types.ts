@@ -72,6 +72,21 @@ export interface CopyVmInput extends CreateVmInput {
 
 export const PERSISTED_SANDBOX_SCHEMA_VERSION = 1 as const
 
+export const MAX_OPERATION_JOURNAL_ENTRIES = 32 as const
+export const MAX_OPERATION_JOURNAL_STRING_BYTES = 256 as const
+export const MAX_OPERATION_JOURNAL_EVIDENCE_REFS = 8 as const
+export const MAX_OPERATION_JOURNAL_EVIDENCE_BYTES = 4 * 1024
+export const MAX_OPERATION_JOURNAL_BYTES = 16 * 1024
+
+export interface SandboxJournalEntry {
+  requestId: string
+  operation: SandboxOperation
+  startedAt: string
+  endedAt?: string
+  resultCode: string
+  evidence: string[]
+}
+
 export interface SandboxRecord {
   sessionId: string
   workspaceId: string
@@ -91,6 +106,7 @@ export interface SandboxRecord {
   desiredLocation?: SandboxDesiredLocation
   phase?: SandboxIntentPhase
   operation?: SandboxOperationRecord
+  journal?: SandboxJournalEntry[]
   createdAt: string
   updatedAt: string
   lastError?: SandboxErrorRecord
@@ -99,6 +115,7 @@ export interface SandboxRecord {
 export interface SandboxOperationRecord {
   kind: SandboxOperation
   phase: string
+  requestId?: string
   force?: boolean
   providerDestroyed?: boolean
 }
@@ -144,7 +161,23 @@ export interface ProviderResourceObservation {
   resource: "present" | "absent" | "unknown"
   ownership: "verified" | "unknown" | "conflict"
   health: "healthy" | "degraded" | "unknown"
+  remoteVersion?: string
   evidence: string[]
+}
+
+export interface ProcessOwnershipObservation {
+  observed: boolean
+  process: "present" | "absent" | "unknown"
+  ownership: "verified" | "unknown" | "conflict"
+  liveness: "running" | "exited" | "unknown"
+  pid?: number
+  evidence: string[]
+}
+
+export interface DiagnosticVersionSources {
+  configured?: string
+  local?: string
+  dependency?: string
 }
 
 export interface GitWorkingTreeObservation {
@@ -185,8 +218,10 @@ export interface WorkspaceProviderBase {
   target(info: WorkspaceInfo): WorkspaceTarget | Promise<WorkspaceTarget>
   release(info: WorkspaceInfo): Promise<void>
   destroy?(info: WorkspaceInfo): Promise<void>
-  inspect?(info: WorkspaceInfo): Promise<ProviderResourceObservation>
+  inspect?(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation>
+  diagnose?(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation>
   inventory?(): Promise<ProviderResourceObservation[]>
+  processObservation?(workspaceId: string): ProcessOwnershipObservation
   branch?(workspaceId: string): string
   runtimeMetadata?(workspaceId: string): WorkspaceRuntimeMetadata | undefined
   dispose?(): Promise<void>
@@ -238,7 +273,9 @@ export interface RuntimeSession {
   /** Provider-local checkout path; never pass this to host Git. */
   readonly remoteWorktreePath?: string
   readonly recoveryMetadata?: Record<string, unknown>
-  inspect?(): Promise<ProviderResourceObservation>
+  inspect?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  diagnose?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  processObservation?(): ProcessOwnershipObservation
   /** Drop only local control assets created for this session; never stop the provider resource. */
   abort?(): Promise<RuntimeCloseResult>
 }
@@ -248,7 +285,7 @@ export interface RuntimeCloseResult {
 }
 
 export interface RuntimeDriver {
-  inspect(resource: RuntimeResourceReference): Promise<ProviderResourceObservation>
+  inspect(resource: RuntimeResourceReference, signal?: AbortSignal): Promise<ProviderResourceObservation>
   adopt(input: RuntimeAdoptionInput): Promise<RuntimeSession>
   sync(session: RuntimeSession): Promise<void>
   close(session: RuntimeSession): Promise<RuntimeCloseResult>
@@ -282,7 +319,7 @@ export interface WorkspaceGateway {
   remove(input: { workspaceId: string; directory: string }): Promise<void>
   waitForSync?(input: { workspaceId: string; directory: string; timeoutMs: number }): Promise<void>
   syncOut?(input: WorkspaceSyncOutInput): Promise<WorkspaceSyncResult>
-  inspect?(input: { workspaceId: string; directory: string }): Promise<WorkspaceInfo | undefined>
+  inspect?(input: { workspaceId: string; directory: string; signal?: AbortSignal }): Promise<WorkspaceInfo | undefined>
 }
 
 export interface WorkingTreeFile {
@@ -385,6 +422,7 @@ export interface SandboxResponse extends Partial<SandboxResultV2> {
 export interface ControlRequest {
   operation: SandboxOperation
   force: boolean
+  requestId?: string
 }
 
 export type CapabilityRole = "host" | "remote"
@@ -442,6 +480,7 @@ export interface ProcessRunner {
 
 export interface ProcessHandle {
   readonly pid: number
+  readonly alive?: boolean
   readonly result: Promise<ProcessResult>
   terminate(): void
 }
@@ -464,6 +503,10 @@ export class SandboxError extends Error {
 
 export function isSandboxOperation(value: unknown): value is SandboxOperation {
   return typeof value === "string" && (SANDBOX_OPERATIONS as readonly string[]).includes(value)
+}
+
+export function isRequestId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)
 }
 
 export function isSandboxState(value: unknown): value is SandboxState {

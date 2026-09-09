@@ -10,9 +10,10 @@ import type { ExeControl } from "./exe-control"
 import { buildRemoteCommandArgv, buildSupervisorArgv, DEFAULT_SSH_BIN, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
 import { basicAuthHeader, buildRemoteFrame, generateRemoteCredentials } from "./remote-runtime"
 import { assertPrivateFile, ensurePrivateDirectory } from "./secure-fs"
-import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment } from "./process"
+import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment, trackedProcessObservation, unknownProcessObservation } from "./process"
 import { assertRelativePath, assertSafeBranch, assertSafeComment, assertSafeSshDestination, assertSafeTag, assertSafeVmName, assertSha, identityMatches, makeVmPlan, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { redactError, redactText } from "./redaction"
+import { readLimitedBody } from "./workspace-http"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
   copyVmIdentity,
@@ -21,6 +22,7 @@ import {
   SandboxError,
   type SandboxConfig,
   type ProcessHandle,
+  type ProcessOwnershipObservation,
   type ProcessResult,
   type ProcessRunner,
   type ProcessSupervisor,
@@ -44,7 +46,6 @@ const EXEDEV_HOST_FINGERPRINT = "SHA256:JJOP/lwiBGOMilfONPWZCXUrfK154cnJFXcqlsi6
 const BUN_VERSION = "1.3.14"
 const MAX_REMOTE_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
-const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
 const MAX_SYNC_PATCH_BYTES = 8 * 1024 * 1024
 const INSPECTION_TIMEOUT_MS = 5_000
 const INVENTORY_TIMEOUT_MS = 10_000
@@ -492,7 +493,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }
   }
 
-  async inspect(info: WorkspaceInfo): Promise<ProviderResourceObservation> {
+  async inspect(info: WorkspaceInfo, _signal?: AbortSignal): Promise<ProviderResourceObservation> {
     const metadata = readWorkspaceMetadata(info)
     const expected = metadata.vmIdentity
     const resourceId = expected?.id ?? expected?.name ?? info.name
@@ -518,13 +519,33 @@ export class ExedevProvider implements WorkspaceProviderBase {
     if (matches.length !== 1 || sameName.length !== 1 || !match || !hasOwnerTag(info, metadata, match.identity)) {
       return { resourceId, resource: "present", ownership: "conflict", health: "unknown", evidence: [`exe.dev inventory:${resourceId}`] }
     }
-    return {
+    const observation: ProviderResourceObservation = {
       resourceId,
       resource: "present",
       ownership: "verified",
       health: classifyVmHealth(match.status),
       evidence: [`exe.dev inventory:${resourceId}`],
     }
+    return observation
+  }
+
+  async diagnose(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation> {
+    const observation = await this.inspect(info)
+    const health = await this.activeHealth(info.id, signal)
+    if (!health) return observation
+    return {
+      ...observation,
+      ...(health.healthy === true ? { health: "healthy" as const } : {}),
+      ...(health.healthy === false ? { health: "degraded" as const } : {}),
+      ...(health.version ? { remoteVersion: health.version } : {}),
+    }
+  }
+
+  processObservation(workspaceId: string): ProcessOwnershipObservation {
+    const activation = this.active.get(workspaceId)
+    return activation
+      ? trackedProcessObservation(activation.process, "exe.dev SSH supervisor")
+      : unknownProcessObservation("exe.dev activation is not tracked by this process")
   }
 
   async inventory(): Promise<ProviderResourceObservation[]> {
@@ -1211,7 +1232,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await readHealthResponse(response).catch(() => undefined)
+          const value = await readHealthResponse(response, controller.signal).catch(() => undefined)
           if (isRecord(value) && value.healthy === true && value.version === this.config.openCodeVersion) return
         }
       } catch {
@@ -1234,6 +1255,34 @@ export class ExedevProvider implements WorkspaceProviderBase {
       .catch((error) => {
         activation.failure = redactError(error)
       })
+  }
+
+  private async activeHealth(workspaceId: string, signal?: AbortSignal): Promise<{ healthy?: boolean; version?: string } | undefined> {
+    const activation = this.active.get(workspaceId)
+    if (!activation?.process || activation.process.alive === false) return undefined
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 2_000)
+    const abort = () => controller.abort(signal?.reason)
+    signal?.addEventListener("abort", abort, { once: true })
+    try {
+      if (signal?.aborted) return undefined
+      const response = await this.fetcher(`http://127.0.0.1:${activation.localPort}/global/health`, {
+        headers: { Authorization: basicAuthHeader(activation.password) },
+        signal: controller.signal,
+      })
+      if (!response.ok) return undefined
+      const value = await readHealthResponse(response, controller.signal)
+      if (!isRecord(value)) return undefined
+      return {
+        ...(typeof value.healthy === "boolean" ? { healthy: value.healthy } : {}),
+        ...(typeof value.version === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.version) ? { version: value.version } : {}),
+      }
+    } catch {
+      return undefined
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener("abort", abort)
+    }
   }
 
   private assertActive(activation: Activation): void {
@@ -1326,27 +1375,9 @@ export class ExedevProvider implements WorkspaceProviderBase {
   }
 }
 
-async function readHealthResponse(response: Response): Promise<unknown> {
-  if (!response.body) return undefined
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
-  let size = 0
+async function readHealthResponse(response: Response, signal: AbortSignal): Promise<unknown> {
   try {
-    while (true) {
-      const next = await reader.read()
-      if (next.done) break
-      size += next.value.byteLength
-      if (size > MAX_HEALTH_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined)
-        return undefined
-      }
-      chunks.push(next.value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  try {
-    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+    return JSON.parse(await readLimitedBody(response, signal, "diagnose"))
   } catch {
     return undefined
   }
@@ -1395,7 +1426,9 @@ export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOp
         ...(metadata?.vmIdentity ? { vmIdentity: metadata.vmIdentity } : {}),
       }
     },
-    inspect: () => provider.inspect(info),
+    processObservation: () => provider.processObservation(input.workspaceId),
+    inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
+    diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
   }
 }
 

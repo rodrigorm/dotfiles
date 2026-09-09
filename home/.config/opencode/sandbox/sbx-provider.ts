@@ -10,8 +10,9 @@ import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-h
 
 import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { assertAbsolutePath, basicAuthHeader, buildRemoteFrame, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
-import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment } from "./process"
+import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment, trackedProcessObservation, unknownProcessObservation } from "./process"
 import { redactError, redactText } from "./redaction"
+import { readLimitedBody } from "./workspace-http"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
   isRecord,
@@ -19,6 +20,7 @@ import {
   SandboxError,
   type SandboxStage,
   type ProcessHandle,
+  type ProcessOwnershipObservation,
   type ProcessResult,
   type ProcessRunner,
   type ProcessSupervisor,
@@ -45,7 +47,6 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
-const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
 const OWNERSHIP_FILE = "/tmp/opencode-sandbox-owner"
 const INSPECTION_TIMEOUT_MS = 5_000
 const START_SERVER = String.raw`import json, os, shutil, signal, subprocess, sys, time
@@ -466,11 +467,30 @@ export class SbxProvider implements WorkspaceProviderBase {
     return activation ? { providerState: metadataFor(activation) } : undefined
   }
 
-  async inspect(info: WorkspaceInfo): Promise<ProviderResourceObservation> {
+  async inspect(info: WorkspaceInfo, _signal?: AbortSignal): Promise<ProviderResourceObservation> {
     const metadata = readMetadata(info)
     const sandbox = metadata.sandbox
     if (!sandbox) throw new SandboxError("inspect", "sandbox identity is unavailable", "SBX_IDENTITY_UNAVAILABLE")
     return this.inspectResource(sandbox, ownerFromMetadata(metadata))
+  }
+
+  async diagnose(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation> {
+    const observation = await this.inspect(info)
+    const health = await this.activeHealth(info.id, signal)
+    if (!health) return observation
+    return {
+      ...observation,
+      ...(health.healthy === true ? { health: "healthy" as const } : {}),
+      ...(health.healthy === false ? { health: "degraded" as const } : {}),
+      ...(health.version ? { remoteVersion: health.version } : {}),
+    }
+  }
+
+  processObservation(workspaceId: string): ProcessOwnershipObservation {
+    const activation = this.active.get(workspaceId)
+    return activation
+      ? trackedProcessObservation(activation.process, "SBX SSH supervisor")
+      : unknownProcessObservation("SBX activation is not tracked by this process")
   }
 
   runtimeDriver(): RuntimeDriver {
@@ -1200,6 +1220,34 @@ export class SbxProvider implements WorkspaceProviderBase {
       })
   }
 
+  private async activeHealth(workspaceId: string, signal?: AbortSignal): Promise<{ healthy?: boolean; version?: string } | undefined> {
+    const activation = this.active.get(workspaceId)
+    if (!activation?.process || activation.process.alive === false) return undefined
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 2_000)
+    const abort = () => controller.abort(signal?.reason)
+    signal?.addEventListener("abort", abort, { once: true })
+    try {
+      if (signal?.aborted) return undefined
+      const response = await this.fetcher(`http://127.0.0.1:${activation.hostPort}/global/health`, {
+        headers: { Authorization: basicAuthHeader(activation.password) },
+        signal: controller.signal,
+      })
+      if (!response.ok) return undefined
+      const value = await readHealthResponse(response, controller.signal)
+      if (!isRecord(value)) return undefined
+      return {
+        ...(typeof value.healthy === "boolean" ? { healthy: value.healthy } : {}),
+        ...(typeof value.version === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.version) ? { version: value.version } : {}),
+      }
+    } catch {
+      return undefined
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener("abort", abort)
+    }
+  }
+
   private assertActive(activation: Activation): void {
     if (activation.failure) throw new SandboxError("tunnel", activation.failure, "SUPERVISOR_EXITED")
   }
@@ -1216,7 +1264,7 @@ export class SbxProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await readHealthResponse(response).catch(() => undefined)
+          const value = await readHealthResponse(response, controller.signal).catch(() => undefined)
           if (isRecord(value) && value.healthy === true) return
         }
       } catch {
@@ -1270,27 +1318,9 @@ export class SbxProvider implements WorkspaceProviderBase {
   }
 }
 
-async function readHealthResponse(response: Response): Promise<unknown> {
-  if (!response.body) return undefined
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
-  let size = 0
+async function readHealthResponse(response: Response, signal: AbortSignal): Promise<unknown> {
   try {
-    while (true) {
-      const next = await reader.read()
-      if (next.done) break
-      size += next.value.byteLength
-      if (size > MAX_HEALTH_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined)
-        return undefined
-      }
-      chunks.push(next.value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  try {
-    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+    return JSON.parse(await readLimitedBody(response, signal, "diagnose"))
   } catch {
     return undefined
   }
@@ -1336,7 +1366,9 @@ export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions)
       await provider.activate(input.workspaceId)
     },
     target: () => provider.target(info),
-    inspect: () => provider.inspect(info),
+    inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
+    diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
+    processObservation: () => provider.processObservation(input.workspaceId),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
     close: () => provider.close(info),
   }

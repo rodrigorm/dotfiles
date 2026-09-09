@@ -198,7 +198,9 @@ describe("Sandcastle lifecycle", () => {
       })
 
       expect(result).toMatchObject({ ok: false, operation: "start", stage: "transition", error: { code: "SESSION_ERROR" } })
-      expect(await setup.store.get(record.sessionId)).toEqual(before)
+      const after = await setup.store.get(record.sessionId)
+      expect(after?.journal).toHaveLength(1)
+      expect(JSON.stringify({ ...after, journal: undefined })).toBe(JSON.stringify({ ...before, journal: undefined }))
       expect(setup.calls).toEqual([])
       expect(captureCalls).toEqual([])
     }

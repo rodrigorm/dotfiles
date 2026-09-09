@@ -1043,7 +1043,8 @@ describe("lifecycle controller", () => {
       expect(result.ok).toBe(false)
       expect(result.error?.code).toMatch(/^REPAIR_(?:EVIDENCE|CONFLICT)$/)
       expect(removed).toBe(0)
-      expect(JSON.stringify(await store.get(record.sessionId))).toBe(before)
+      const after = await store.get(record.sessionId)
+      expect(JSON.stringify(after && { ...after, journal: undefined })).toBe(before)
     }
   })
 
@@ -2507,7 +2508,9 @@ describe("lifecycle controller", () => {
       })
 
       expect(result).toMatchObject({ ok: false, operation: "start", stage: "transition", error: { code: "SESSION_ERROR" } })
-      expect(await store.get(record.sessionId)).toEqual(before)
+      const after = await store.get(record.sessionId)
+      expect(after?.journal).toHaveLength(1)
+      expect(JSON.stringify({ ...after, journal: undefined })).toBe(JSON.stringify({ ...before, journal: undefined }))
       expect(effects).toEqual([])
     }
   })
@@ -4935,6 +4938,109 @@ describe("Cloudflare Sandbox bridge", () => {
 
     await expect(client.exec("sandboxa2", { argv: ["cat"] })).rejects.toMatchObject({ code: "CLOUDFLARE_RESPONSE_LIMIT" })
   })
+
+  it("cancels a diagnostic response body after headers arrive", async () => {
+    const diagnostic = new AbortController()
+    let signal: AbortSignal | undefined
+    let cancel: (() => void) | undefined
+    let cancelled = false
+    const bodyRead = new Promise<void>((resolve) => { cancel = resolve })
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 600_000,
+      fetcher: (async (_input, init) => {
+        signal = init?.signal ?? undefined
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"running":'))
+          },
+          pull() {
+            cancel?.()
+          },
+          cancel() {
+            cancelled = true
+          },
+        }), { status: 200, headers: { "Content-Type": "application/json" } })
+      }) as typeof fetch,
+    })
+
+    const request = client.running("sandboxa2", diagnostic.signal)
+    await bodyRead
+    diagnostic.abort()
+
+    await expect(request).rejects.toBeDefined()
+    expect(signal?.aborted).toBe(true)
+    expect(cancelled).toBe(true)
+  })
+
+  it("settles a diagnostic fetch when the injected fetcher ignores abort", async () => {
+    const diagnostic = new AbortController()
+    let signal: AbortSignal | undefined
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 600_000,
+      fetcher: (async (_input, init) => {
+        signal = init?.signal ?? undefined
+        markStarted()
+        return new Promise<Response>(() => {})
+      }) as typeof fetch,
+    })
+
+    const request = client.running("sandboxa2", diagnostic.signal)
+    await started
+    diagnostic.abort()
+
+    await expect(request).rejects.toMatchObject({ code: "CLOUDFLARE_REQUEST" })
+    expect(signal?.aborted).toBe(true)
+  })
+
+  it("cancels a late diagnostic response body after fetch aborts", async () => {
+    const diagnostic = new AbortController()
+    let signal: AbortSignal | undefined
+    let markStarted!: () => void
+    let releaseResponse!: () => void
+    let resolveCancelled!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const cancelled = new Promise<void>((resolve) => { resolveCancelled = resolve })
+    const response = new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        resolveCancelled()
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 600_000,
+      fetcher: (async (_input, init) => {
+        signal = init?.signal ?? undefined
+        markStarted()
+        return new Promise<Response>((resolve) => { releaseResponse = () => resolve(response) })
+      }) as typeof fetch,
+    })
+
+    const request = client.running("sandboxa2", diagnostic.signal)
+    await started
+    diagnostic.abort()
+    await expect(request).rejects.toMatchObject({ code: "CLOUDFLARE_REQUEST" })
+    releaseResponse()
+
+    let failureTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        cancelled,
+        new Promise<never>((_, reject) => {
+          failureTimer = setTimeout(() => reject(new Error("late response body was not canceled")), 100)
+        }),
+      ])
+    } finally {
+      if (failureTimer) clearTimeout(failureTimer)
+    }
+    expect(signal?.aborted).toBe(true)
+  })
 })
 
 describe("provider health responses", () => {
@@ -4983,6 +5089,52 @@ describe("provider health responses", () => {
       expect(String((error as Error).message)).not.toContain("private")
       expect(testCase.health.cancelled()).toBe(true)
     }
+  })
+
+  it("settles Cloudflare diagnostic health when the injected fetcher ignores abort", async () => {
+    const diagnostic = new AbortController()
+    let signal: AbortSignal | undefined
+    let markStarted!: () => void
+    let releaseResponse!: () => void
+    let resolveCancelled!: () => void
+    const started = new Promise<void>((resolve) => { markStarted = resolve })
+    const cancelled = new Promise<void>((resolve) => { resolveCancelled = resolve })
+    const response = new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        resolveCancelled()
+      },
+    }), { status: 200, headers: { "Content-Type": "application/json" } })
+    const provider = new CloudflareProvider({
+      worktree: await temporaryDirectory(),
+      client: {} as CloudflareSandboxClient,
+      fetcher: (async (_input, init) => {
+        signal = init?.signal ?? undefined
+        markStarted()
+        return new Promise<Response>((resolve) => { releaseResponse = () => resolve(response) })
+      }) as typeof fetch,
+    })
+    const activeHealth = (provider as unknown as {
+      activeHealth(activation: { tunnel: { url: string }; password: string }, signal?: AbortSignal): Promise<unknown>
+    }).activeHealth.bind(provider)
+
+    const health = activeHealth({ tunnel: { url: "https://sandbox.example.test" }, password: "private" }, diagnostic.signal)
+    await started
+    diagnostic.abort()
+    await expect(health).resolves.toBeUndefined()
+    releaseResponse()
+
+    let failureTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        cancelled,
+        new Promise<never>((_, reject) => {
+          failureTimer = setTimeout(() => reject(new Error("late health response body was not canceled")), 100)
+        }),
+      ])
+    } finally {
+      if (failureTimer) clearTimeout(failureTimer)
+    }
+    expect(signal?.aborted).toBe(true)
   })
 })
 

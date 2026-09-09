@@ -1,6 +1,6 @@
 # Plan: make the OpenCode sandbox agent-native
 
-Status: Phases 0-2 and the Phase 3 persisted-state/decision-contract criteria are complete for the default Sandcastle path; Cloudflare recovery and provider-seam unification remain deferred. This file lives in `history/` for the remaining work and concise completion record. Current behavior is documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
+Status: Phases 0-4 evidence criteria are complete for the default Sandcastle path; Cloudflare recovery and provider-seam unification remain deferred. This file lives in `history/` for the remaining work and concise completion record. Current behavior is documented in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md).
 
 ## Outcome
 
@@ -103,8 +103,9 @@ The capability gains `scope: "session" | "project"`. Normal commands use session
 |---|---|---|
 | 0: safety holes | Complete, 2026-09-02 | Control-proxy lifetime, host-only mutation, ownership checks, cleanup, and bounded diagnostics were closed. |
 | 1: decision-ready inspection | Complete, 2026-09-02 | `SandboxResultV2`, bounded five-source inspection, project inventory, capabilities, redaction, and response bounds were delivered. |
-| 2: recovery loop | Complete for SBX and exe.dev, 2026-09-06 | Host-only repair/recover, durable ownership adoption, preservation-before-destruction, stale-plan rejection, and retry-safe orphan deletion were delivered. Cloudflare remains unsupported. |
+| 2: recovery loop | Complete for SBX and exe.dev, 2026-09-06 | Host-only repair/recover, durable ownership adoption, preservation-before-destruction, stale-plan rejection, and retry-safe orphan deletion were delivered. Cloudflare recovery remains unsupported. |
 | 3: persisted state dimensions | Complete for the state-model criteria | Schema-1 disk migration, canonical intent/phase, legal observation matrix, deterministic compatibility projection, and typed action/error coverage are tested. Provider-seam cleanup remains deferred. |
+| 4: make learning accretive | Evidence criteria complete, 2026-09-08 | State records carry a bounded request journal; `diagnose` returns a fixed, redacted bundle with version provenance, identities, state, workspace/provider/process observations, and explicit limits; one focused scenario fixture covers the documented incident mappings. |
 
 The current contract and operating limits live in [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md) and [`docs/opencode-sandbox-operations.md`](../docs/opencode-sandbox-operations.md). `recover` and `repair` are exposed by `sandboxctl`; recovery and verified-orphan deletion are actionable only when a configured runtime driver and fresh evidence prove their preconditions.
 
@@ -137,15 +138,17 @@ Legal phase pairs and situation classifications are executable contracts in `sta
 
 - The compatibility labels `recovery_pending` and `orphaned` remain response projections until every provider recovery path is supported. They are not durable facts.
 - `LifecycleController` still accepts legacy provider release/destroy and infrastructure operations for injected compatibility paths. One runtime-driver seam is not yet the removal gate; do not claim this migration complete.
-- Cloudflare remains unsupported for post-restart inspection, recovery, adoption, and destructive control. Add a bridge lookup with durable owner metadata and a runtime driver before changing that status.
+- Cloudflare can inspect a known sandbox after restart, but ownership remains unknown without durable owner metadata; recovery, adoption, and destructive control remain unsupported. Add a bridge lookup with durable owner metadata and a runtime driver before changing that status.
 
 ### Phase 4: make learning accretive
+
+Status: Evidence criteria complete, 2026-09-08. The journal, diagnostic bundle, and shared incident scenario fixture are covered by focused regression tests; provider-seam cleanup and Cloudflare recovery remain deferred.
 
 Changes:
 
 - Record a bounded operation journal in each state record: request ID, operation, start/end time, result code, and evidence references. Keep only the latest entries.
 - Add a redacted diagnostic bundle command that captures versions, identities, state, workspace association, provider observation, and process ownership.
-- Add scenario fixtures for every incident class. Prefer one end-to-end fixture over provider-specific copies when the lifecycle behavior is shared.
+- Add one lifecycle-interface scenario fixture for every incident class and documented failure mapping. Prefer one end-to-end fixture over provider-specific copies when the lifecycle behavior is shared.
 - Generate command reference tables from the operation and state constants if documentation drift recurs. Do not add generation preemptively.
 
 Completion criteria:
@@ -153,6 +156,8 @@ Completion criteria:
 - A failed operation can be reconstructed without scanning global logs.
 - Diagnostic output is bounded, redacted, and deterministic enough for a regression fixture.
 - Every production incident maps to an existing scenario class or adds exactly one new class.
+
+The focused `phase4.test.ts` fixture is the executable record for these criteria. It covers all nine classes, checks typed action preconditions, reconstructs retained journal entries through `diagnose`, and maps each documented condition without adding a tenth class.
 
 ## Command vocabulary decision
 

@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join } from "node:path"
 
 import { redactText } from "./redaction"
 import {
+  isRequestId,
   isNodeError,
   isSandboxDesiredLocation,
   isSandboxIntentPhase,
@@ -12,7 +13,13 @@ import {
   isSandboxOperation,
   isSandboxState,
   PERSISTED_SANDBOX_SCHEMA_VERSION,
+  MAX_OPERATION_JOURNAL_BYTES,
+  MAX_OPERATION_JOURNAL_EVIDENCE_BYTES,
+  MAX_OPERATION_JOURNAL_EVIDENCE_REFS,
+  MAX_OPERATION_JOURNAL_ENTRIES,
+  MAX_OPERATION_JOURNAL_STRING_BYTES,
   SandboxError,
+  type SandboxJournalEntry,
   type PersistedSandboxRecord,
   type SandboxRecord,
   type SandboxState,
@@ -49,6 +56,7 @@ interface ValidatedCommon {
   createdAt: string
   updatedAt: string
   operation?: PersistedSandboxRecord["operation"]
+  journal?: PersistedSandboxRecord["journal"]
   lastError?: PersistedSandboxRecord["lastError"]
 }
 
@@ -238,6 +246,7 @@ const CANONICAL_FIELDS = new Set([
   "desiredLocation",
   "phase",
   "operation",
+  "journal",
   "createdAt",
   "updatedAt",
   "lastError",
@@ -369,6 +378,7 @@ function buildPersistedRecord(common: ValidatedCommon, intent: CanonicalIntent):
     desiredLocation: intent.desiredLocation,
     phase: intent.phase,
     ...(intent.operation ? { operation: intent.operation } : {}),
+    ...(common.journal && common.journal.length > 0 ? { journal: common.journal } : {}),
     createdAt: common.createdAt,
     updatedAt: common.updatedAt,
     ...(intent.lastError ? { lastError: intent.lastError } : {}),
@@ -384,6 +394,7 @@ function needsCanonicalWrite(value: Record<string, unknown>, persisted: Persiste
     differs(value.providerState, persisted.providerState) ||
     differs(value.vmIdentity, persisted.vmIdentity) ||
     differs(value.operation, persisted.operation) ||
+    differs(value.journal, persisted.journal) ||
     differs(value.lastError, persisted.lastError)
 }
 
@@ -451,6 +462,7 @@ function validateCommon(value: Record<string, unknown>, expectedSessionId?: stri
   }
   const vmIdentity = value.vmIdentity === undefined ? undefined : validateVmIdentity(value.vmIdentity)
   const operation = validateOperation(value.operation)
+  const journal = validateJournal(value.journal)
   const lastError = validateLastError(value.lastError)
   return {
     sessionId: value.sessionId as string,
@@ -468,6 +480,7 @@ function validateCommon(value: Record<string, unknown>, expectedSessionId?: stri
     createdAt: value.createdAt as string,
     updatedAt: value.updatedAt as string,
     ...(operation ? { operation } : {}),
+    ...(journal && journal.length > 0 ? { journal } : {}),
     ...(lastError ? { lastError } : {}),
   }
 }
@@ -498,12 +511,99 @@ function validateOperation(value: unknown): SandboxRecord["operation"] | undefin
   if (value.providerDestroyed !== undefined && typeof value.providerDestroyed !== "boolean") {
     throw new SandboxError("validate", "state operation providerDestroyed is invalid", "STATE_SCHEMA")
   }
+  if (value.requestId !== undefined && !isRequestId(value.requestId)) {
+    throw new SandboxError("validate", "state operation request ID is invalid", "STATE_SCHEMA")
+  }
   return {
     kind: value.kind,
     phase: value.phase,
+    ...(value.requestId !== undefined ? { requestId: value.requestId } : {}),
     ...(value.force !== undefined ? { force: value.force } : {}),
     ...(value.providerDestroyed !== undefined ? { providerDestroyed: value.providerDestroyed } : {}),
   }
+}
+
+export function boundOperationJournal(entries: readonly SandboxJournalEntry[]): SandboxJournalEntry[] {
+  const bounded = entries.slice(-MAX_OPERATION_JOURNAL_ENTRIES).map((entry) => ({
+    requestId: entry.requestId,
+    operation: entry.operation,
+    startedAt: boundedJournalText(entry.startedAt),
+    ...(entry.endedAt !== undefined ? { endedAt: boundedJournalText(entry.endedAt) } : {}),
+    resultCode: boundedJournalText(entry.resultCode),
+    evidence: boundedJournalEvidence(entry.evidence),
+  }))
+  const latest: SandboxJournalEntry[] = []
+  for (let index = bounded.length - 1; index >= 0; index--) {
+    const candidate = [bounded[index]!, ...latest]
+    if (Buffer.byteLength(JSON.stringify(candidate)) > MAX_OPERATION_JOURNAL_BYTES) break
+    latest.unshift(bounded[index]!)
+  }
+  return latest
+}
+
+function validateJournal(value: unknown): SandboxJournalEntry[] | undefined {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new SandboxError("validate", "state journal is invalid", "STATE_SCHEMA")
+
+  const requestIds = new Set<string>()
+  const entries = value.map((entry) => {
+    if (!isRecord(entry) || !isRequestId(entry.requestId) || !isSandboxOperation(entry.operation)) {
+      throw new SandboxError("validate", "state journal entry is invalid", "STATE_SCHEMA")
+    }
+    if (requestIds.has(entry.requestId)) {
+      throw new SandboxError("validate", "state journal contains a duplicate request ID", "STATE_JOURNAL_DUPLICATE")
+    }
+    requestIds.add(entry.requestId)
+    if (typeof entry.startedAt !== "string" || entry.startedAt.length === 0) {
+      throw new SandboxError("validate", "state journal start time is invalid", "STATE_SCHEMA")
+    }
+    if (entry.endedAt !== undefined && (typeof entry.endedAt !== "string" || entry.endedAt.length === 0)) {
+      throw new SandboxError("validate", "state journal end time is invalid", "STATE_SCHEMA")
+    }
+    if (typeof entry.resultCode !== "string" || entry.resultCode.length === 0) {
+      throw new SandboxError("validate", "state journal result code is invalid", "STATE_SCHEMA")
+    }
+    if (!Array.isArray(entry.evidence) || entry.evidence.some((item) => typeof item !== "string")) {
+      throw new SandboxError("validate", "state journal evidence is invalid", "STATE_SCHEMA")
+    }
+    return {
+      requestId: entry.requestId,
+      operation: entry.operation,
+      startedAt: boundedJournalText(entry.startedAt),
+      ...(entry.endedAt !== undefined ? { endedAt: boundedJournalText(entry.endedAt) } : {}),
+      resultCode: boundedJournalText(entry.resultCode),
+      evidence: boundedJournalEvidence(entry.evidence),
+    }
+  })
+
+  return boundOperationJournal(entries)
+}
+
+function boundedJournalText(value: string): string {
+  const redacted = redactText(value)
+  return truncateUtf8(redacted, MAX_OPERATION_JOURNAL_STRING_BYTES)
+}
+
+function boundedJournalEvidence(values: readonly string[]): string[] {
+  const output: string[] = []
+  for (const value of values.slice(0, MAX_OPERATION_JOURNAL_EVIDENCE_REFS)) {
+    const text = boundedJournalText(value)
+    if (Buffer.byteLength(JSON.stringify([...output, text])) > MAX_OPERATION_JOURNAL_EVIDENCE_BYTES) break
+    output.push(text)
+  }
+  return output
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let bytes = 0
+  let length = 0
+  for (const character of value) {
+    const size = Buffer.byteLength(character)
+    if (bytes + size > maxBytes) break
+    bytes += size
+    length += character.length
+  }
+  return value.slice(0, length)
 }
 
 function validateLastError(value: unknown): SandboxRecord["lastError"] | undefined {
@@ -586,7 +686,7 @@ function containsCredentialKey(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsCredentialKey)
   if (!isRecord(value)) return false
   for (const [key, item] of Object.entries(value)) {
-    if (/(?:password|token|secret|credential|auth(?:orization|_content)?|api[_-]?key|private[_-]?key)/i.test(key)) return true
+    if (/(?:password|token|secret|credential|auth(?:orization|_content)?|api[_-]?key|private[_-]?key|cookie|set-cookie|ssh[_-]?key)/i.test(key)) return true
     if (isRecord(item) && containsCredentialKey(item)) return true
     if (Array.isArray(item) && containsCredentialKey(item)) return true
   }

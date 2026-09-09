@@ -1,6 +1,7 @@
-import { isAbsolute, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 import { open, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
+import { fileURLToPath } from "node:url"
 import { Database } from "bun:sqlite"
 
 import { assertExperimentalWorkspacesEnabled, parseConfig } from "./config"
@@ -359,13 +360,27 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
       providerType: sandcastle?.type ?? provider?.type,
       branchForWorkspace: provider?.branch?.bind(provider),
       providerInspect: inspectionProvider?.inspect
-        ? (record) => inspectionProvider.inspect!(workspaceInfoForRecord(record))
+        ? (record, signal) => inspectionProvider.inspect!(workspaceInfoForRecord(record), signal)
         : undefined,
+      providerDiagnose: inspectionProvider?.diagnose
+        ? (record, signal) => inspectionProvider.diagnose!(workspaceInfoForRecord(record), signal)
+        : undefined,
+      processInspect: inspectionProvider?.processObservation
+        ? (record) => inspectionProvider.processObservation!(record.workspaceId)
+        : undefined,
+      diagnosticSources: async (signal) => {
+        const dependency = await installedPluginVersion(signal)
+        return {
+          configured: config.openCodeVersion,
+          ...(env.OPENCODE_VERSION ? { local: env.OPENCODE_VERSION } : {}),
+          ...(dependency ? { dependency } : {}),
+        }
+      },
       providerTarget: provider?.target
         ? (record) => provider.target(workspaceInfoForRecord(record))
         : undefined,
       providerInventory: inspectionProvider?.inventory?.bind(inspectionProvider),
-      gitInspect: (record, worktreePath) => inspectWorkingTree(worktreePath),
+      gitInspect: (record, worktreePath, signal) => inspectWorkingTree(worktreePath, undefined, signal),
       providerRelease: provider?.release
         ? (record) => provider.release!(workspaceInfoForRecord(record))
         : undefined,
@@ -513,6 +528,18 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
     }
   } catch (error) {
     log(redactError(error))
+    return undefined
+  }
+}
+
+async function installedPluginVersion(signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const packagePath = join(dirname(fileURLToPath(import.meta.url)), "../node_modules/@opencode-ai/plugin/package.json")
+    const value = JSON.parse(await readFile(packagePath, { encoding: "utf8", signal }))
+    return isRecord(value) && typeof value.version === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.version)
+      ? value.version
+      : undefined
+  } catch {
     return undefined
   }
 }

@@ -9,13 +9,24 @@ import {
 
 import { redactError, redactText } from "./redaction"
 import { runSyncBarrier } from "./sync-barrier"
-import { SandboxError, type ProviderResourceObservation, type RuntimeDriver, type RuntimeSession, type SessionContext, type WorkspaceTarget, type WorkingTreeCapture } from "./types"
+import {
+  SandboxError,
+  type ProcessOwnershipObservation,
+  type ProviderResourceObservation,
+  type RuntimeDriver,
+  type RuntimeSession,
+  type SessionContext,
+  type WorkspaceTarget,
+  type WorkingTreeCapture,
+} from "./types"
 
 export interface OpenCodeSandboxAdapter {
   readonly provider: SandboxProvider
   applyCapture(input: { sandbox: Sandbox; capture: WorkingTreeCapture }): Promise<void>
   target(): WorkspaceTarget | Promise<WorkspaceTarget>
-  inspect?(): Promise<ProviderResourceObservation>
+  inspect?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  diagnose?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  processObservation?(): ProcessOwnershipObservation
   recoveryMetadata?(): Record<string, unknown>
   close?(): Promise<void>
 }
@@ -53,7 +64,9 @@ export interface SandcastleSession extends RuntimeSession {
   readonly sandbox: Sandbox
   readonly target: Extract<WorkspaceTarget, { type: "remote" }>
   readonly recoveryMetadata: Record<string, unknown>
-  inspect?(): Promise<ProviderResourceObservation>
+  inspect?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  diagnose?(signal?: AbortSignal): Promise<ProviderResourceObservation>
+  processObservation?(): ProcessOwnershipObservation
   applyCapture(capture: WorkingTreeCapture): Promise<void>
   sync(): Promise<SandboxRunResult>
   close(): Promise<CloseResult>
@@ -108,7 +121,9 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
       get recoveryMetadata() {
         return { ...(adapter.recoveryMetadata?.() ?? {}) }
       },
-      ...(adapter.inspect ? { inspect: () => adapter.inspect!() } : {}),
+      ...(adapter.inspect ? { inspect: (signal?: AbortSignal) => adapter.inspect!(signal) } : {}),
+      ...(adapter.diagnose ? { diagnose: (signal?: AbortSignal) => adapter.diagnose!(signal) } : {}),
+      ...(adapter.processObservation ? { processObservation: () => adapter.processObservation!() } : {}),
       async applyCapture(capture) {
         if (capture.baseSha !== input.baseSha) {
           throw new SandboxError("sync", "working tree capture does not match the Sandcastle worktree", "CAPTURE_SHA_MISMATCH")

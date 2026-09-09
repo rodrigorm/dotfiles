@@ -2,15 +2,22 @@ import { createCapability } from "./control-channel"
 import { shortHash } from "./naming"
 import { redactError, redactText } from "./redaction"
 import { compatibilityStateForIntent } from "./state"
-import { FileStateStore } from "./state-store"
+import { boundOperationJournal, FileStateStore } from "./state-store"
+import { unknownProcessObservation } from "./process"
 import {
   isRecord,
+  isRequestId,
+  MAX_OPERATION_JOURNAL_EVIDENCE_BYTES,
+  MAX_OPERATION_JOURNAL_EVIDENCE_REFS,
+  MAX_OPERATION_JOURNAL_STRING_BYTES,
   SandboxError,
   type AuthorizedControlRequest,
   type CapabilityRole,
   type ControlCapability,
+  type DiagnosticVersionSources,
   type GitWorkingTreeObservation,
   type ProviderResourceObservation,
+  type ProcessOwnershipObservation,
   type PublicOperation,
   type PersistedSandboxRecord,
   type RuntimeDriver,
@@ -21,6 +28,7 @@ import {
   type SandboxRecord,
   type SandboxObservation,
   type SandboxAllowedAction,
+  type SandboxJournalEntry,
   type SandboxResultV2,
   type SandboxResponse,
   type SessionContext,
@@ -37,12 +45,29 @@ import {
 } from "./sandcastle-session"
 
 const MAX_DIAGNOSTIC_BYTES = 48 * 1024
+const MAX_DIAGNOSTIC_HOOK_ENTRIES = 64
+const MAX_DIAGNOSTIC_HOOK_STRING_BYTES = MAX_OPERATION_JOURNAL_STRING_BYTES
+const MAX_DIAGNOSTIC_HOOK_STRING_SCAN_CHARS = 1_024
+const MAX_DIAGNOSTIC_HOOK_DEPTH = 3
+const MAX_DIAGNOSTIC_HOOK_WORK = 256
+const MAX_DIAGNOSTIC_PROBES = 5
+const DIAGNOSTIC_TIMEOUT_MS = 30_000
 const INSPECTION_TIMEOUT_MS = 5_000
 const INVENTORY_TIMEOUT_MS = 10_000
 const MAX_INVENTORY_RECORDS = 1_000
 const MAX_INVENTORY_RESOURCES = 1_000
 const MAX_INVENTORY_DETAIL_BYTES = 48 * 1024
 const MAX_RESPONSE_BYTES = 64 * 1024 - 1024
+const JOURNALED_OPERATIONS = new Set<PublicOperation>(["start", "stop", "delete", "retry", "recover", "repair"])
+
+interface JournalContext {
+  requestId: string
+  operation: PublicOperation
+  startedAt: string
+  started: boolean
+  pending?: boolean
+  completed?: boolean
+}
 
 interface ReconciliationRecordIdentity {
   sessionId: string
@@ -66,6 +91,7 @@ interface ObservationPlan {
   provider: Probe<ProviderResourceObservation>
   git: Probe<GitWorkingTreeObservation>
   handle: SandboxObservation
+  process: ProcessOwnershipObservation
   observations: SandboxObservation[]
   classification: SandboxResultV2["classification"]
   work: SandboxResultV2["work"]
@@ -75,7 +101,7 @@ interface ObservationPlan {
 
 export interface InfrastructureOperations {
   remove?(record: SandboxRecord): Promise<void>
-  diagnose?(record: SandboxRecord): Promise<Record<string, unknown>>
+  diagnose?(record: SandboxRecord, signal?: AbortSignal): Promise<Record<string, unknown>>
   logs?(record: SandboxRecord): Promise<string[]>
   preflightDelete?(record: SandboxRecord): Promise<Record<string, unknown>>
 }
@@ -85,16 +111,21 @@ export interface LifecycleDependencies {
   workspace: WorkspaceGateway
   capture?: (context: SessionContext) => Promise<WorkingTreeCapture>
   infrastructure?: InfrastructureOperations
-  providerInspect?: (record: SandboxRecord) => Promise<ProviderResourceObservation>
+  providerInspect?: (record: SandboxRecord, signal?: AbortSignal) => Promise<ProviderResourceObservation>
+  providerDiagnose?: (record: SandboxRecord, signal?: AbortSignal) => Promise<ProviderResourceObservation>
   providerTarget?: (record: SandboxRecord) => WorkspaceTarget | undefined | Promise<WorkspaceTarget | undefined>
   providerInventory?: () => Promise<ProviderResourceObservation[]>
-  gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
+  processInspect?: (record: SandboxRecord) => ProcessOwnershipObservation
+  diagnosticSources?: (signal?: AbortSignal) => DiagnosticVersionSources | Promise<DiagnosticVersionSources>
+  gitInspect?: (record: SandboxRecord, worktreePath: string, signal?: AbortSignal) => Promise<GitWorkingTreeObservation>
   providerType?: string
   branchForWorkspace?: (workspaceId: string) => string
   providerRelease?: (record: SandboxRecord) => Promise<void>
   providerDestroy?: (record: SandboxRecord) => Promise<void>
   sandcastle?: SandcastleSessionFactory
   runtimeDriver?: RuntimeDriver
+  /** Test seam; production diagnostics use the fixed 30-second deadline. */
+  diagnosticTimeoutMs?: number
   now?: () => Date
 }
 
@@ -103,16 +134,20 @@ export class LifecycleController {
   private readonly workspace: WorkspaceGateway
   private readonly capture?: (context: SessionContext) => Promise<WorkingTreeCapture>
   private readonly infrastructure: InfrastructureOperations
-  private readonly providerInspect?: (record: SandboxRecord) => Promise<ProviderResourceObservation>
+  private readonly providerInspect?: (record: SandboxRecord, signal?: AbortSignal) => Promise<ProviderResourceObservation>
+  private readonly providerDiagnose?: (record: SandboxRecord, signal?: AbortSignal) => Promise<ProviderResourceObservation>
   private readonly providerTarget?: (record: SandboxRecord) => WorkspaceTarget | undefined | Promise<WorkspaceTarget | undefined>
   private readonly providerInventory?: () => Promise<ProviderResourceObservation[]>
-  private readonly gitInspect?: (record: SandboxRecord, worktreePath: string) => Promise<GitWorkingTreeObservation>
+  private readonly processInspect?: (record: SandboxRecord) => ProcessOwnershipObservation
+  private readonly diagnosticSources?: (signal?: AbortSignal) => DiagnosticVersionSources | Promise<DiagnosticVersionSources>
+  private readonly gitInspect?: (record: SandboxRecord, worktreePath: string, signal?: AbortSignal) => Promise<GitWorkingTreeObservation>
   private readonly providerType: string
   private readonly branchForWorkspace?: (workspaceId: string) => string
   private readonly providerRelease?: (record: SandboxRecord) => Promise<void>
   private readonly providerDestroy?: (record: SandboxRecord) => Promise<void>
   private readonly sandcastle?: SandcastleSessionFactory
   private readonly runtimeDriver?: RuntimeDriver
+  private readonly diagnosticTimeoutMs: number
   private readonly now: () => Date
   private readonly contexts = new Map<string, SessionContext>()
   private readonly sessions = new Map<string, RuntimeSession>()
@@ -131,8 +166,11 @@ export class LifecycleController {
     this.capture = dependencies.capture
     this.infrastructure = dependencies.infrastructure ?? {}
     this.providerInspect = dependencies.providerInspect
+    this.providerDiagnose = dependencies.providerDiagnose
     this.providerTarget = dependencies.providerTarget
     this.providerInventory = dependencies.providerInventory
+    this.processInspect = dependencies.processInspect
+    this.diagnosticSources = dependencies.diagnosticSources
     this.gitInspect = dependencies.gitInspect
     this.providerType = dependencies.providerType ?? "exedev"
     this.branchForWorkspace = dependencies.branchForWorkspace
@@ -140,6 +178,7 @@ export class LifecycleController {
     this.providerDestroy = dependencies.providerDestroy
     this.sandcastle = dependencies.sandcastle
     this.runtimeDriver = dependencies.runtimeDriver ?? dependencies.sandcastle?.runtimeDriver
+    this.diagnosticTimeoutMs = dependencies.diagnosticTimeoutMs ?? DIAGNOSTIC_TIMEOUT_MS
     this.now = dependencies.now ?? (() => new Date())
   }
 
@@ -193,6 +232,8 @@ export class LifecycleController {
   }
 
   private async handleRequest(request: AuthorizedControlRequest): Promise<SandboxResponse> {
+    const requestId = isRequestId(request.requestId) ? request.requestId : cryptoRandomUuid()
+    let journal: JournalContext | undefined
     try {
       if (this.disposed) throw pluginDisposed()
       const record = request.operation === "inventory" && (request.capability.scope ?? "session") === "project"
@@ -200,12 +241,23 @@ export class LifecycleController {
         : await this.store.get(request.capability.sessionId)
       this.assertCapability(record, request.capability)
       this.assertOperationAllowed(record, request)
+      if (JOURNALED_OPERATIONS.has(request.operation)) {
+        if (record?.journal?.some((entry) => entry.requestId === requestId)) throw requestIdReused()
+        journal = {
+          requestId,
+          operation: request.operation,
+          startedAt: this.now().toISOString(),
+          started: false,
+        }
+      }
 
+      let response: SandboxResponse
       switch (request.operation) {
         case "start":
-          return await this.start(request.capability)
+          response = await this.start(request.capability, undefined, journal)
+          break
         case "stop": {
-          const response = await this.stop(request.capability)
+          response = await this.stop(request.capability, journal)
           if (
             (this.sandcastle || this.sessionDrivers.has(request.capability.sessionId)) &&
             response.intent?.desiredLocation === "local" &&
@@ -213,30 +265,47 @@ export class LifecycleController {
           ) {
             this.scheduleSessionIdle(request.capability.sessionId)
           }
-          return response
+          break
         }
         case "status":
-          return this.status(record, request.capability)
+          response = this.status(record, request.capability)
+          break
         case "inspect":
-          return await this.inspect(record, request.capability)
+          response = await this.inspect(record, request.capability)
+          break
         case "inventory":
-          return await this.inventory(request.capability)
+          response = await this.inventory(request.capability)
+          break
         case "logs":
-          return await this.logs(record, request.capability)
+          response = await this.logs(record, request.capability)
+          break
         case "diagnose":
-          return await this.diagnose(record, request.capability)
+          response = await this.diagnose(record, request.capability)
+          break
         case "delete":
-          return await this.delete(request.capability, request.force)
+          response = await this.delete(request.capability, request.force, journal)
+          break
         case "retry":
-          return await this.retry(request.capability, record)
+          response = await this.retry(request.capability, record, journal)
+          break
         case "recover":
-          return await this.recover(request.capability)
+          response = await this.recover(request.capability, journal)
+          break
         case "repair":
-          return await this.repair(request.capability)
+          response = await this.repair(request.capability, journal)
+          break
       }
+      if (journal?.started) {
+        journal.pending ??= Boolean(response.ok && response.intent?.phase !== "idle")
+        if (!journal.pending && !journal.completed) {
+          await this.completeJournalForResponse(request.capability.sessionId, journal, response).catch(() => undefined)
+        }
+      }
+      return { ...response, requestId }
     } catch (error) {
+      if (journal?.started && !journal.completed) await this.completeJournalForError(request.capability.sessionId, journal, error).catch(() => undefined)
       const record = await this.store.get(request.capability.sessionId).catch(() => undefined)
-      return failureResponse(
+      return { ...failureResponse(
         request.operation,
         error instanceof SandboxError ? error.stage : "validate",
         redactError(error),
@@ -244,7 +313,7 @@ export class LifecycleController {
         error,
         request.capability.role,
         { captureAvailable: this.capture !== undefined },
-      )
+      ), requestId }
     }
   }
 
@@ -293,17 +362,22 @@ export class LifecycleController {
         await this.adoptPendingRuntime(record)
       } catch (error) {
         const failedRecord = await this.store.get(sessionId).catch(() => undefined) ?? record
-        await write({
+        const failed = completePendingJournal({
           ...failedRecord,
           ...(preservedPathFrom(error) ? { preservedWorktreePath: preservedPathFrom(error) } : {}),
           phase: "idle",
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
-        })
+        }, errorCode(error), journalEvidence(failedRecord, undefined, error), this.now().toISOString())
+        await write(failed)
         return
       }
     }
-    if (record.lastError) return
+    if (record.lastError) {
+      const completed = completePendingJournal(record, record.lastError.code ?? "RECORDED_ERROR", journalEvidence(record), this.now().toISOString())
+      if (completed !== record) await write(completed)
+      return
+    }
     if (this.sandcastle || this.sessionDrivers.has(sessionId)) {
       try {
         await this.onSandcastleIdle(record, write)
@@ -311,13 +385,14 @@ export class LifecycleController {
         this.rejectTargetGate(record.workspaceId, error)
         const failedRecord = await this.store.get(sessionId).catch(() => undefined) ?? record
         const preservedWorktreePath = preservedPathFrom(error) ?? failedRecord.preservedWorktreePath
-        await write({
+        const failed = completePendingJournal({
           ...failedRecord,
           ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
           phase: "idle",
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
-        })
+        }, errorCode(error), journalEvidence(failedRecord, undefined, error), this.now().toISOString())
+        await write(failed)
       }
       return
     }
@@ -327,12 +402,13 @@ export class LifecycleController {
       try {
         await this.syncOut(record)
       } catch (error) {
-        await write({
+        const failed = completePendingJournal({
           ...record,
           phase: "idle",
           updatedAt: this.now().toISOString(),
           lastError: failureDetails(error),
-        })
+        }, errorCode(error), journalEvidence(record, undefined, error), this.now().toISOString())
+        await write(failed)
       }
       return
     }
@@ -342,13 +418,14 @@ export class LifecycleController {
       if (record.desiredLocation === "remote" && record.phase === "activating" && record.operation?.kind === "start") {
         await this.waitForSync(record)
         await this.workspace.warp({ sessionId, workspaceId: record.workspaceId, directory: record.directory })
-      await write({
-        ...record,
-        phase: "idle",
-        operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
-        updatedAt: this.now().toISOString(),
-        lastError: undefined,
-      })
+        const completed = completePendingJournal({
+          ...record,
+          phase: "idle",
+          operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
+          updatedAt: this.now().toISOString(),
+          lastError: undefined,
+        }, "OK", journalEvidence(record), this.now().toISOString())
+        await write(completed)
         return
       }
 
@@ -356,13 +433,14 @@ export class LifecycleController {
         if (record.operation?.kind === "stop" || record.operation?.phase === "remote") await this.syncOut(record)
         await this.workspace.warp({ sessionId, workspaceId: null, directory: record.directory })
         await this.cleanupWorkspace(record)
-        await write({
+        const completed = completePendingJournal({
           ...record,
           phase: "idle",
           operation: record.operation ? { ...record.operation, phase: "detached" } : undefined,
           updatedAt: this.now().toISOString(),
           lastError: undefined,
-        })
+        }, "OK", journalEvidence(record), this.now().toISOString())
+        await write(completed)
         return
       }
 
@@ -402,21 +480,23 @@ export class LifecycleController {
             current = await this.markProviderDestroyed(current, write)
           }
         }
-        await write({
+        const completed = completePendingJournal({
           ...current,
           phase: "idle",
           operation: current.operation ? { ...current.operation, phase: "deleted" } : undefined,
           updatedAt: this.now().toISOString(),
           lastError: undefined,
-        })
+        }, "OK", journalEvidence(current), this.now().toISOString())
+        await write(completed)
       }
     } catch (error) {
-      await write({
+      const failed = completePendingJournal({
         ...current,
         phase: "idle",
         updatedAt: this.now().toISOString(),
         lastError: failureDetails(error),
-      })
+      }, errorCode(error), journalEvidence(current, undefined, error), this.now().toISOString())
+      await write(failed)
     }
   }
 
@@ -456,13 +536,14 @@ export class LifecycleController {
   ): Promise<void> {
     if (persistedDeleteCanFinish(record, plan)) {
       if (plan.workspace.value) await this.removeWorkspace(record)
-      await write({
+      const completed = completePendingJournal({
         ...record,
         phase: "idle",
         operation: record.operation ? { ...record.operation, phase: "deleted" } : undefined,
         updatedAt: this.now().toISOString(),
         lastError: undefined,
-      })
+      }, "OK", journalEvidence(record), this.now().toISOString())
+      await write(completed)
       return
     }
     if (!reconciliationPlanIsSafe(plan)) return
@@ -492,7 +573,8 @@ export class LifecycleController {
           message: `pending ${operation.kind} requires fresh evidence before retry`,
         },
       }
-      await write(next)
+      const failed = completePendingJournal(next, next.lastError?.code ?? "RECOVERY_REQUIRED", journalEvidence(next), this.now().toISOString())
+      await write(failed)
       return
     }
     if (["conflict", "unknown", "control_lost", "stale_record"].includes(plan.classification)) return
@@ -532,7 +614,7 @@ export class LifecycleController {
     if (record.operation?.kind === "recover" && record.lastError) return
     if ((this.sandcastle || this.runtimeDriver) && record.desiredLocation === "remote" && !this.sessions.has(record.sessionId)) {
       if (plan.classification !== "orphan") return
-      await write({
+      const failed = completePendingJournal({
         ...record,
         operation: record.operation ? { ...record.operation, phase: "orphaned" } : undefined,
         phase: "idle",
@@ -542,7 +624,8 @@ export class LifecycleController {
           stage: "reconcile",
           message: "Sandcastle session handle is unavailable; provider ownership was verified",
         },
-      })
+      }, "SANDCASTLE_HANDLE", journalEvidence(record), this.now().toISOString())
+      await write(failed)
       return
     }
     if ((this.sandcastle || this.runtimeDriver) && record.desiredLocation === "remote") return
@@ -611,6 +694,104 @@ export class LifecycleController {
     this.operations.add(operation)
     void operation.finally(() => this.operations.delete(operation)).catch(() => undefined)
     return operation
+  }
+
+  private async beginJournal(
+    record: SandboxRecord,
+    write: (record: SandboxRecord) => Promise<void>,
+    context: JournalContext | undefined,
+    evidence: readonly string[] = [],
+  ): Promise<SandboxRecord> {
+    if (!context || context.started) return record
+    if (record.journal?.some((entry) => entry.requestId === context.requestId)) throw requestIdReused()
+    const next = {
+      ...record,
+      journal: boundOperationJournal([
+        ...(record.journal ?? []),
+        journalEntry(context, evidence),
+      ]),
+    }
+    await write(next)
+    context.started = true
+    return next
+  }
+
+  private async completeJournalInLock(
+    record: SandboxRecord,
+    write: (record: SandboxRecord | PersistedSandboxRecord) => Promise<void>,
+    context: JournalContext | undefined,
+    resultCode: string,
+    evidence: readonly string[],
+  ): Promise<SandboxRecord> {
+    if (!context || context.completed) return record
+    const next = completeJournalEntry(record, context.requestId, resultCode, evidence, this.now().toISOString())
+    if (next === record) {
+      if (!journalEntryCompleted(record, context.requestId)) return record
+    } else {
+      await write(next)
+    }
+    context.completed = true
+    context.pending = false
+    return next
+  }
+
+  private async withJournalRecordLock<T>(
+    sessionId: string,
+    operation: (
+      record: SandboxRecord | undefined,
+      write: (record: SandboxRecord | PersistedSandboxRecord) => Promise<void>,
+    ) => Promise<T>,
+  ): Promise<T> {
+    // ponytail: bounded 100 ms wait for a lifecycle lock; journal completion must not change a successful response into STATE_LOCKED.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        return await this.store.withRecordLock(sessionId, operation)
+      } catch (error) {
+        if (!(error instanceof SandboxError) || error.code !== "STATE_LOCKED" || attempt === 99) throw error
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+    }
+    throw new SandboxError("validate", `session is already locked: ${sessionId}`, "STATE_LOCKED")
+  }
+
+  private async completeJournalForResponse(sessionId: string, context: JournalContext, response: SandboxResponse): Promise<void> {
+    await this.withJournalRecordLock(sessionId, async (record, write) => {
+      if (!record) return
+      await this.completeJournalInLock(record, write, context, responseResultCode(response), journalEvidence(record, response))
+    })
+  }
+
+  private async completeJournalForError(sessionId: string, context: JournalContext, error: unknown): Promise<void> {
+    await this.withJournalRecordLock(sessionId, async (record, write) => {
+      if (!record) return
+      await this.completeJournalInLock(record, write, context, errorCode(error), journalEvidence(record, undefined, error))
+    })
+  }
+
+  private async journalCompletedRequest(
+    sessionId: string,
+    context: JournalContext,
+    response: SandboxResponse,
+  ): Promise<void> {
+    await this.withJournalRecordLock(sessionId, async (record, write) => {
+      if (!record) return
+      if (record.journal?.some((entry) => entry.requestId === context.requestId)) throw requestIdReused()
+      const started = {
+        ...record,
+        journal: boundOperationJournal([...(record.journal ?? []), journalEntry(context)]),
+      }
+      const next = completeJournalEntry(
+        started,
+        context.requestId,
+        responseResultCode(response),
+        journalEvidence(started, response),
+        this.now().toISOString(),
+      )
+      if (next !== record) await write(next)
+      context.started = true
+      context.completed = true
+      context.pending = false
+    })
   }
 
   private syncSession(sessionId: string, session: RuntimeSession): Promise<void> {
@@ -728,13 +909,14 @@ export class LifecycleController {
       await this.withTarget(record.workspaceId, session.target, () => this.workspace.startSync!({ directory: record.directory }))
       await this.workspace.waitForSync({ workspaceId: record.workspaceId, directory: record.directory, timeoutMs: 30_000 })
       await this.workspace.replaySession({ sessionId: record.sessionId, directory: record.directory, target: session.target })
-      await write({
+      const completed = completePendingJournal({
         ...record,
         phase: "idle",
         operation: record.operation ? { ...record.operation, phase: "remote" } : undefined,
         updatedAt: this.now().toISOString(),
         lastError: undefined,
-      })
+      }, "OK", journalEvidence(record), this.now().toISOString())
+      await write(completed)
       this.resolveTargetGate(record.workspaceId, session.target)
       return
     }
@@ -754,13 +936,14 @@ export class LifecycleController {
     const session = this.sessions.get(record.sessionId)
     if (!session) {
       if (record.operation?.kind === "delete" && record.operation.phase === "destroying" && record.operation.providerDestroyed) {
-        await write({
+        const completed = completePendingJournal({
           ...record,
           phase: "idle",
           operation: { ...record.operation, phase: "deleted" },
           updatedAt: this.now().toISOString(),
           lastError: undefined,
-        })
+        }, "OK", journalEvidence(record), this.now().toISOString())
+        await write(completed)
         return
       }
       if (record.operation?.kind === "delete" && ["removing", "destroying"].includes(record.operation.phase) && this.runtimeDriver) {
@@ -782,24 +965,26 @@ export class LifecycleController {
           await this.removeWorkspace(current)
         }
         if (!current.operation?.providerDestroyed) current = await this.destroyRuntimeForDelete(current, write, this.runtimeDriver)
-        await write({
+        const completed = completePendingJournal({
           ...current,
           phase: "idle",
           operation: { ...current.operation!, phase: "deleted" },
           updatedAt: this.now().toISOString(),
           lastError: undefined,
-        })
+        }, "OK", journalEvidence(current), this.now().toISOString())
+        await write(completed)
         return
       }
       if (record.operation?.kind === "delete" && record.operation.phase === "removing" && record.operation.providerDestroyed) {
         await this.removeWorkspace(record)
-        await write({
+        const completed = completePendingJournal({
           ...record,
           phase: "idle",
           operation: { ...record.operation, phase: "deleted" },
           updatedAt: this.now().toISOString(),
           lastError: undefined,
-        })
+        }, "OK", journalEvidence(record), this.now().toISOString())
+        await write(completed)
         return
       }
       throw new SandboxError("reconcile", "Sandcastle session handle is unavailable", "SANDCASTLE_HANDLE")
@@ -865,7 +1050,7 @@ export class LifecycleController {
       }
       if (!current.operation?.providerDestroyed) current = await this.destroyRuntimeForDelete(current, write, runtimeDriver)
     }
-    await write({
+    const completed = completePendingJournal({
       ...current,
       phase: "idle",
       operation: current.operation
@@ -874,13 +1059,14 @@ export class LifecycleController {
       ...(current.preservedWorktreePath ? { preservedWorktreePath: current.preservedWorktreePath } : {}),
       updatedAt: this.now().toISOString(),
       lastError: undefined,
-    })
+    }, "OK", journalEvidence(current), this.now().toISOString())
+    await write(completed)
     this.resolveTargetGate(record.workspaceId, localTarget)
     this.targets.delete(record.workspaceId)
   }
 
-  private async start(capability: ControlCapability, expected?: SandboxRecord): Promise<SandboxResponse> {
-    if (this.sandcastle) return this.startWithSandcastle(capability, expected)
+  private async start(capability: ControlCapability, expected?: SandboxRecord, journal?: JournalContext): Promise<SandboxResponse> {
+    if (this.sandcastle) return this.startWithSandcastle(capability, expected, journal)
 
     const context = this.contexts.get(capability.sessionId)
     if (!context) throw new SandboxError("validate", "session context is not available", "SESSION_CONTEXT")
@@ -889,13 +1075,24 @@ export class LifecycleController {
       if (expected && (!existing || !sameRetryRecord(existing, expected))) throw retryStale()
       this.assertCapability(existing, capability)
       this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
+      if (journal && existing) existing = await this.beginJournal(existing, write, journal)
       const retrying = Boolean(expected && existing?.lastError && existing.operation?.kind === "start")
       await this.assertStartEvidence(existing, retrying)
       if (existing?.desiredLocation === "remote" && existing.phase === "idle" && !existing.lastError) {
-        return successResponse("start", existing, "session is already remote")
+        const response = successResponse("start", existing, "session is already remote")
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(existing, write, journal, responseResultCode(response), journalEvidence(existing, response))
+        }
+        return response
       }
       if (existing?.desiredLocation === "remote" && ["provisioning", "activating"].includes(existing.phase ?? "") && !existing.lastError) {
-        return successResponse("start", existing, "session activation is already pending")
+        const response = successResponse("start", existing, "session activation is already pending")
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(existing, write, journal, responseResultCode(response), journalEvidence(existing, response))
+        }
+        return response
       }
       if (existing && existing.phase !== "idle") throw new SandboxError("transition", "cannot start while another transition is pending", "START_TRANSITION")
       if (existing?.desiredLocation === "deleted" && !existing.lastError) throw new SandboxError("validate", "session workspace has already been deleted", "SESSION_DELETED")
@@ -925,6 +1122,7 @@ export class LifecycleController {
       const operation = {
         kind: "start" as const,
         phase: "provisioning",
+        ...(journal ? { requestId: journal.requestId } : {}),
       }
       let current: SandboxRecord = {
         sessionId: capability.sessionId,
@@ -941,11 +1139,13 @@ export class LifecycleController {
         desiredLocation: "remote",
         phase: "provisioning",
         operation,
+        ...(existing?.journal ? { journal: existing.journal } : {}),
         ...(existing?.preservedWorktreePath ? { preservedWorktreePath: existing.preservedWorktreePath } : {}),
         createdAt: existing?.createdAt ?? this.now().toISOString(),
         updatedAt: this.now().toISOString(),
       }
-      await write(current)
+      if (journal) current = await this.beginJournal(current, write, journal)
+      else await write(current)
 
       try {
         const workspace = await this.workspace.create({
@@ -1004,6 +1204,7 @@ export class LifecycleController {
           lastError: undefined,
         }
         await write(next)
+        if (journal) journal.pending = true
         return successResponse("start", next, "Sandbox pronta. A proxima mensagem sera executada remotamente.")
       } catch (error) {
         let cleanupError: unknown
@@ -1022,14 +1223,20 @@ export class LifecycleController {
             ...(cleanupError ? { message: `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` } : {}),
           },
         }
-        await write(failed)
         const lastError = failed.lastError ?? { stage: "provision", message: "start failed" }
-        return failureResponse("start", lastError.stage, lastError.message, failed)
+        const response = failureResponse("start", lastError.stage, lastError.message, failed)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(failed, write, journal, responseResultCode(response), journalEvidence(failed, response))
+        } else {
+          await write(failed)
+        }
+        return response
       }
     })
   }
 
-  private async startWithSandcastle(capability: ControlCapability, expected?: SandboxRecord): Promise<SandboxResponse> {
+  private async startWithSandcastle(capability: ControlCapability, expected?: SandboxRecord, journal?: JournalContext): Promise<SandboxResponse> {
     const factory = this.sandcastle
     if (!factory) throw new SandboxError("validate", "Sandcastle session factory is unavailable", "SANDCASTLE_UNAVAILABLE")
     const context = this.contexts.get(capability.sessionId)
@@ -1039,13 +1246,24 @@ export class LifecycleController {
       if (expected && (!existing || !sameRetryRecord(existing, expected))) throw retryStale()
       this.assertCapability(existing, capability)
       this.assertOperationAllowed(existing, { operation: "start", force: false, capability })
+      if (journal && existing) existing = await this.beginJournal(existing, write, journal)
       const retrying = Boolean(expected && existing?.lastError && existing.operation?.kind === "start")
       await this.assertStartEvidence(existing, retrying)
       if (existing?.desiredLocation === "remote" && existing.phase === "idle" && !existing.lastError) {
-        return successResponse("start", existing, "session is already remote")
+        const response = successResponse("start", existing, "session is already remote")
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(existing, write, journal, responseResultCode(response), journalEvidence(existing, response))
+        }
+        return response
       }
       if (existing?.desiredLocation === "remote" && ["provisioning", "activating"].includes(existing.phase ?? "") && !existing.lastError) {
-        return successResponse("start", existing, "session activation is already pending")
+        const response = successResponse("start", existing, "session activation is already pending")
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(existing, write, journal, responseResultCode(response), journalEvidence(existing, response))
+        }
+        return response
       }
       if (existing && existing.phase !== "idle") throw new SandboxError("transition", "cannot start while another transition is pending", "START_TRANSITION")
       if (existing?.desiredLocation === "deleted" && !existing.lastError) throw new SandboxError("validate", "session workspace has already been deleted", "SESSION_DELETED")
@@ -1085,6 +1303,7 @@ export class LifecycleController {
       const operation = {
         kind: "start" as const,
         phase: "provisioning",
+        ...(journal ? { requestId: journal.requestId } : {}),
       }
       let current: SandboxRecord = {
         sessionId: capability.sessionId,
@@ -1099,11 +1318,13 @@ export class LifecycleController {
         desiredLocation: "remote",
         phase: "provisioning",
         operation,
+        ...(existing?.journal ? { journal: existing.journal } : {}),
         ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
         createdAt: existing?.createdAt ?? this.now().toISOString(),
         updatedAt: this.now().toISOString(),
       }
-      await write(current)
+      if (journal) current = await this.beginJournal(current, write, journal)
+      else await write(current)
 
       let session: SandcastleSession | undefined
       try {
@@ -1160,6 +1381,7 @@ export class LifecycleController {
           lastError: undefined,
         }
         await write(next)
+        if (journal) journal.pending = true
         return successResponse("start", next, "Sandbox pronta. A proxima mensagem sera executada remotamente.")
       } catch (error) {
         let cleanupError: unknown
@@ -1196,24 +1418,41 @@ export class LifecycleController {
             ...(cleanupError ? { message: `${redactError(error)}; cleanup failed: ${redactError(cleanupError)}` } : {}),
           },
         }
-        await write(failed)
         const lastError = failed.lastError ?? { stage: "provision", message: "start failed" }
-        return failureResponse("start", lastError.stage, lastError.message, failed)
+        const response = failureResponse("start", lastError.stage, lastError.message, failed)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(failed, write, journal, responseResultCode(response), journalEvidence(failed, response))
+        } else {
+          await write(failed)
+        }
+        return response
       }
     })
   }
 
-  private async stop(capability: ControlCapability): Promise<SandboxResponse> {
+  private async stop(capability: ControlCapability, journal?: JournalContext): Promise<SandboxResponse> {
     return this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "stop", force: false, capability })
       if (!record) return successResponse("stop", undefined, "session is already local", undefined, capability.role)
+      if (journal) record = await this.beginJournal(record, write, journal)
       if (record.lastError) throw failedOperationError(record, "stop")
       if (record.desiredLocation === "local" && record.phase === "idle" && !record.lastError) {
-        return successResponse("stop", record, "session is already local", undefined, capability.role)
+        const response = successResponse("stop", record, "session is already local", undefined, capability.role)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response))
+        }
+        return response
       }
       if (record.desiredLocation === "local" && record.phase === "detaching" && !record.lastError) {
-        return successResponse("stop", record, "session detach is already pending", undefined, capability.role)
+        const response = successResponse("stop", record, "session detach is already pending", undefined, capability.role)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response))
+        }
+        return response
       }
       if (record.desiredLocation !== "remote" || record.phase !== "idle") {
         throw new SandboxError("transition", "cannot stop while another transition is pending", "STOP_TRANSITION")
@@ -1228,11 +1467,13 @@ export class LifecycleController {
         operation: {
           kind: "stop",
           phase: "awaiting_idle",
+          ...(journal ? { requestId: journal.requestId } : {}),
         },
         updatedAt: this.now().toISOString(),
       }
       this.beginTargetGate(record.workspaceId)
       await write(next)
+      if (journal) journal.pending = true
       return successResponse("stop", next, "Detach agendado; a resposta atual sera concluida primeiro.", undefined, capability.role)
     })
   }
@@ -1310,6 +1551,7 @@ export class LifecycleController {
       this.inspectRuntimeTarget(record, handle),
     ])
     const handleObservation = runtimeHandleObservation(handle, target, freshAt)
+    const process = this.inspectProcess(record, handle)
     const observations = [recordObservation(record), handleObservation, workspace.observation, provider.observation, git.observation]
     const classification = classifySituation(record, observations)
     return {
@@ -1318,6 +1560,7 @@ export class LifecycleController {
       provider,
       git,
       handle: handleObservation,
+      process,
       observations,
       classification,
       work: workFromInspection(record, git.value, classification),
@@ -1326,10 +1569,31 @@ export class LifecycleController {
     }
   }
 
-  private recover(capability: ControlCapability): Promise<SandboxResponse> {
+  private inspectProcess(record: SandboxRecord, session: RuntimeSession | undefined): ProcessOwnershipObservation {
+    try {
+      const observation = session?.processObservation?.() ?? this.processInspect?.(record)
+      return observation ? safeProcessObservation(observation) : unknownProcessObservation("process ownership inspection is unavailable")
+    } catch (error) {
+      return unknownProcessObservation(`process ownership inspection failed:${errorCode(error)}`)
+    }
+  }
+
+  private recover(capability: ControlCapability, journal?: JournalContext): Promise<SandboxResponse> {
     const existing = this.recoveryFlights.get(capability.sessionId)
-    if (existing) return existing
-    const flight = this.recoverLocked(capability)
+    if (existing) {
+      return existing.then(async (response) => {
+        if (journal) {
+          try {
+            await this.journalCompletedRequest(capability.sessionId, journal, response)
+          } catch (error) {
+            if (!(error instanceof SandboxError) || error.code !== "REQUEST_ID_REUSED") return response
+            throw error
+          }
+        }
+        return response
+      })
+    }
+    const flight = this.recoverLocked(capability, journal)
     this.recoveryFlights.set(capability.sessionId, flight)
     void flight.then(
       () => {
@@ -1342,11 +1606,12 @@ export class LifecycleController {
     return flight
   }
 
-  private async recoverLocked(capability: ControlCapability): Promise<SandboxResponse> {
+  private async recoverLocked(capability: ControlCapability, journal?: JournalContext): Promise<SandboxResponse> {
     return this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "recover", force: false, capability })
       if (!record) throw new SandboxError("reconcile", "no sandbox session is associated", "RECOVER_UNAVAILABLE")
+      if (journal) record = await this.beginJournal(record, write, journal)
       if (record.provider === "cloudflare" || !this.runtimeDriver) {
         throw new SandboxError("reconcile", "runtime adoption is not supported for this provider", "RECOVER_UNSUPPORTED")
       }
@@ -1356,7 +1621,7 @@ export class LifecycleController {
       const recoveryAvailable = this.runtimeDriver !== undefined && record.provider !== "cloudflare" && resource !== undefined
       const evidenceError = recoveryEvidenceError(record, plan, resource?.resourceId)
       if (evidenceError) {
-        return failureResponse("recover", evidenceError.stage, evidenceError.message, record, evidenceError, capability.role, {
+        const response = failureResponse("recover", evidenceError.stage, evidenceError.message, record, evidenceError, capability.role, {
           observations: plan.observations,
           classification: plan.classification,
           effectiveTarget: plan.effectiveTarget,
@@ -1366,11 +1631,16 @@ export class LifecycleController {
           mutationsAllowed: true,
           recoveryAvailable: false,
         })
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response, evidenceError))
+        }
+        return response
       }
 
       if (!resource) {
         const error = new SandboxError("reconcile", "recovery requires a durable runtime resource reference", "RECOVER_EVIDENCE")
-        return failureResponse("recover", error.stage, error.message, record, error, capability.role, {
+        const response = failureResponse("recover", error.stage, error.message, record, error, capability.role, {
           observations: plan.observations,
           classification: plan.classification,
           effectiveTarget: plan.effectiveTarget,
@@ -1380,13 +1650,18 @@ export class LifecycleController {
           mutationsAllowed: true,
           recoveryAvailable: false,
         })
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response, error))
+        }
+        return response
       }
 
       const pending: SandboxRecord = {
         ...record,
         desiredLocation: "remote",
         phase: "activating",
-        operation: { kind: "recover", phase: "adopting" },
+        operation: { kind: "recover", phase: "adopting", ...(journal ? { requestId: journal.requestId } : {}) },
         updatedAt: this.now().toISOString(),
         lastError: undefined,
       }
@@ -1412,13 +1687,19 @@ export class LifecycleController {
           ...current,
           desiredLocation: "remote",
           phase: "idle",
-          operation: { kind: "recover", phase: "remote" },
+          operation: { kind: "recover", phase: "remote", ...(journal ? { requestId: journal.requestId } : {}) },
           updatedAt: this.now().toISOString(),
           lastError: undefined,
         }
-        await write(next)
+        const response = recoverySuccessResponse(next, plan, session, capability.role, this.capture !== undefined, this.contexts.has(next.sessionId), recoveryAvailable)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(next, write, journal, responseResultCode(response), journalEvidence(next, response))
+        } else {
+          await write(completePendingJournal(next, "OK", journalEvidence(next), this.now().toISOString()))
+        }
         this.resolveTargetGate(next.workspaceId, session.target)
-        return recoverySuccessResponse(next, plan, session, capability.role, this.capture !== undefined, this.contexts.has(next.sessionId), recoveryAvailable)
+        return response
       } catch (error) {
         if (session) {
           this.sessions.delete(record.sessionId)
@@ -1444,7 +1725,11 @@ export class LifecycleController {
               ...current,
               desiredLocation: "remote" as const,
               phase: "idle" as const,
-              operation: { kind: "recover" as const, phase: "adopt_failed" },
+              operation: {
+                kind: "recover" as const,
+                phase: "adopt_failed",
+                ...(journal ? { requestId: journal.requestId } : current.operation?.requestId ? { requestId: current.operation.requestId } : {}),
+              },
               ...(preservedWorktreePath ? { preservedWorktreePath } : {}),
               updatedAt: this.now().toISOString(),
               lastError: failureDetails(error),
@@ -1452,7 +1737,14 @@ export class LifecycleController {
           : current && preservedWorktreePath
             ? { ...current, preservedWorktreePath }
             : current
-        if (failed && currentMatches) await write(failed)
+        if (failed && currentMatches) {
+          if (journal) {
+            journal.pending = false
+            await this.completeJournalInLock(failed, write, journal, errorCode(error), journalEvidence(failed, undefined, error))
+          } else {
+            await write(completePendingJournal(failed, errorCode(error), journalEvidence(failed, undefined, error), this.now().toISOString()))
+          }
+        }
         const responseRecord = failed ?? pending
         const responseWork = preservedWorktreePath ? workWithPreservedPath(plan.work, preservedWorktreePath) : plan.work
         return failureResponse("recover", failureStage(error), redactError(error), responseRecord, error, capability.role, {
@@ -1480,16 +1772,17 @@ export class LifecycleController {
     await this.workspace.replaySession({ sessionId: record.sessionId, directory: record.directory, target: session.target })
   }
 
-  private async repair(capability: ControlCapability): Promise<SandboxResponse> {
+  private async repair(capability: ControlCapability, journal?: JournalContext): Promise<SandboxResponse> {
     return this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "repair", force: false, capability })
-    if (!record) return successResponse("repair", undefined, "no sandbox session is associated", undefined, capability.role)
+      if (!record) return successResponse("repair", undefined, "no sandbox session is associated", undefined, capability.role)
+      if (journal) record = await this.beginJournal(record, write, journal)
 
       let plan = await this.inspectRecord(record)
       if (!repairAvailable(record, plan)) {
         const error = repairEvidenceError(plan)
-        return failureResponse("repair", error.stage, error.message, record, error, capability.role, {
+        const response = failureResponse("repair", error.stage, error.message, record, error, capability.role, {
           observations: plan.observations,
           classification: plan.classification,
           effectiveTarget: plan.effectiveTarget,
@@ -1498,6 +1791,11 @@ export class LifecycleController {
           contextAvailable: this.contexts.has(record.sessionId),
           mutationsAllowed: true,
         })
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response, error))
+        }
+        return response
       }
 
       if (plan.workspace.value) {
@@ -1509,7 +1807,7 @@ export class LifecycleController {
         }
         if (!repairAvailable(record, plan)) {
           const error = repairEvidenceError(plan)
-          return failureResponse("repair", error.stage, error.message, record, error, capability.role, {
+          const response = failureResponse("repair", error.stage, error.message, record, error, capability.role, {
             observations: plan.observations,
             classification: classifySituation(record, plan.observations),
             effectiveTarget: plan.effectiveTarget,
@@ -1518,6 +1816,11 @@ export class LifecycleController {
             contextAvailable: this.contexts.has(record.sessionId),
             mutationsAllowed: true,
           })
+          if (journal) {
+            journal.pending = false
+            await this.completeJournalInLock(record, write, journal, responseResultCode(response), journalEvidence(record, response, error))
+          }
+          return response
         }
         if (workspace.value) await this.removeWorkspace(record)
       }
@@ -1553,7 +1856,7 @@ export class LifecycleController {
       const provider = observations.find((observation) => observation.source === "provider")
       const work = workFromInspection(next, plan.git.value, classification)
       const preservationVerified = Boolean(next.preservedWorktreePath && /^[a-f0-9]{40}$/i.test(plan.git.value?.head ?? ""))
-      return successResponse("repair", next, "stale sandbox control-plane state repaired", undefined, capability.role, {
+      const response = successResponse("repair", next, "stale sandbox control-plane state repaired", undefined, capability.role, {
         observations,
         classification,
         effectiveTarget: null,
@@ -1561,6 +1864,11 @@ export class LifecycleController {
         allowedActions: allowedActions(next, capability.role, classification, provider, this.capture !== undefined, this.contexts.has(next.sessionId), true, preservationVerified),
         recommendedAction: recommendedAction(next, capability.role, classification, provider, this.capture !== undefined, this.contexts.has(next.sessionId), true, preservationVerified),
       })
+      if (journal) {
+        journal.pending = false
+        await this.completeJournalInLock(next, write, journal, responseResultCode(response), journalEvidence(next, response))
+      }
+      return response
     })
   }
 
@@ -1670,14 +1978,14 @@ export class LifecycleController {
     }
   }
 
-  private async inspectWorkspace(record: SandboxRecord, freshAt: string): Promise<Probe<WorkspaceInfo>> {
+  private async inspectWorkspace(record: SandboxRecord, freshAt: string, signal?: AbortSignal): Promise<Probe<WorkspaceInfo>> {
     if (!this.workspace.inspect) {
       return {
         observation: { source: "workspace", observed: false, freshAt, resource: "unknown", ownership: "unknown", health: "unknown", evidence: ["workspace inspection is unavailable"] },
       }
     }
     try {
-      const info = await withTimeout(this.workspace.inspect({ workspaceId: record.workspaceId, directory: record.directory }), INSPECTION_TIMEOUT_MS, "workspace inspection timed out")
+      const info = await withTimeout(this.workspace.inspect({ workspaceId: record.workspaceId, directory: record.directory, signal }), INSPECTION_TIMEOUT_MS, "workspace inspection timed out")
       if (!info) {
         return { observation: { source: "workspace", observed: true, freshAt, resource: "absent", ownership: "unknown", health: "unknown", evidence: [`workspace registry:${record.workspaceId}`] } }
       }
@@ -1699,7 +2007,7 @@ export class LifecycleController {
     }
   }
 
-  private async inspectProvider(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string): Promise<Probe<ProviderResourceObservation>> {
+  private async inspectProvider(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string, signal?: AbortSignal): Promise<Probe<ProviderResourceObservation>> {
     const resource = runtimeResourceReference(record)
     if (!session?.inspect && !this.runtimeDriver && !this.providerInspect) {
       return { observation: unknownObservation("provider", freshAt, "provider inspection is unavailable") }
@@ -1710,10 +2018,10 @@ export class LifecycleController {
     try {
       const result = await withTimeout(
         session?.inspect
-          ? session.inspect()
-          : this.runtimeDriver
-            ? this.runtimeDriver.inspect(resource!)
-            : this.providerInspect!(record),
+           ? session.inspect(signal)
+           : this.runtimeDriver
+             ? this.runtimeDriver.inspect(resource!, signal)
+             : this.providerInspect!(record, signal),
         INSPECTION_TIMEOUT_MS,
         "provider inspection timed out",
       )
@@ -1726,7 +2034,7 @@ export class LifecycleController {
     }
   }
 
-  private async inspectGit(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string): Promise<Probe<GitWorkingTreeObservation>> {
+  private async inspectGit(record: SandboxRecord, session: RuntimeSession | undefined, freshAt: string, signal?: AbortSignal): Promise<Probe<GitWorkingTreeObservation>> {
     if (!this.gitInspect) {
       return { observation: { source: "git", observed: false, freshAt, evidence: ["Git inspection is unavailable"] } }
     }
@@ -1735,7 +2043,7 @@ export class LifecycleController {
       return { observation: { source: "git", observed: false, freshAt, evidence: ["runtime worktree is unavailable"] } }
     }
     try {
-      const value = await withTimeout(this.gitInspect(record, worktreePath), INSPECTION_TIMEOUT_MS, "Git inspection timed out")
+      const value = await withTimeout(this.gitInspect(record, worktreePath, signal), INSPECTION_TIMEOUT_MS, "Git inspection timed out")
       return {
         value,
         observation: { source: "git", observed: true, freshAt, evidence: safeEvidence(value.evidence) },
@@ -1766,18 +2074,131 @@ export class LifecycleController {
   }
 
   private async diagnose(record: SandboxRecord | undefined, capability: ControlCapability): Promise<SandboxResponse> {
-    if (!record) return successResponse("diagnose", undefined, "no sandbox session is associated", undefined, capability.role)
-    const details = this.infrastructure.diagnose
-      ? boundedDetails(nonSecretDetails(await this.infrastructure.diagnose(record)))
-      : { configured: false }
-    return successResponse("diagnose", record, "diagnostics completed", details, capability.role)
+    const generatedAt = this.now().toISOString()
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.diagnosticTimeoutMs)
+    const budget: DiagnosticBudget = { used: 0, completed: 0, timedOut: 0 }
+    const signal = controller.signal
+    const session = record ? this.sessions.get(record.sessionId) : undefined
+    const sourceProbe = this.diagnosticSources
+      ? startDiagnosticProbe(budget, signal, "versions", (probeSignal) => this.diagnosticSources!(probeSignal))
+      : undefined
+    const workspaceProbe = record && this.workspace.inspect
+      ? startDiagnosticProbe(budget, signal, "workspace", (probeSignal) => this.inspectWorkspace(record, generatedAt, probeSignal))
+      : undefined
+    const providerProbe = record && this.hasDiagnosticProvider(record, session)
+      ? startDiagnosticProbe(budget, signal, "provider", (probeSignal) => this.diagnoseProvider(record, session, probeSignal))
+      : undefined
+    const gitProbe = record && this.gitInspect && (sessionWorktreePath(session) ?? record.preservedWorktreePath)
+      ? startDiagnosticProbe(budget, signal, "git", (probeSignal) => this.inspectGit(record, session, generatedAt, probeSignal))
+      : undefined
+    const infrastructureProbe = record && this.infrastructure.diagnose
+      ? startDiagnosticProbe(budget, signal, "infrastructure", (probeSignal) => this.infrastructure.diagnose!(record, probeSignal))
+      : undefined
+
+    try {
+      const [sourceResult, workspaceResult, providerResult, gitResult, infrastructureResult] = await Promise.all([
+        sourceProbe ?? Promise.resolve(undefined),
+        workspaceProbe ?? Promise.resolve(undefined),
+        providerProbe ?? Promise.resolve(undefined),
+        gitProbe ?? Promise.resolve(undefined),
+        infrastructureProbe ?? Promise.resolve(undefined),
+      ])
+      const workspace = diagnosticObservationProbe(workspaceResult, "workspace", generatedAt)
+      const provider = diagnosticProviderProbe(providerResult, generatedAt)
+      const git = diagnosticObservationProbe(gitResult, "git", generatedAt)
+      const handle = diagnosticHandleObservation(session, generatedAt)
+      const process = record
+        ? this.inspectProcess(record, session)
+        : unknownProcessObservation("process ownership inspection is unavailable")
+      const observations = record
+        ? [recordObservation(record), handle, workspace.observation, provider.observation, git.observation]
+        : emptyObservations(new Date(generatedAt))
+      const classification = record ? classifySituation(record, observations) : "unknown"
+      const plan: ObservationPlan | undefined = record
+        ? {
+            identity: reconciliationRecordIdentity(record),
+            workspace,
+            provider,
+            git,
+            handle,
+            process,
+            observations,
+            classification,
+            work: workFromInspection(record, git.value, classification),
+            effectiveTarget: diagnosticEffectiveTarget(session, provider.value),
+            probeError: workspace.error ?? provider.error ?? git.error,
+          }
+        : undefined
+      const errors = diagnosticErrors(sourceResult, infrastructureResult, workspace, provider, git)
+      const legacyDetails = record && this.infrastructure.diagnose
+        ? diagnosticHookDetails(infrastructureResult?.value)
+        : { configured: false }
+      const details = boundedDetails({
+        ...legacyDetails,
+        ...diagnosticBundle(record, plan, capability.role, sourceResult?.value ?? {}, generatedAt, errors, budget),
+        ...(errors.length > 0 ? { diagnosticError: errorCode(errors[0]) } : {}),
+      })
+      const failed = errors.length > 0
+      return successResponse(
+        "diagnose",
+        record,
+        failed ? "diagnostics completed with unknown evidence" : record ? "diagnostics completed" : "no sandbox session is associated",
+        details,
+        capability.role,
+        plan
+          ? {
+              ok: !failed,
+              observations: plan.observations,
+              classification: plan.classification,
+              effectiveTarget: plan.effectiveTarget,
+              work: plan.work,
+              ...(errors.length > 0 ? { error: publicError(errors[0]) } : {}),
+            }
+          : {
+              ok: !failed,
+              observations,
+              classification: "unknown",
+              effectiveTarget: null,
+              work: emptyWork(),
+              ...(errors.length > 0 ? { error: publicError(errors[0]) } : {}),
+            },
+      )
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
-  private async delete(capability: ControlCapability, force: boolean): Promise<SandboxResponse> {
+  private hasDiagnosticProvider(record: SandboxRecord, session: RuntimeSession | undefined): boolean {
+    return Boolean(
+      session?.diagnose ||
+      this.providerDiagnose ||
+      session?.inspect ||
+      (this.runtimeDriver && runtimeResourceReference(record)) ||
+      this.providerInspect,
+    )
+  }
+
+  private async diagnoseProvider(record: SandboxRecord, session: RuntimeSession | undefined, signal: AbortSignal): Promise<ProviderResourceObservation> {
+    const resource = runtimeResourceReference(record)
+    if (session?.diagnose) return session.diagnose(signal)
+    if (this.providerDiagnose) return this.providerDiagnose(record, signal)
+    if (session?.inspect) return session.inspect(signal)
+    if (this.runtimeDriver && resource) return this.runtimeDriver.inspect(resource, signal)
+    if (this.providerInspect) return this.providerInspect(record, signal)
+    throw new SandboxError("diagnose", "provider diagnostic inspection is unavailable", "DIAGNOSTIC_UNAVAILABLE")
+  }
+
+  private async delete(capability: ControlCapability, force: boolean, journal?: JournalContext): Promise<SandboxResponse> {
     const decision = await this.store.withRecordLock(capability.sessionId, async (record, write) => {
       this.assertCapability(record, capability)
       this.assertOperationAllowed(record, { operation: "delete", force, capability })
+      if (record && journal) record = await this.beginJournal(record, write, journal)
       if (!record || (record.desiredLocation === "deleted" && record.phase === "idle" && !record.lastError)) {
+        if (journal && record) {
+          journal.pending = false
+          record = await this.completeJournalInLock(record, write, journal, "OK", journalEvidence(record))
+        }
         return { record, forceDiscard: false, alreadyDeleted: true }
       }
       const localStable = isIdleIntent(record, "local")
@@ -1800,7 +2221,13 @@ export class LifecycleController {
       if (!(destructionRecorded && localStable && !hasSession && !this.runtimeDriver)) {
         plan = await this.inspectRecord(record)
         const evidenceError = deleteOperationEvidenceError(record, plan, force, forceDiscard, orphaned, hasSession, this.runtimeDriver !== undefined)
-        if (evidenceError) return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error: evidenceError, plan } }
+        if (evidenceError) {
+          if (journal) {
+            journal.pending = false
+            record = await this.completeJournalInLock(record, write, journal, evidenceError.code, journalEvidence(record, undefined, evidenceError))
+          }
+          return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error: evidenceError, plan } }
+        }
       }
       if (!force && record.preservedWorktreePath) await this.verifyPreservedWorktree(record)
       if (!force && this.infrastructure.preflightDelete) await this.infrastructure.preflightDelete(record)
@@ -1814,9 +2241,19 @@ export class LifecycleController {
           throw new SandboxError("validate", "orphan deletion is only authorized from the host", "REQUEST_ORPHAN_DELETE")
         }
         const error = deleteEvidenceError(record, plan, resource)
-        if (error) return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error, plan } }
+        if (error) {
+          if (journal) {
+            journal.pending = false
+            record = await this.completeJournalInLock(record, write, journal, error.code, journalEvidence(record, undefined, error))
+          }
+          return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error, plan } }
+        }
         if (!orphaned && plan.classification !== "orphan") {
           const error = new SandboxError("reconcile", "delete requires a freshly observed orphaned runtime", "DELETE_EVIDENCE")
+          if (journal) {
+            journal.pending = false
+            record = await this.completeJournalInLock(record, write, journal, error.code, journalEvidence(record, undefined, error))
+          }
           return { record, forceDiscard: false, alreadyDeleted: false, preflightFailure: { error, plan } }
         }
         orphaned = true
@@ -1836,6 +2273,7 @@ export class LifecycleController {
         operation: {
           kind: "delete",
           phase,
+          ...(journal ? { requestId: journal.requestId } : {}),
           force,
           ...(record.operation?.providerDestroyed ? { providerDestroyed: true } : {}),
         },
@@ -1843,13 +2281,24 @@ export class LifecycleController {
         lastError: undefined,
       }
       await write(next)
-      if (!force) return { record: next, forceDiscard, alreadyDeleted: false }
+      if (!force) {
+        if (journal) journal.pending = true
+        return { record: next, forceDiscard, alreadyDeleted: false }
+      }
 
       let final = next
       await this.processSessionIdleLocked(capability.sessionId, next, async (updated) => {
         final = updated
         await write(updated)
       }, { record: next, capability })
+      if (journal) {
+        if (journalEntryCompleted(final, journal.requestId)) {
+          journal.completed = true
+          journal.pending = false
+        } else {
+          journal.pending = true
+        }
+      }
       return { record: final, forceDiscard, alreadyDeleted: false }
     })
 
@@ -1882,12 +2331,22 @@ export class LifecycleController {
     return successResponse("delete", final, decision.forceDiscard ? "Failed sandbox discarded." : "Sandbox removed.", undefined, capability.role)
   }
 
-  private async retry(capability: ControlCapability, record: SandboxRecord | undefined): Promise<SandboxResponse> {
+  private async retry(capability: ControlCapability, record: SandboxRecord | undefined, journal?: JournalContext): Promise<SandboxResponse> {
     this.assertOperationAllowed(record, { operation: "retry", force: false, capability })
+    if (record && journal) {
+      record = await this.store.withRecordLock(record.sessionId, async (current, write) => {
+        if (!current || !sameRetryRecord(current, record!)) throw retryStale()
+        const started = await this.beginJournal(current, write, journal)
+        if (started.lastError) return started
+        journal.pending = false
+        return this.completeJournalInLock(started, write, journal, "OK", journalEvidence(started))
+      })
+    }
     if (isOrphaned(record)) {
       throw new SandboxError("reconcile", "session sandbox is orphaned; manual recovery is required", "SESSION_ORPHANED")
     }
     if (!record || !record.lastError) {
+      if (journal) journal.pending = false
       return successResponse("retry", record, "there is no failed operation to retry", undefined, capability.role)
     }
     if (record.provider === "cloudflare") {
@@ -1906,15 +2365,15 @@ export class LifecycleController {
       }
     }
     const operation = record.operation?.kind
-    if (operation === "recover") return this.retryRecovery(capability)
+    if (operation === "recover") return this.retryRecovery(capability, journal)
     if (operation === "start") {
-      if (record.operation?.phase === "awaiting_idle") return this.retryPending(capability, record, "start", "awaiting_idle")
-      if (record.operation?.phase === "remote") return this.retryRemoteSync(capability, record)
-      return this.start(capability, record)
+      if (record.operation?.phase === "awaiting_idle") return this.retryPending(capability, record, "start", "awaiting_idle", journal)
+      if (record.operation?.phase === "remote") return this.retryRemoteSync(capability, record, journal)
+      return this.start(capability, record, journal)
     }
     if (operation === "stop") {
       const phase = record.operation?.phase === "adopting" ? "adopting" : "awaiting_idle"
-      return this.retryPending(capability, record, "stop", phase)
+      return this.retryPending(capability, record, "stop", phase, journal)
     }
     if (operation === "delete") {
       let phase = "awaiting_idle"
@@ -1922,13 +2381,13 @@ export class LifecycleController {
       else if (record.operation?.phase === "destroying") phase = "destroying"
       else if (record.operation?.phase === "removing") phase = "removing"
       else if (record.operation?.phase === "discarding") phase = "discarding"
-      return this.retryPending(capability, record, "delete", phase)
+      return this.retryPending(capability, record, "delete", phase, journal)
     }
     throw new SandboxError("validate", "no retryable operation is recorded", "RETRY_UNAVAILABLE")
   }
 
-  private async retryRecovery(capability: ControlCapability): Promise<SandboxResponse> {
-    const result = await this.recover(capability)
+  private async retryRecovery(capability: ControlCapability, journal?: JournalContext): Promise<SandboxResponse> {
+    const result = await this.recover(capability, journal)
     return {
       ...result,
       operation: "retry",
@@ -1941,6 +2400,7 @@ export class LifecycleController {
     record: SandboxRecord,
     kind: "start" | "stop" | "delete",
     phase: string,
+    journal?: JournalContext,
   ): Promise<SandboxResponse> {
     return this.store.withRecordLock(record.sessionId, async (current, write) => {
       if (!current || !sameRetryRecord(current, record)) throw retryStale()
@@ -1954,6 +2414,7 @@ export class LifecycleController {
           ...current.operation,
           kind,
           phase,
+          ...(journal ? { requestId: journal.requestId } : {}),
         },
         updatedAt: this.now().toISOString(),
         lastError: undefined,
@@ -1966,36 +2427,72 @@ export class LifecycleController {
       }, { record: next, capability })
       if (final.lastError) {
         const lastError = final.lastError ?? { stage: "reconcile", message: "retry failed" }
-        return failureResponse("retry", lastError.stage, lastError.message, final, undefined, capability.role)
+        const response = failureResponse("retry", lastError.stage, lastError.message, final, undefined, capability.role)
+        if (journal && !journalEntryCompleted(final, journal.requestId)) {
+          journal.pending = false
+          await this.completeJournalInLock(final, write, journal, responseResultCode(response), journalEvidence(final, response))
+        } else if (journal) {
+          journal.completed = true
+          journal.pending = false
+        }
+        return response
       }
-      return successResponse("retry", final, "Retry completed.", undefined, capability.role)
+      const response = successResponse("retry", final, "Retry completed.", undefined, capability.role)
+      if (journal && !journalEntryCompleted(final, journal.requestId)) {
+        if (response.intent?.phase === "idle") {
+          journal.pending = false
+          await this.completeJournalInLock(final, write, journal, responseResultCode(response), journalEvidence(final, response))
+        } else {
+          journal.pending = true
+        }
+      } else if (journal) {
+        journal.completed = true
+        journal.pending = false
+      }
+      return response
     })
   }
 
-  private async retryRemoteSync(capability: ControlCapability, record: SandboxRecord): Promise<SandboxResponse> {
+  private async retryRemoteSync(capability: ControlCapability, record: SandboxRecord, journal?: JournalContext): Promise<SandboxResponse> {
     const next = await this.store.withRecordLock(record.sessionId, async (current, write) => {
       if (!current || !sameRetryRecord(current, record)) throw retryStale()
       this.assertCapability(current, capability)
       this.assertOperationAllowed(current, { operation: "retry", force: false, capability })
       try {
         await this.syncOut(current)
-        const next = {
+        const next: SandboxRecord = {
           ...current,
           desiredLocation: "remote" as const,
           phase: "idle" as const,
           updatedAt: this.now().toISOString(),
-          operation: current.operation ? { ...current.operation, phase: "remote" } : undefined,
+          operation: current.operation
+            ? { ...current.operation, phase: "remote", ...(journal ? { requestId: journal.requestId } : {}) }
+            : undefined,
           lastError: undefined,
         }
-        await write(next)
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(next, write, journal, "OK", journalEvidence(next))
+        } else {
+          await write(next)
+        }
         return next
       } catch (error) {
-        await write({
+        const failed: SandboxRecord = {
           ...current,
           phase: "idle",
           updatedAt: this.now().toISOString(),
+          operation: current.operation
+            ? { ...current.operation, ...(journal ? { requestId: journal.requestId } : {}) }
+            : undefined,
           lastError: failureDetails(error),
-        })
+        }
+        if (journal) {
+          journal.pending = false
+          await this.completeJournalInLock(failed, write, journal, errorCode(error), journalEvidence(failed, undefined, error))
+        } else {
+          await write(failed)
+        }
         throw error
       }
     })
@@ -2170,6 +2667,80 @@ function failureDetails(error: unknown, message = redactError(error)): NonNullab
   }
 }
 
+function journalEntry(context: JournalContext, evidence: readonly string[] = []): SandboxJournalEntry {
+  return {
+    requestId: context.requestId,
+    operation: context.operation,
+    startedAt: context.startedAt,
+    resultCode: "PENDING",
+    evidence: safeEvidence([`operation:${context.operation}`, ...evidence]),
+  }
+}
+
+function completePendingJournal(
+  record: SandboxRecord,
+  resultCode: string,
+  evidence: readonly string[],
+  endedAt: string,
+): SandboxRecord {
+  const requestId = record.operation?.requestId
+  return requestId
+    ? completeJournalEntry(record, requestId, resultCode, evidence, endedAt)
+    : record
+}
+
+function completeJournalEntry(
+  record: SandboxRecord,
+  requestId: string,
+  resultCode: string,
+  evidence: readonly string[],
+  endedAt: string,
+): SandboxRecord {
+  if (!record.journal) return record
+  let index = -1
+  for (let position = record.journal.length - 1; position >= 0; position--) {
+    if (record.journal[position]?.requestId === requestId) {
+      index = position
+      break
+    }
+  }
+  if (index < 0) return record
+  const current = record.journal[index]!
+  if (current.endedAt !== undefined && current.resultCode !== "PENDING") return record
+  const journal = [...record.journal]
+  journal[index] = {
+    ...current,
+    endedAt,
+    resultCode,
+    evidence: safeEvidence([...current.evidence, ...evidence]),
+  }
+  return { ...record, journal: boundOperationJournal(journal) }
+}
+
+function journalEntryCompleted(record: SandboxRecord, requestId: string): boolean {
+  for (let index = record.journal?.length ?? 0; index > 0; index--) {
+    const entry = record.journal![index - 1]
+    if (entry?.requestId === requestId) return entry.endedAt !== undefined && entry.resultCode !== "PENDING"
+  }
+  return false
+}
+
+function responseResultCode(response: SandboxResponse): string {
+  return response.ok ? "OK" : response.error?.code ?? "SANDBOX_ERROR"
+}
+
+function journalEvidence(record: SandboxRecord, response?: SandboxResponse, error?: unknown): string[] {
+  const refs: string[] = []
+  if (response?.error?.code) refs.push(`result:${response.error.code}`)
+  if (response?.stage) refs.push(`stage:${response.stage}`)
+  if (error instanceof SandboxError) refs.push(`stage:${error.stage}`, `result:${error.code}`)
+  if (record.operation) refs.push(`phase:${record.operation.phase}`)
+  for (const observation of response?.observations ?? []) {
+    for (const evidence of observation.evidence.slice(0, 2)) refs.push(`${observation.source}:${evidence}`)
+  }
+  return safeEvidence(refs)
+}
+
 function preservedPathFrom(error: unknown): string | undefined {
   return isRecord(error) && typeof error.preservedWorktreePath === "string" ? error.preservedWorktreePath : undefined
 }
@@ -2191,7 +2762,7 @@ function nonSecretDetails(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) return {}
   const result: Record<string, unknown> = {}
   for (const [key, item] of Object.entries(value)) {
-    if (/(?:password|token|secret|credential|auth|api[_-]?key|private[_-]?key)/i.test(key)) continue
+    if (/(?:password|token|secret|credential|auth|api[_-]?key|private[_-]?key|cookie|set-cookie|ssh[_-]?key|headers?|argv|env|logs?|stdout|stderr)/i.test(key)) continue
     result[key] = nonSecretValue(item)
   }
   return result
@@ -2214,7 +2785,7 @@ function boundedText(value: string): { value: string; truncated: boolean } {
   if (bytes.byteLength <= MAX_DIAGNOSTIC_BYTES) return { value: redacted, truncated: false }
   const suffix = "\n[truncated]"
   return {
-    value: `${bytes.subarray(0, MAX_DIAGNOSTIC_BYTES - Buffer.byteLength(suffix)).toString("utf8")}${suffix}`,
+    value: `${truncateUtf8(redacted, MAX_DIAGNOSTIC_BYTES - Buffer.byteLength(suffix))}${suffix}`,
     truncated: true,
   }
 }
@@ -2598,6 +3169,298 @@ interface Probe<T> {
   error?: unknown
 }
 
+interface DiagnosticOutcome<T> {
+  value?: T
+  error?: unknown
+}
+
+interface DiagnosticBudget {
+  used: number
+  completed: number
+  timedOut: number
+}
+
+function startDiagnosticProbe<T>(
+  budget: DiagnosticBudget,
+  signal: AbortSignal,
+  _name: string,
+  operation: (signal: AbortSignal) => T | Promise<T>,
+): Promise<DiagnosticOutcome<T>> {
+  if (budget.used >= MAX_DIAGNOSTIC_PROBES) {
+    return Promise.resolve({ error: new SandboxError("diagnose", "diagnostic probe budget exceeded", "DIAGNOSTIC_PROBE_LIMIT") })
+  }
+  budget.used++
+  return new Promise<DiagnosticOutcome<T>>((resolve) => {
+    let settled = false
+    const finish = (outcome: DiagnosticOutcome<T>, timedOut = false) => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener("abort", onAbort)
+      budget.completed++
+      if (timedOut) budget.timedOut++
+      resolve(outcome)
+    }
+    const onAbort = () => finish({ error: diagnosticTimeoutError() }, true)
+    if (signal.aborted) {
+      onAbort()
+      return
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    let pending: Promise<T>
+    try {
+      pending = Promise.resolve(operation(signal))
+    } catch (error) {
+      finish({ error })
+      return
+    }
+    pending.then(
+      (value) => finish({ value }),
+      (error) => finish({ error }),
+    )
+  })
+}
+
+function diagnosticObservationProbe<T>(
+  outcome: DiagnosticOutcome<Probe<T>> | undefined,
+  source: SandboxObservation["source"],
+  freshAt: string,
+): Probe<T> {
+  if (!outcome) return unavailableDiagnosticProbe(source, freshAt)
+  if (outcome.error) return failedDiagnosticProbe(source, freshAt, outcome.error)
+  const probe = outcome.value
+  if (!probe) return unavailableDiagnosticProbe(source, freshAt)
+  if (!probe.error) return probe
+  const error = normalizeDiagnosticError(probe.error)
+  return { ...probe, error, observation: diagnosticFailureObservation(source, freshAt, error) }
+}
+
+function diagnosticProviderProbe(
+  outcome: DiagnosticOutcome<ProviderResourceObservation> | undefined,
+  freshAt: string,
+): Probe<ProviderResourceObservation> {
+  if (!outcome) return unavailableDiagnosticProbe("provider", freshAt)
+  if (outcome.error) return failedDiagnosticProbe("provider", freshAt, outcome.error)
+  if (!outcome.value) return unavailableDiagnosticProbe("provider", freshAt)
+  try {
+    return { value: outcome.value, observation: providerObservation(outcome.value, freshAt) }
+  } catch (error) {
+    return failedDiagnosticProbe("provider", freshAt, error)
+  }
+}
+
+function unavailableDiagnosticProbe<T>(source: SandboxObservation["source"], freshAt: string): Probe<T> {
+  return {
+    observation: {
+      source,
+      observed: false,
+      freshAt,
+      resource: "unknown",
+      ownership: "unknown",
+      health: "unknown",
+      evidence: [`${source} diagnostic inspection is unavailable`],
+    },
+  }
+}
+
+function failedDiagnosticProbe<T>(source: SandboxObservation["source"], freshAt: string, cause: unknown): Probe<T> {
+  const error = normalizeDiagnosticError(cause)
+  return { observation: diagnosticFailureObservation(source, freshAt, error), error }
+}
+
+function diagnosticFailureObservation(
+  source: SandboxObservation["source"],
+  freshAt: string,
+  error: unknown,
+): SandboxObservation {
+  const evidence = errorCode(error) === "DIAGNOSTIC_TIMEOUT" || errorCode(error) === "INSPECTION_TIMEOUT" || errorCode(error) === "WORKSPACE_HTTP_TIMEOUT"
+    ? "diagnostic probe timed out"
+    : `diagnostic probe failed:${errorCode(error)}`
+  return unknownObservation(source, freshAt, evidence)
+}
+
+function normalizeDiagnosticError(error: unknown): unknown {
+  return ["INSPECTION_TIMEOUT", "WORKSPACE_HTTP_TIMEOUT"].includes(errorCode(error))
+    ? diagnosticTimeoutError()
+    : error
+}
+
+function diagnosticTimeoutError(): SandboxError {
+  return new SandboxError("diagnose", "diagnostic probe timed out", "DIAGNOSTIC_TIMEOUT")
+}
+
+function diagnosticHandleObservation(session: RuntimeSession | undefined, freshAt: string): SandboxObservation {
+  return session
+    ? {
+        source: "handle",
+        observed: true,
+        freshAt,
+        resource: "present",
+        ownership: "verified",
+        health: "unknown",
+        evidence: ["in-memory runtime handle"],
+      }
+    : {
+        source: "handle",
+        observed: false,
+        freshAt,
+        resource: "unknown",
+        ownership: "unknown",
+        health: "unknown",
+        evidence: ["runtime handle inspection is unavailable"],
+      }
+}
+
+function diagnosticEffectiveTarget(
+  session: RuntimeSession | undefined,
+  provider: ProviderResourceObservation | undefined,
+): SandboxResultV2["effectiveTarget"] {
+  if (!session || provider?.resource !== "present" || provider.ownership !== "verified") return null
+  return { kind: "remote", resourceId: safeResourceId(provider.resourceId) }
+}
+
+function diagnosticErrors(
+  source: DiagnosticOutcome<DiagnosticVersionSources> | undefined,
+  infrastructure: DiagnosticOutcome<Record<string, unknown>> | undefined,
+  workspace: Probe<WorkspaceInfo>,
+  provider: Probe<ProviderResourceObservation>,
+  git: Probe<GitWorkingTreeObservation>,
+): unknown[] {
+  return [source?.error, infrastructure?.error, workspace.error, provider.error, git.error]
+    .filter((error): error is unknown => error !== undefined)
+    .map(normalizeDiagnosticError)
+}
+
+const DIAGNOSTIC_HOOK_FIELDS: readonly [string, readonly string[]][] = [
+  ["configured", ["configured"]],
+  ["status", ["status"]],
+  ["code", ["code"]],
+  ["stage", ["stage"]],
+  ["message", ["message"]],
+  ["summary", ["summary"]],
+  ["healthy", ["healthy"]],
+  ["version", ["version"]],
+  ["resource", ["resource"]],
+  ["resourceId", ["resourceId", "resourceid", "resource_id", "resource-id"]],
+  ["ownership", ["ownership"]],
+  ["health", ["health"]],
+  ["observed", ["observed"]],
+  ["liveness", ["liveness"]],
+  ["process", ["process"]],
+  ["resultCode", ["resultCode", "resultcode", "result_code", "result-code"]],
+  ["evidence", ["evidence"]],
+  ["nested", ["nested"]],
+]
+
+interface DiagnosticHookBudget {
+  entries: number
+  work: number
+  truncated: boolean
+}
+
+function diagnosticHookDetails(value: unknown): Record<string, unknown> {
+  const details: Record<string, unknown> = { configured: true }
+  const budget: DiagnosticHookBudget = { entries: 0, work: 0, truncated: false }
+  const sanitized = diagnosticHookValue(value, 0, budget)
+  if (isRecord(sanitized)) Object.assign(details, sanitized)
+  // The hook is a fixed projection, so omitted fields make the result partial even below the caps.
+  if (isRecord(value) || budget.truncated) details.truncated = true
+  return details
+}
+
+function diagnosticHookValue(value: unknown, depth: number, budget: DiagnosticHookBudget): unknown {
+  if (depth > MAX_DIAGNOSTIC_HOOK_DEPTH) {
+    budget.truncated = true
+    return undefined
+  }
+  if (!useDiagnosticHookWork(budget)) return undefined
+  if (typeof value === "string") return diagnosticHookString(value, budget)
+  if (typeof value === "boolean") return value
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
+  if (!isRecord(value)) return undefined
+  const result: Record<string, unknown> = {}
+  for (const [outputKey, inputKeys] of DIAGNOSTIC_HOOK_FIELDS) {
+    if (budget.entries >= MAX_DIAGNOSTIC_HOOK_ENTRIES) {
+      budget.truncated = true
+      break
+    }
+    let item: unknown
+    let present = false
+    for (const inputKey of inputKeys) {
+      if (!useDiagnosticHookWork(budget)) break
+      try {
+        item = value[inputKey]
+      } catch {
+        budget.truncated = true
+        continue
+      }
+      if (item !== undefined) {
+        present = true
+        break
+      }
+    }
+    if (!present) continue
+    const safe = outputKey === "evidence" && Array.isArray(item)
+      ? diagnosticHookEvidence(item, budget)
+      : diagnosticHookValue(item, depth + 1, budget)
+    if (safe !== undefined) {
+      result[outputKey] = safe
+      budget.entries++
+    }
+  }
+  return result
+}
+
+function diagnosticHookEvidence(value: readonly unknown[], budget: DiagnosticHookBudget): string[] {
+  const result: string[] = []
+  let length = 0
+  try {
+    length = value.length
+  } catch {
+    budget.truncated = true
+    return result
+  }
+  const limit = Math.min(length, MAX_OPERATION_JOURNAL_EVIDENCE_REFS)
+  if (length > limit) budget.truncated = true
+  for (let index = 0; index < limit; index++) {
+    if (!useDiagnosticHookWork(budget)) break
+    let item: unknown
+    try {
+      item = value[index]
+    } catch {
+      budget.truncated = true
+      continue
+    }
+    const safe = diagnosticHookValue(item, MAX_DIAGNOSTIC_HOOK_DEPTH, budget)
+    if (typeof safe === "string") result.push(safe)
+  }
+  return result
+}
+
+function diagnosticHookString(value: string, budget: DiagnosticHookBudget): string {
+  const scanned = value.slice(0, MAX_DIAGNOSTIC_HOOK_STRING_SCAN_CHARS)
+  const bounded = truncateUtf8(scanned, MAX_DIAGNOSTIC_HOOK_STRING_BYTES)
+  if (bounded.length < scanned.length || scanned.length < value.length) budget.truncated = true
+  return safeDiagnosticText(bounded)
+}
+
+function useDiagnosticHookWork(budget: DiagnosticHookBudget): boolean {
+  if (budget.work >= MAX_DIAGNOSTIC_HOOK_WORK) {
+    budget.truncated = true
+    return false
+  }
+  budget.work++
+  return true
+}
+
+function safeGitObservation(value: GitWorkingTreeObservation): Record<string, unknown> {
+  return {
+    head: typeof value.head === "string" ? safeDiagnosticText(value.head) : null,
+    branch: typeof value.branch === "string" ? safeDiagnosticText(value.branch) : null,
+    dirty: typeof value.dirty === "boolean" ? value.dirty : null,
+    evidence: safeEvidence(value.evidence),
+  }
+}
+
 function successResponse(
   operation: PublicOperation,
   record: SandboxRecord | undefined,
@@ -2649,7 +3512,7 @@ function boundResponse(response: SandboxResponse): SandboxResponse {
   if (Buffer.byteLength(JSON.stringify(response)) < MAX_RESPONSE_BYTES) return response
   const { details: _details, ...withoutDetails } = response
   const base = { ...withoutDetails, message: "response exceeded the control-channel size limit" }
-  const previewSource = response.details === undefined ? response.message : JSON.stringify(response.details)
+  const previewSource = diagnosticSummaryFromDetails(response.details) ?? (response.details === undefined ? response.message : JSON.stringify(response.details))
   const preview = boundedText(previewSource).value
   const bounded = { ...base, details: { truncated: true, preview } }
   if (Buffer.byteLength(JSON.stringify(bounded)) < MAX_RESPONSE_BYTES) return bounded
@@ -2728,6 +3591,190 @@ function recordDetails(record: SandboxRecord | undefined): Record<string, unknow
     ...(Object.keys(recoveryMetadata).length > 0 ? { recoveryMetadata } : {}),
     ...(record.preservedWorktreePath ? { preservedWorktreePath: record.preservedWorktreePath } : {}),
   }
+}
+
+function diagnosticBundle(
+  record: SandboxRecord | undefined,
+  plan: ObservationPlan | undefined,
+  role: CapabilityRole,
+  versions: DiagnosticVersionSources,
+  generatedAt: string,
+  errors: readonly unknown[],
+  budget: DiagnosticBudget,
+): Record<string, unknown> {
+  const provider = plan?.provider.value ? safeProviderResource(plan.provider.value) : undefined
+  const process = plan?.process ?? unknownProcessObservation("process ownership inspection is unavailable")
+  const summary = diagnosticSummary(record, plan, provider)
+  const workspace = plan?.workspace
+  const providerObservation = plan?.provider
+
+  return {
+    schemaVersion: 1,
+    generatedAt,
+    summary,
+    capabilities: {
+      role,
+      readOnly: true,
+      providerInspection: Boolean(providerObservation?.observation.observed),
+      workspaceInspection: Boolean(workspace?.observation.observed),
+      gitInspection: Boolean(plan?.git.observation.observed),
+      processOwnership: process.observed,
+      restart: "unknown",
+    },
+    limits: {
+      maxSeconds: 30,
+      maxProbes: MAX_DIAGNOSTIC_PROBES,
+      maxResponseBytes: 64 * 1024,
+      maxDiagnosticBytes: MAX_DIAGNOSTIC_BYTES,
+      maxJournalEntries: 32,
+      maxJournalBytes: 16 * 1024,
+    },
+    results: {
+      versions: {
+        configured: diagnosticVersion(versions.configured, "sandbox configuration", generatedAt),
+        local: diagnosticVersion(versions.local, "host OpenCode health/source", generatedAt),
+        dependency: diagnosticVersion(versions.dependency, "@opencode-ai/plugin package metadata", generatedAt),
+        remote: diagnosticVersion(provider?.remoteVersion, "provider health observation", generatedAt),
+      },
+      identities: {
+        lifecycle: record
+          ? {
+              sessionId: record.sessionId,
+              projectId: record.projectId,
+              workspaceId: record.workspaceId,
+              generation: record.generation,
+            }
+          : null,
+        provider: record
+          ? {
+              provider: record.provider,
+              resourceId: safeResourceId(provider?.resourceId ?? runtimeResourceReference(record)?.resourceId ?? "unknown"),
+              vmName: record.vmName ?? null,
+              vmIdentity: record.vmIdentity ? safeVmIdentity(record.vmIdentity) : null,
+            }
+          : null,
+        workspace: workspace?.value ? safeWorkspaceInfo(workspace.value) : null,
+      },
+      state: {
+        observed: Boolean(record),
+        desiredLocation: record?.desiredLocation ?? null,
+        phase: record?.phase ?? null,
+        compatibilityState: record ? publicState(record) : null,
+        operation: record?.operation
+          ? {
+              kind: record.operation.kind,
+              phase: safeDiagnosticText(record.operation.phase),
+              requestId: record.operation.requestId ?? null,
+              force: record.operation.force ?? null,
+              providerDestroyed: record.operation.providerDestroyed ?? null,
+            }
+          : null,
+        lastError: record?.lastError
+          ? {
+              stage: safeDiagnosticText(record.lastError.stage),
+              code: record.lastError.code ?? null,
+              message: safeDiagnosticText(record.lastError.message),
+            }
+          : null,
+      },
+      operationJournal: diagnosticJournal(record?.journal),
+      workspaceAssociation: diagnosticObservation(workspace?.observation, workspace?.value ? safeWorkspaceInfo(workspace.value) : null, generatedAt),
+      providerObservation: diagnosticObservation(providerObservation?.observation, provider ?? null, generatedAt),
+      gitObservation: diagnosticObservation(plan?.git.observation, plan?.git.value ? safeGitObservation(plan.git.value) : null, generatedAt),
+      processOwnership: safeProcessObservation(process),
+      probeBudget: {
+        max: MAX_DIAGNOSTIC_PROBES,
+        used: budget.used,
+        completed: budget.completed,
+        timedOut: budget.timedOut,
+      },
+      summary,
+      errors: errors.map(errorCode),
+    },
+  }
+}
+
+function diagnosticVersion(value: unknown, provenance: string, freshAt: string): Record<string, unknown> {
+  const observed = typeof value === "string" && isSafeDiagnosticVersion(value)
+  return {
+    value: observed ? value : null,
+    observed,
+    provenance,
+    freshAt,
+  }
+}
+
+function diagnosticObservation(
+  observation: SandboxObservation | undefined,
+  value: unknown,
+  freshAt: string,
+): Record<string, unknown> {
+  return {
+    observed: observation?.observed ?? false,
+    freshAt: observation?.freshAt ?? freshAt,
+    resource: observation?.resource ?? "unknown",
+    ownership: observation?.ownership ?? "unknown",
+    health: observation?.health ?? "unknown",
+    evidence: safeEvidence(observation?.evidence ?? []),
+    value,
+  }
+}
+
+function diagnosticJournal(entries: readonly SandboxJournalEntry[] | undefined): SandboxJournalEntry[] {
+  return (entries ?? []).map((entry) => ({
+    requestId: entry.requestId,
+    operation: entry.operation,
+    startedAt: safeDiagnosticText(entry.startedAt),
+    ...(entry.endedAt !== undefined ? { endedAt: safeDiagnosticText(entry.endedAt) } : {}),
+    resultCode: safeDiagnosticText(entry.resultCode),
+    evidence: safeEvidence(entry.evidence.map(safeDiagnosticText)),
+  }))
+}
+
+function safeProcessObservation(value: ProcessOwnershipObservation): ProcessOwnershipObservation {
+  return {
+    observed: value.observed === true,
+    process: value.process === "present" || value.process === "absent" ? value.process : "unknown",
+    ownership: value.ownership === "verified" || value.ownership === "conflict" ? value.ownership : "unknown",
+    liveness: value.liveness === "running" || value.liveness === "exited" ? value.liveness : "unknown",
+    ...(typeof value.pid === "number" && Number.isSafeInteger(value.pid) && value.pid > 0 ? { pid: value.pid } : {}),
+    evidence: safeEvidence(value.evidence),
+  }
+}
+
+function safeWorkspaceInfo(value: WorkspaceInfo): Record<string, unknown> {
+  return {
+    id: safeResourceId(value.id),
+    type: safeDiagnosticText(value.type),
+    name: safeDiagnosticText(value.name),
+    branch: value.branch === null ? null : safeDiagnosticText(value.branch),
+    directory: value.directory === null ? null : safeDiagnosticText(value.directory),
+    projectId: safeResourceId(value.projectID),
+  }
+}
+
+function safeVmIdentity(value: VmIdentity): Record<string, unknown> {
+  return {
+    id: value.id ? safeResourceId(value.id) : null,
+    name: safeDiagnosticText(value.name),
+    region: value.region ? safeDiagnosticText(value.region) : null,
+    tags: value.tags.map(safeDiagnosticText).slice(0, 16),
+  }
+}
+
+function diagnosticSummary(
+  record: SandboxRecord | undefined,
+  plan: ObservationPlan | undefined,
+  provider: ProviderResourceObservation | undefined,
+): string {
+  return [
+    `provider=${record?.provider ?? "unknown"}`,
+    `state=${record ? publicState(record) : "local"}`,
+    `classification=${plan?.classification ?? "unknown"}`,
+    `resource=${provider?.resource ?? "unknown"}`,
+    `ownership=${provider?.ownership ?? "unknown"}`,
+    `health=${provider?.health ?? "unknown"}`,
+  ].join(" ")
 }
 
 function sessionFor(record: SandboxRecord | undefined): SandboxResultV2["session"] {
@@ -3126,6 +4173,7 @@ function safeProviderResource(value: ProviderResourceObservation): ProviderResou
     resource: value.resource,
     ownership: value.ownership,
     health: value.health,
+    ...(value.remoteVersion && isSafeDiagnosticVersion(value.remoteVersion) ? { remoteVersion: value.remoteVersion } : {}),
     evidence: safeEvidence(value.evidence),
   }
 }
@@ -3355,28 +4403,56 @@ function boundedItems<T>(values: readonly T[], maxBytes: number): { values: T[];
 
 function safeEvidence(values: readonly unknown[]): string[] {
   const output: string[] = []
-  let bytes = 0
-  for (const value of values.slice(0, 8)) {
-    const text = safePublicText(String(value)).slice(0, 256)
-    const size = Buffer.byteLength(text)
-    if (bytes + size > 4_096) break
+  for (const value of values.slice(0, MAX_OPERATION_JOURNAL_EVIDENCE_REFS)) {
+    const text = truncateUtf8(safePublicText(String(value)), MAX_OPERATION_JOURNAL_STRING_BYTES)
+    if (Buffer.byteLength(JSON.stringify([...output, text])) > MAX_OPERATION_JOURNAL_EVIDENCE_BYTES) break
     output.push(text)
-    bytes += size
   }
   return output
 }
 
 function safeResourceId(value: string): string {
-  const text = safePublicText(value).slice(0, 128)
+  const text = truncateUtf8(safePublicText(value), 128)
   return text || "unknown"
 }
 
 function safePublicText(value: string): string {
-  return redactText(value).replace(/https?:\/\/[^\s]+/gi, "[REDACTED_URL]")
+  return redactText(value)
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let bytes = 0
+  let length = 0
+  for (const character of value) {
+    const size = Buffer.byteLength(character)
+    if (bytes + size > maxBytes) break
+    bytes += size
+    length += character.length
+  }
+  return value.slice(0, length)
+}
+
+function safeDiagnosticText(value: string): string {
+  return safePublicText(value).replace(/(headers?|argv|env|logs?|stdout|stderr|raw)\s*[=:]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, "$1=[REDACTED]")
+}
+
+function isSafeDiagnosticVersion(value: string): boolean {
+  return value.length > 0 && value.length <= 128 && /^[A-Za-z0-9._-]+$/.test(value)
+}
+
+function diagnosticSummaryFromDetails(details: Record<string, unknown> | undefined): string | undefined {
+  if (!details) return undefined
+  if (typeof details.summary === "string") return details.summary
+  const results = details.results
+  return isRecord(results) && typeof results.summary === "string" ? results.summary : undefined
 }
 
 function errorCode(error: unknown): string {
   return error instanceof SandboxError ? error.code : "SANDBOX_ERROR"
+}
+
+function requestIdReused(): SandboxError {
+  return new SandboxError("validate", "request ID has already been used", "REQUEST_ID_REUSED")
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

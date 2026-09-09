@@ -6,6 +6,7 @@ import { preparePrivateSocket } from "./secure-fs"
 import { redactError } from "./redaction"
 import {
   SandboxError,
+  isRequestId,
   isSandboxOperation,
   isRecord,
   type AuthorizedControlRequest,
@@ -175,16 +176,18 @@ export class ControlChannel {
     } catch (error) {
       const sandboxError = error instanceof SandboxError ? error : new SandboxError("validate", "invalid control request", "REQUEST_SCHEMA")
       const operation = isRecord(body) && isSandboxOperation(body.operation) ? body.operation : "status"
-      send(400, errorResponse(operation, sandboxError.stage, sandboxError.message, sandboxError.code), operation)
+      const requestId = isRecord(body) && isRequestId(body.requestId) ? body.requestId : undefined
+      send(400, errorResponse(operation, sandboxError.stage, sandboxError.message, sandboxError.code, requestId), operation)
       return
     }
 
+    const requestId = controlRequest.requestId ?? randomUUID()
     try {
-      const result = await this.handler({ ...controlRequest, capability })
-      send(result.ok ? 200 : 409, normalizeResponse(result, controlRequest.operation), controlRequest.operation)
+      const result = await this.handler({ ...controlRequest, requestId, capability })
+      send(result.ok ? 200 : 409, normalizeResponse(result, controlRequest.operation, requestId), controlRequest.operation)
     } catch (error) {
       const sandboxError = error instanceof SandboxError ? error : new SandboxError("control_channel", redactError(error), "SANDBOX_ERROR")
-      send(500, errorResponse(controlRequest.operation, sandboxError.stage, sandboxError.message, sandboxError.code), controlRequest.operation)
+      send(500, errorResponse(controlRequest.operation, sandboxError.stage, sandboxError.message, sandboxError.code, requestId), controlRequest.operation)
     }
   }
 
@@ -203,13 +206,20 @@ export class ControlChannel {
 export function parseControlRequest(value: unknown, capability: ControlCapability): ControlRequest {
   if (!isRecord(value)) throw new SandboxError("validate", "control request must be an object", "REQUEST_SCHEMA")
   const keys = Object.keys(value).sort()
-  const allowedKeys = value.force === undefined ? ["operation"] : ["force", "operation"]
+  const allowedKeys = [
+    ...(value.force === undefined ? [] : ["force"]),
+    "operation",
+    ...(value.requestId === undefined ? [] : ["requestId"]),
+  ].sort()
   if (keys.length !== allowedKeys.length || !keys.every((key, index) => key === allowedKeys[index])) {
     throw new SandboxError("validate", "control request contains unsupported fields", "REQUEST_FIELDS")
   }
   if (!isSandboxOperation(value.operation)) throw new SandboxError("validate", "control operation is invalid", "REQUEST_OPERATION")
   if (value.force !== undefined && typeof value.force !== "boolean") {
     throw new SandboxError("validate", "control force flag is invalid", "REQUEST_FORCE")
+  }
+  if (value.requestId !== undefined && !isRequestId(value.requestId)) {
+    throw new SandboxError("validate", "control request ID is invalid", "REQUEST_ID")
   }
   const force = value.force ?? false
   const scope = capability.scope ?? "session"
@@ -231,7 +241,11 @@ export function parseControlRequest(value: unknown, capability: ControlCapabilit
   if (value.operation === "recover" && capability.role !== "host") {
     throw new SandboxError("validate", "recover is only authorized from the host", "REQUEST_RECOVER")
   }
-  return { operation: value.operation, force }
+  return {
+    operation: value.operation,
+    force,
+    ...(value.requestId !== undefined ? { requestId: value.requestId } : {}),
+  }
 }
 
 async function readJson(request: IncomingMessage, maxBytes: number): Promise<unknown> {
@@ -261,7 +275,7 @@ function equalSecret(expected: string, actual: string): boolean {
 
 async function defaultHandler(request: AuthorizedControlRequest): Promise<SandboxResponse> {
   return {
-    ...emptyResponse(request.operation, true, `${request.operation} accepted`, null),
+    ...emptyResponse(request.operation, true, `${request.operation} accepted`, null, request.requestId),
     state: "local",
     sessionId: request.capability.sessionId,
   }
@@ -272,9 +286,10 @@ function errorResponse(
   stage: string,
   message: string,
   code: string,
+  requestId?: string,
 ): SandboxResponse {
   return {
-    ...emptyResponse(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }),
+    ...emptyResponse(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }, requestId),
     state: "error",
     stage,
   }
@@ -285,11 +300,12 @@ function emptyResponse(
   ok: boolean,
   message: string,
   error: SandboxResponse["error"],
+  requestId: string = randomUUID(),
 ): SandboxResponse {
   const freshAt = new Date().toISOString()
   return {
     schemaVersion: 2,
-    requestId: randomUUID(),
+    requestId,
     ok,
     operation,
     message: redactError(message),
@@ -318,13 +334,13 @@ function emptyResponse(
   }
 }
 
-function normalizeResponse(value: SandboxResponse, operation: ControlRequest["operation"]): SandboxResponse {
+function normalizeResponse(value: SandboxResponse, operation: ControlRequest["operation"], requestId: string): SandboxResponse {
   const message = typeof value.message === "string" ? value.message : `${operation} accepted`
   const normalized: SandboxResponse = {
     ...emptyResponse(operation, typeof value.ok === "boolean" ? value.ok : false, message, null),
     ...value,
     schemaVersion: 2,
-    requestId: typeof value.requestId === "string" ? value.requestId : randomUUID(),
+    requestId,
     operation: typeof value.operation === "string" ? value.operation : operation,
     ok: typeof value.ok === "boolean" ? value.ok : false,
     message: redactError(message),

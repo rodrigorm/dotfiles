@@ -64,7 +64,7 @@ projectId + sessionId + generation + workspaceId + provider
 
 `baseSha` and `branch` bind the Git lineage. Provider metadata binds the external resource. A control capability binds `sessionId`, `generation`, and role. Any destructive operation must establish this chain from the lifecycle record to the observed resource.
 
-SBX and exe.dev require this tuple to match the provider's observed resource metadata before reuse, stop, or destruction. New SBX resources store the tuple and a random ownership ID in an external marker read through `sbx cp`; read-only inspection can therefore verify ownership after restart without starting a stopped sandbox. Legacy fingerprint-only markers remain verifiable only by their creating process. Names are conveniences, not proof of ownership. Cloudflare currently checks this tuple only in the live provider instance; it has no resource inspection, inventory, or runtime-adoption adapter, so a Cloudflare provider observation remains unavailable or unknown.
+SBX and exe.dev require this tuple to match the provider's observed resource metadata before reuse, stop, or destruction. New SBX resources store the tuple and a random ownership ID in an external marker read through `sbx cp`; read-only inspection can therefore verify ownership after restart without starting a stopped sandbox. Legacy fingerprint-only markers remain verifiable only by their creating process. Names are conveniences, not proof of ownership. Cloudflare can inspect a known sandbox while its live adapter exists, but its bridge has no durable owner lookup or inventory, so post-restart provider ownership remains unavailable or unknown.
 
 ## Authoritative state
 
@@ -94,6 +94,12 @@ The disk and response schemas are intentionally different:
 Legacy records that contain only `state` are validated, deterministically mapped to schema-1 intent and phase, and rewritten under the per-session state lock. The rewrite is atomic: the store writes and syncs a private temporary file, then renames it into place. Migration is idempotent, does not probe a provider, and returns the compatibility state for the current response. A schema-1 record with an extra legacy `state` field still uses canonical intent; the next normal write removes that non-canonical field.
 
 `desiredLocation` and `phase` are durable intent. Control, resource, ownership, health, classification, and effective target are observations or derivations and are not durable truth. An `observed: false` or unknown response entry is not evidence of absence. In particular, a persisted `remote` intent or compatibility `state` never proves that a runtime exists, is healthy, or is stopped.
+
+### Failure evidence
+
+When an eligible mutating request (`start`, `stop`, `delete`, `retry`, `recover`, or `repair`) reaches a lifecycle record, it appends a journal entry using the validated control request ID. The entry is persisted as `PENDING` before lifecycle mutation; a synchronous completion adds `endedAt`, a result code, and bounded evidence. Start, stop, and normal delete may return at an idle boundary, so the idle handler completes the same entry later. A pending entry is not evidence of success. Read-only operations do not append entries, and a retry receives a new request ID while retaining the earlier entry.
+
+The journal retains only the newest 32 entries and stays below 16 KiB. Each text value is capped at 256 bytes, evidence at eight references and 4 KiB, and state-store writes redact credential-shaped values. It is a reconstruction index, not a copy of provider or OpenCode logs. A failed operation can be reconstructed only while its lifecycle record and retained entry exist; a resource created before its ID reached the record remains unattributed and unknown-safe.
 
 ## Phase 1 decision contract
 
@@ -129,9 +135,11 @@ Every normal control response is a `SandboxResultV2` with `schemaVersion: 2`. Th
 | `status` | Lifecycle record read only | File-read latency; provider, workspace, handle, and Git sources remain `observed: false`. |
 | Session `inspect` | At most one controller probe each for workspace, provider, Git, and runtime target; probes run in parallel | Each controller probe has a 5-second deadline. A timeout or unavailable ownership/resource adapter yields unknown or unobserved evidence and does not authorize a new start or destructive ownership action. There is no separate 15-second aggregate budget. |
 | Project `inventory` | One lifecycle-record scan and one configured-provider listing; no per-resource deep probes | Provider listing has a 10-second deadline. Records remain available if provider inventory fails; provider scope is unknown when resources cannot be tied to the requested project. |
-| `diagnose` | Explicit configured diagnostics, separate from `inspect` | The lifecycle controller supplies no generic probe-count or wall-clock budget for diagnostics. Returned details are still redacted and bounded; an unconfigured hook returns `{ "configured": false }`. |
+| `diagnose` | Fixed diagnostic bundle plus optional configured diagnostics, separate from `inspect` | The bundle reports a five-probe/30-second diagnostic budget. Returned details are redacted and bounded; an unconfigured optional hook returns `{ "configured": false }`. |
 
-Provider inspection is currently available through the exe.dev and SBX adapters. SBX inspection checks an exact inventory match and its ownership marker; exe.dev inspection checks an exact durable VM identity and owner tag. The `RuntimeDriver` seam has five methods: `inspect`, `adopt`, `sync`, `close`, and `destroy`. The default SBX and exe.dev Sandcastle factories wire production drivers: recovery requires one exact live inventory entry, durable ownership proof, and a safe matching checkout; SBX also requires its published OpenCode port, while exe.dev rebuilds a fresh SSH supervisor and tunnel. Cloudflare has no resource inspection, inventory, or runtime-adoption adapter, so it remains unsupported for recovery.
+Provider inspection is currently available through the exe.dev and SBX adapters and through the live Cloudflare adapter. SBX inspection checks an exact inventory match and its ownership marker; exe.dev inspection checks an exact durable VM identity and owner tag; Cloudflare inspection is limited to a known sandbox's running state, while `diagnose` may add active health. The `RuntimeDriver` seam has five methods: `inspect`, `adopt`, `sync`, `close`, and `destroy`. The default SBX and exe.dev Sandcastle factories wire production drivers: recovery requires one exact live inventory entry, durable ownership proof, and a safe matching checkout; SBX also requires its published OpenCode port, while exe.dev rebuilds a fresh SSH supervisor and tunnel. Cloudflare has no durable post-restart lookup or runtime-adoption adapter, so it remains unsupported for recovery.
+
+`diagnose` combines the retained journal with one bounded fresh observation bundle. It is the only read path that adds active provider health/version probes; normal `inspect` remains inventory/marker-only. Version values identify their provenance: configured values come from sandbox configuration, local values from the host OpenCode source, dependency values from package metadata, and remote values only from a provider health observation. Every value carries `observed` and `freshAt`; a missing source is `null` rather than an inferred version. The optional diagnostic hook is additive, redacted, and capped; it is not authoritative and cannot restore discarded journal entries. Process ownership covers only a tracked runtime handle, not a system-wide process scan. Cloudflare's live known-resource result remains read-only because its post-restart owner lookup is unavailable.
 
 ### Classifications and actions
 
@@ -147,7 +155,7 @@ Provider inspection is currently available through the exe.dev and SBX adapters.
 | `work_at_risk` | The compatibility projection is `sync_failed` or the durable record has a sync error | Retry the recorded operation when it is present and allowed; preserve work before any discard. |
 | `unknown` | Required evidence is missing, unavailable, or inconsistent without a more specific safe classification | Inspect again or require an operator; no inferred provider action. |
 
-The action list is authoritative. `recommendedAction` must be present in `allowedActions` when non-null. A post-restart active or control-lost runtime can be recovered or deleted only through an injected runtime driver after exact resource and ownership verification; Cloudflare remains explicitly unsupported. Host `repair` can reconcile only a stale control-plane record after fresh provider and runtime-handle absence plus an absent or exactly owned workspace registration. Orphan deletion adopts before preservation, rechecks ownership immediately before destruction, and persists the destruction phase so retries do not repeat it. Recovery itself never destroys a provider resource.
+The action list is authoritative. `recommendedAction` must be present in `allowedActions` when non-null. A post-restart active or control-lost runtime can be recovered or deleted only through an injected runtime driver after exact resource and ownership verification; Cloudflare remains explicitly unsupported for recovery and destruction. Host `repair` can reconcile only a stale control-plane record after fresh provider and runtime-handle absence plus an absent or exactly owned workspace registration. Orphan deletion adopts before preservation, rechecks ownership immediately before destruction, and persists the destruction phase so retries do not repeat it. Recovery itself never destroys a provider resource.
 
 ### Output bounds
 
@@ -202,11 +210,11 @@ State files reject credential-shaped keys, use private permissions, write atomic
 |---|---|---|---|---|
 | `sbx` | Docker Sandbox clone | Published OpenCode port plus supervised SSH control proxy | `sbx` CLI and Docker Sandbox support | Session inspect plus project inventory; inspect reads the durable ownership marker |
 | `exedev` | exe.dev VM | SSH and remote control socket | exe.dev access, SSH lobby, pinned host key | Session inspect plus project inventory; inspect matches durable VM identity and owner tag |
-| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Unsupported after restart: no provider inspect, inventory, or runtime-adoption adapter; observations stay unavailable or unknown |
+| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter |
 
 All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
 
-The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare needs a bridge resource lookup returning the durable sandbox ID and owner tuple plus a runtime driver before it can support recovery or post-restart deletion; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map. Cloudflare therefore never receives an inferred destructive action.
+The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare needs a bridge resource lookup returning durable owner metadata plus a runtime driver before it can support recovery or post-restart deletion; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map. Its live inspection is read-only and never receives an inferred destructive action.
 
 ## Configuration
 
@@ -217,7 +225,7 @@ Configuration precedence, lowest to highest:
 3. The JSON object in `SANDBOX_CONFIG`.
 4. `SANDBOX_PROVIDER` for provider selection.
 
-This repository selects `sbx` and OpenCode `1.18.25` in `.opencode/sandbox.json`. The tracked plugin dependency and default remote version remain `1.18.23`; the project override is deliberate. Current diagnostics do not expose this drift; it is outside the Phase 1 inspection contract.
+This repository selects `sbx` and OpenCode `1.18.25` in `.opencode/sandbox.json`. The tracked plugin dependency and default remote version remain `1.18.23`; the project override is deliberate. `/sandbox diagnose` reports these configured, dependency, and observed remote version sources when available, without inferring a missing local version.
 
 `OPENCODE_EXPERIMENTAL_WORKSPACES=1` enables the OpenCode workspace hooks. `home/.bashrc.d/20-opencode.sh` sets it for interactive shells.
 
@@ -257,13 +265,13 @@ The Bun tests are the executable sandbox contract. `make test` validates the wid
 The current implementation has documented gaps, not hidden assumptions:
 
 - Plugin disposal syncs and closes owned remote Sandcastle sessions and cancels pending idle work, but it does not yet persist a provider-observed final state.
-- The Cloudflare production factory does not yet inject a runtime driver, so restarted Cloudflare runtimes remain inspect-only. The bridge has no resource lookup that returns durable owner metadata, and the provider's ownership map is process-local; add that bridge contract before recovery can prove a persisted sandbox ID belongs to the session. The default SBX and exe.dev factories recover only running resources with exact durable ownership proof; a detached, verified, preserved leak is still the separate deletion path.
-- SBX ownership can be inspected after restart from its durable marker, and exe.dev from durable VM identity and owner metadata. Recovery and orphan deletion create only fresh local credentials, ports, and supervisors; provider mutation remains gated by exact ownership observations. Cloudflare has no provider inspection or inventory adapter and remains unknown-safe.
+- The Cloudflare production factory does not yet inject a runtime driver, so restarted Cloudflare runtimes remain inspect-only with unknown provider ownership. The bridge has no resource lookup that returns durable owner metadata, and the provider's ownership map is process-local; add that bridge contract before recovery can prove a persisted sandbox ID belongs to the session. The default SBX and exe.dev factories recover only running resources with exact durable ownership proof; a detached, verified, preserved leak is still the separate deletion path.
+- SBX ownership can be inspected after restart from its durable marker, and exe.dev from durable VM identity and owner metadata. Recovery and orphan deletion create only fresh local credentials, ports, and supervisors; provider mutation remains gated by exact ownership observations. Cloudflare's live adapter can report a known resource's running/health state but remains unknown-safe after restart.
 - The legacy direct SBX path cannot resume a detached runtime under a new generation; it fails closed. The default Sandcastle path can adopt an exact running runtime without recreating it, but stopped runtimes remain unsupported.
 - A missing Sandcastle handle during reconciliation remains unchanged when provider or workspace evidence is unavailable or conflicting; recovery remains unavailable without a runtime driver.
 - Provider cleanup failure before workspace registration can leave a resource whose ID never reached the lifecycle record.
 - Unsupported provider inspection returns unknown observations and no destructive action.
-- Default `diagnose` reports only that diagnostics are not configured.
+- Default `diagnose` returns a fixed, bounded, redacted bundle; an optional configured diagnostics hook contributes additional bounded details.
 
 The remaining provider-seam work and concise completion summary live in [`history/opencode-sandbox-agent-system-plan.md`](../history/opencode-sandbox-agent-system-plan.md).
 

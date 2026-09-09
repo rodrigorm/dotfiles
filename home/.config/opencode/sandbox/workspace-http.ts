@@ -158,13 +158,14 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
     })
   }
 
-  async inspect(input: { workspaceId: string; directory: string }): Promise<WorkspaceInfo | undefined> {
+  async inspect(input: { workspaceId: string; directory: string; signal?: AbortSignal }): Promise<WorkspaceInfo | undefined> {
     try {
       const value = await this.request("/experimental/workspace", {
         method: "GET",
         directory: input.directory,
         workspace: input.workspaceId,
         timeoutMs: INSPECTION_TIMEOUT_MS,
+        signal: input.signal,
       })
       if (!Array.isArray(value)) throw new SandboxError("control_channel", "workspace list response is not an array", "WORKSPACE_SCHEMA")
       return value.map((entry) => parseWorkspaceInfo(entry, this.projectId)).find((info) => info.id === input.workspaceId)
@@ -211,6 +212,7 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
       workspace?: string
       body?: unknown
       timeoutMs?: number
+      signal?: AbortSignal
     },
   ): Promise<unknown> {
     const url = new URL(this.serverUrl)
@@ -222,7 +224,9 @@ export class HttpWorkspaceGateway implements WorkspaceGateway {
       }).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     ).toString()
 
-    const signal = createTimeoutSignal(options.timeoutMs ?? this.requestTimeoutMs)
+    const signal = options.signal
+      ? AbortSignal.any([options.signal, createTimeoutSignal(options.timeoutMs ?? this.requestTimeoutMs)])
+      : createTimeoutSignal(options.timeoutMs ?? this.requestTimeoutMs)
     try {
       const response = await waitForAbort(
         () => this.fetcher(url, {

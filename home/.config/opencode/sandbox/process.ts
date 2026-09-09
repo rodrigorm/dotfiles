@@ -1,6 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process"
 
-import { SandboxError, type ProcessHandle, type ProcessResult, type ProcessRunner, type ProcessSupervisor, type RunProcessInput } from "./types"
+import {
+  SandboxError,
+  type ProcessHandle,
+  type ProcessOwnershipObservation,
+  type ProcessResult,
+  type ProcessRunner,
+  type ProcessSupervisor,
+  type RunProcessInput,
+} from "./types"
 
 const DEFAULT_MAX_OUTPUT_BYTES = 1_048_576
 const TERMINATION_GRACE_MS = 3_000
@@ -11,6 +19,36 @@ export const nodeProcessRunner: ProcessRunner = {
 
 export const nodeProcessSupervisor: ProcessSupervisor = {
   start: startProcess,
+}
+
+export function trackedProcessObservation(handle: ProcessHandle | undefined, evidence = "tracked sandbox supervisor"): ProcessOwnershipObservation {
+  if (!handle) {
+    return {
+      observed: true,
+      process: "absent",
+      ownership: "verified",
+      liveness: "unknown",
+      evidence: [evidence, "no tracked process handle"],
+    }
+  }
+  return {
+    observed: true,
+    process: "present",
+    ownership: "verified",
+    liveness: handle.alive === undefined ? "unknown" : handle.alive ? "running" : "exited",
+    pid: Number.isSafeInteger(handle.pid) && handle.pid > 0 ? handle.pid : undefined,
+    evidence: [evidence, "tracked process handle"],
+  }
+}
+
+export function unknownProcessObservation(evidence: string): ProcessOwnershipObservation {
+  return {
+    observed: false,
+    process: "unknown",
+    ownership: "unknown",
+    liveness: "unknown",
+    evidence: [evidence],
+  }
 }
 
 export function sanitizeEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
@@ -211,6 +249,9 @@ export function startProcess(input: RunProcessInput): Promise<ProcessHandle> {
 
   return Promise.resolve({
     pid: child.pid,
+    get alive() {
+      return child.exitCode === null && child.signalCode === null
+    },
     result,
     terminate,
   })

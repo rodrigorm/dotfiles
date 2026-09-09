@@ -17,12 +17,14 @@ const FILE_READ_CHUNK_BYTES = 64 * 1024
 export async function inspectWorkingTree(
   directory: string,
   runner: ProcessRunner = nodeProcessRunner,
+  signal?: AbortSignal,
 ): Promise<GitWorkingTreeObservation> {
   assertDirectory(directory)
   const result = await runner.run({
     argv: ["git", "-C", directory, "status", "--porcelain=v2", "--branch", "--untracked-files=normal", "--"],
     cwd: directory,
     timeoutMs: 5_000,
+    signal,
     maxOutputBytes: MAX_INSPECTION_BYTES,
   })
   if (result.exitCode !== 0) throw new SandboxError("inspect", "could not inspect the Git worktree", "GIT_INSPECTION")

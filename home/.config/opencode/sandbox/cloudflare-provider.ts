@@ -10,6 +10,7 @@ import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-h
 import {
   assertSandboxId,
   CloudflareBridgeClient,
+  waitForAbort,
   type CloudflareSandboxClient,
   type CloudflareTunnelInfo,
 } from "./cloudflare-bridge"
@@ -17,6 +18,7 @@ import { basicAuthHeader } from "./remote-runtime"
 import { nodeProcessRunner, sanitizeEnvironment } from "./process"
 import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { redactError, redactText } from "./redaction"
+import { readLimitedBody } from "./workspace-http"
 import { requestControl } from "./cli"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
@@ -25,6 +27,7 @@ import {
   SandboxError,
   type ProcessResult,
   type ProcessRunner,
+  type ProviderResourceObservation,
   type WorkspaceInfo,
   type WorkspaceProviderBase,
   type WorkspaceRuntimeMetadata,
@@ -39,7 +42,6 @@ const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 600_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
-const MAX_HEALTH_RESPONSE_BYTES = 512 * 1024
 const TRANSFER_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-sandbox/transfers`
 
 const BOOTSTRAP = (version: string) => `set -eu
@@ -299,6 +301,59 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   runtimeMetadata(workspaceId: string): WorkspaceRuntimeMetadata | undefined {
     const activation = this.active.get(workspaceId)
     return activation ? { providerState: metadataFor(activation) } : undefined
+  }
+
+  async inspect(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation> {
+    const metadata = readMetadata(info)
+    const activation = this.active.get(info.id)
+    const sandboxId = activation?.sandboxId ?? metadata.sandboxId
+    if (!sandboxId) {
+      return {
+        resourceId: info.id,
+        resource: "unknown",
+        ownership: "unknown",
+        health: "unknown",
+        evidence: ["Cloudflare sandbox identity is unavailable"],
+      }
+    }
+
+    let running: boolean
+    try {
+      running = await this.client.running(sandboxId, signal)
+    } catch (error) {
+      if (isNotFound(error)) {
+        return { resourceId: sandboxId, resource: "absent", ownership: "unknown", health: "unknown", evidence: [`Cloudflare sandbox:${sandboxId}`] }
+      }
+      throw error
+    }
+
+    const ownership = sameOwner(this.owned.get(sandboxId), ownerFromMetadata(metadata)) ? "verified" as const : "unknown" as const
+    if (!running) {
+      return { resourceId: sandboxId, resource: "present", ownership, health: "degraded", evidence: [`Cloudflare sandbox:${sandboxId}`] }
+    }
+
+    return {
+      resourceId: sandboxId,
+      resource: "present",
+      ownership,
+      health: "unknown",
+      evidence: [`Cloudflare sandbox:${sandboxId}`],
+    }
+  }
+
+  async diagnose(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation> {
+    const observation = await this.inspect(info, signal)
+    const activation = this.active.get(info.id)
+    const health = activation && observation.resource === "present" && observation.health !== "degraded"
+      ? await this.activeHealth(activation, signal)
+      : undefined
+    if (!health) return observation
+    return {
+      ...observation,
+      ...(health.healthy === true ? { health: "healthy" as const } : {}),
+      ...(health.healthy === false ? { health: "degraded" as const } : {}),
+      ...(health.version ? { remoteVersion: health.version } : {}),
+    }
   }
 
   createIsolatedHandle(info: WorkspaceInfo): IsolatedSandboxHandle {
@@ -656,7 +711,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
           signal: controller.signal,
         })
         if (response.ok) {
-          const value = await readHealthResponse(response).catch(() => undefined)
+          const value = await readHealthResponse(response, controller.signal).catch(() => undefined)
           if (isRecord(value) && value.healthy === true) return
         }
       } catch {
@@ -667,6 +722,38 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       await delay(250)
     }
     throw new SandboxError("remote_health", "Cloudflare OpenCode health check timed out", "REMOTE_HEALTH_TIMEOUT")
+  }
+
+  private async activeHealth(activation: Activation, signal?: AbortSignal): Promise<{ healthy?: boolean; version?: string } | undefined> {
+    if (!activation.tunnel) return undefined
+    const tunnel = activation.tunnel
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 2_000)
+    const abort = () => controller.abort(signal?.reason)
+    signal?.addEventListener("abort", abort, { once: true })
+    try {
+      if (signal?.aborted) return undefined
+      const response = await waitForAbort(
+        () => this.fetcher(`${tunnel.url}/global/health`, {
+          headers: { Authorization: basicAuthHeader(activation.password) },
+          signal: controller.signal,
+        }),
+        controller.signal,
+        (lateResponse) => lateResponse.body?.cancel(),
+      )
+      if (!response.ok) return undefined
+      const value = await readHealthResponse(response, controller.signal)
+      if (!isRecord(value)) return undefined
+      return {
+        ...(typeof value.healthy === "boolean" ? { healthy: value.healthy } : {}),
+        ...(typeof value.version === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.version) ? { version: value.version } : {}),
+      }
+    } catch {
+      return undefined
+    } finally {
+      clearTimeout(timeout)
+      signal?.removeEventListener("abort", abort)
+    }
   }
 
   private async run(
@@ -797,27 +884,9 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   }
 }
 
-async function readHealthResponse(response: Response): Promise<unknown> {
-  if (!response.body) return undefined
-  const reader = response.body.getReader()
-  const chunks: Uint8Array[] = []
-  let size = 0
+async function readHealthResponse(response: Response, signal: AbortSignal): Promise<unknown> {
   try {
-    while (true) {
-      const next = await reader.read()
-      if (next.done) break
-      size += next.value.byteLength
-      if (size > MAX_HEALTH_RESPONSE_BYTES) {
-        await reader.cancel().catch(() => undefined)
-        return undefined
-      }
-      chunks.push(next.value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  try {
-    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks, size)))
+    return JSON.parse(await readLimitedBody(response, signal, "diagnose"))
   } catch {
     return undefined
   }
@@ -862,6 +931,8 @@ export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleA
       await provider.activate(input.workspaceId)
     },
     target: () => provider.target(info),
+    inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
+    diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
     close: () => provider.close(info),
   }

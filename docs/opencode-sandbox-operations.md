@@ -13,7 +13,7 @@ Inside an OpenCode session, use `/sandbox <operation>`. The command delegates to
 | Inventory this project | `/sandbox inventory` from the host | Project lifecycle records and provider resources are listed without mutation when a provider inventory adapter exists |
 | Move execution to a runtime | `/sandbox start` | Response says activation is pending or remote; the next message confirms the remote target |
 | Return execution to the host | `/sandbox stop` | A later status is `detached`, and preserved worktree details are reported if present |
-| Inspect a failure | `/sandbox diagnose` | Provider-safe details are captured when diagnostics are configured; `{ "configured": false }` means no diagnostics hook is configured |
+| Inspect a failure | `/sandbox diagnose` | A fixed, redacted diagnostic bundle is returned; optional configured-hook details are included, and `{ "configured": false }` means that hook is absent |
 | Repeat the recorded failed operation | `/sandbox retry` using the role in `allowedActions` | The recorded `start`, `stop`, `delete`, or `recover` operation is retried only when the typed action is advertised; start and force-delete retries require the host |
 | Recover a verified orphan | `/sandbox recover` from the host when advertised | The exact resource is adopted through the configured runtime driver and the existing workspace returns to `remote`; failed or stale recovery remains inspectable without destruction |
 | Reconcile a proved stale control-plane record | `/sandbox repair` from the host | State becomes `local` or `detached`; an exact stale workspace registration is removed and no provider resource is mutated |
@@ -37,9 +37,9 @@ Legacy state-only records are migrated on read under the per-session lock. The s
 | `status` | Lifecycle record read only | File-read latency; external sources are `observed: false`. |
 | Session `inspect` | One controller probe each for workspace, provider, Git, and runtime target, run in parallel | 5 seconds per probe. Timeout or unavailable provider evidence stays unknown and cannot authorize a new start or ownership-based destruction. There is no separate 15-second aggregate budget. |
 | Project `inventory` | One record scan and one configured-provider listing; no per-resource deep probes | 10 seconds for provider inventory. Records remain reportable when provider inventory fails or cannot be scoped to the project. |
-| `diagnose` | Configured diagnostics only | No generic controller probe-count or wall-clock budget. Returned details are redacted and capped at 48 KiB; an unconfigured hook returns `{ "configured": false }`. |
+| `diagnose` | Fixed bundle plus optional configured diagnostics | The bundle reports its five-probe/30-second diagnostic budget. Controller observations are bounded and redacted; optional hook details are capped at 48 KiB. An absent hook contributes `{ "configured": false }`. |
 
-Provider resource inspection and inventory are implemented for exe.dev and SBX. The default SBX and exe.dev Sandcastle runtime drivers adopt only one running resource with exact durable ownership proof and a matching checkout; SBX also requires a published port, while exe.dev creates fresh local SSH/tunnel state after proof. Legacy markers, stopped or unknown status, timeouts, and conflicts remain read-only. The Cloudflare adapter has neither inspection nor inventory, and its bridge has no resource lookup returning durable owner metadata; `running(sandboxId)` alone cannot prove ownership after restart, so its provider observation is unavailable or unknown.
+Provider resource inspection and inventory are implemented for exe.dev and SBX. The default SBX and exe.dev Sandcastle runtime drivers adopt only one running resource with exact durable ownership proof and a matching checkout; SBX also requires a published port, while exe.dev creates fresh local SSH/tunnel state after proof. Legacy markers, stopped or unknown status, timeouts, and conflicts remain read-only. The live Cloudflare adapter can inspect a known sandbox's running state; `diagnose` may add active health, but it has no durable resource lookup, inventory, or runtime-adoption adapter after restart. `running(sandboxId)` alone cannot prove ownership, so post-restart provider observation remains unavailable or unknown.
 
 ## Situation report
 
@@ -71,11 +71,50 @@ Treat a present or unavailable workspace registration, and a failed runtime-targ
 
 `allowedActions` is authoritative. Each action carries its role, arguments, preconditions, and `waitFor` behavior. Use `recommendedAction` only when it is present in that list. A `null` recommendation means the controller has no safe next action to automate. `error.retryable` describes whether repeating the operation may be useful; it does not authorize a retry, and `retry` is allowed only for the recorded operation when the typed action lists it.
 
+## Reconstructing a failed operation
+
+1. Run `/sandbox status` and retain `requestId`, `intent`, compatibility `state`, `error`, and the recorded identity fields. Status is record-only and does not establish provider or workspace facts.
+2. Run `/sandbox diagnose` once. Read `details.results.state.operation`, `details.results.state.lastError`, and `details.results.operationJournal`; correlate the failed response `requestId` with the journal entry. A retry has its own request ID and must not replace the earlier entry.
+3. Use the entry's `startedAt`, optional `endedAt`, `resultCode`, and evidence references to reconstruct the lifecycle stage. `PENDING` without `endedAt` means the request crossed an asynchronous boundary or was interrupted; it does not mean the operation succeeded.
+4. Use the fresh `diagnose` observations and then `/sandbox inspect` when a current action decision is needed. Preserve all five sources and follow `allowedActions`; do not fill missing facts from provider logs or compatibility prose.
+5. Before any destructive action, name the ownership tuple and confirm preservation or an explicit discard authorization. A missing record, missing provider owner proof, or missing journal entry remains unknown-safe.
+
+The journal is bounded to the newest 32 entries and 16 KiB, with 256-byte text values, eight evidence references, and 4 KiB of evidence per entry. State writes and diagnostic output redact credential-shaped values and cap diagnostic details at 48 KiB; the control response remains below 64 KiB. `diagnose` reports version provenance and freshness, but it does not scan global logs, recreate expired history, or prove Cloudflare ownership after restart. Its process result covers tracked lifecycle handles only.
+
+## Documented incident mappings
+
+The focused Phase4 fixture uses these IDs as aliases into the nine classification classes. No additional class is needed for the current recorded conditions.
+
+| Fixture ID | Classification | Safe typed outcome |
+|---|---|---|
+| `clean-baseline` | `clean` | `start` only when host context and capture are advertised |
+| `attached-runtime` | `attached` | `stop` after session idle |
+| `runtime-handle-loss` | `control_lost` | inspect; do not infer resource state |
+| `cloudflare-post-restart` | `control_lost` | inspect; no post-restart owner proof |
+| `legacy-sbx-detached-runtime` | `control_lost` | inspect; legacy path fails closed |
+| `missing-handle-with-unavailable-evidence` | `control_lost` | inspect; preserve uncertainty |
+| `unsupported-provider-inspection` | `control_lost` | inspect; no provider mutation |
+| `plugin-disposal-final-state` | `control_lost` | inspect; final provider state is not durable |
+| `verified-orphan` | `orphan` | host `recover` only with an advertised runtime driver |
+| `stale-control-plane` | `stale_record` | host `repair` after fresh absence evidence |
+| `verified-preserved-leak` | `leaked_resource` | host `delete` only after preservation is verified |
+| `ownership-conflict` | `conflict` | inspect; require an operator decision |
+| `duplicate-provider-resource` | `conflict` | inspect; do not select a resource by name |
+| `checkout-mismatch` | `conflict` | inspect; do not mutate the mismatched checkout |
+| `sync-failure` | `work_at_risk` | retry the recorded operation when advertised; preserve first |
+| `unknown-provider-evidence` | `unknown` | inspect; take no inferred provider action |
+| `cloudflare-known-resource-without-owner` | `unknown` | inspect; live health is not ownership proof |
+| `legacy-sbx-marker` | `unknown` | inspect; legacy marker is not restart-proof ownership |
+| `stopped-or-unknown-provider-status` | `orphan` | inspect; status is not a safe destructive precondition |
+| `provider-cleanup-before-record` | `unknown` | no inferred action; the resource is unattributed |
+| `provider-inspection-timeout` | `control_lost` | inspect; timeout is not absence evidence |
+| `failed-recovery` | `control_lost` | retry only when typed action is advertised; otherwise inspect |
+
 ## Restart boundary
 
 `adopt` remains provider vocabulary. Host `repair` is available only after fresh inspection proves provider absence, runtime-handle absence, and either workspace absence or an exactly owned workspace registration. It removes only that exact registration, never a mismatch, then writes a safe `local` or `detached` record. After a plugin restart, an active Sandcastle record with only a missing handle remains unchanged; verified provider presence may produce the compatibility label `orphaned`, and `recover` or `delete` may reacquire it only when `allowedActions` advertises the configured runtime-driver path. Orphan deletion preserves work before removing the exact workspace, rechecks ownership immediately before destruction, and records completed destruction for retry safety. Recovery itself never destroys a provider resource.
 
-The Cloudflare path has no provider inspection, inventory, or runtime-adoption adapter. Its provider observation remains unavailable or unknown, and no Cloudflare command, recovery, or destructive action is implied by an `allowedActions` or recommendation field.
+The live Cloudflare path can report read-only running evidence for its known sandbox, and `diagnose` can add active health while the runtime is tracked. It still has no durable provider lookup, inventory, or runtime-adoption adapter after restart; no Cloudflare command, recovery, or destructive action is implied by an `allowedActions` or recommendation field.
 
 ## Current SBX orphan procedure
 

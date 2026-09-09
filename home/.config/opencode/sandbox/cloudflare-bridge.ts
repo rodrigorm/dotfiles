@@ -24,7 +24,7 @@ export interface CloudflareSandboxClient {
   createSandbox(): Promise<string>
   destroySandbox(sandboxId: string): Promise<void>
   destroyTunnel(sandboxId: string, port: number): Promise<void>
-  running(sandboxId: string): Promise<boolean>
+  running(sandboxId: string, signal?: AbortSignal): Promise<boolean>
   exec(sandboxId: string, input: CloudflareExecInput): Promise<ProcessResult>
   putFile(sandboxId: string, path: string, content: Uint8Array): Promise<void>
   getFile(sandboxId: string, path: string): Promise<Uint8Array>
@@ -86,12 +86,14 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
     )
   }
 
-  async running(sandboxId: string): Promise<boolean> {
+  async running(sandboxId: string, signal?: AbortSignal): Promise<boolean> {
     assertSandboxId(sandboxId)
     const response = await this.request(
       `/v1/sandbox/${encodeURIComponent(sandboxId)}/running`,
       { method: "GET" },
       "discover",
+      MAX_RESPONSE_BYTES,
+      signal,
     )
     const value = parseJson(response.body, "sandbox status")
     if (!isRecord(value) || typeof value.running !== "boolean") {
@@ -120,7 +122,7 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
     )
     try {
       if (!pending.response.ok) {
-        const body = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel")
+        const body = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
         throw new SandboxError(
           "control_channel",
           redactText(new TextDecoder().decode(body)) || `Cloudflare bridge returned HTTP ${pending.response.status}`,
@@ -128,9 +130,9 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
         )
       }
       if (pending.response.headers.get("content-type")?.includes("text/event-stream")) {
-        return await parseSseStream(pending.response, input.onLine)
+        return await parseSseStream(pending.response, input.onLine, pending.signal)
       }
-      const responseBody = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel")
+      const responseBody = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
       return parseExecResponse(responseBody, pending.response.headers.get("content-type") ?? "", input.onLine)
     } finally {
       pending.close()
@@ -235,10 +237,11 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
     },
     stage: SandboxStage,
     maxBytes = MAX_RESPONSE_BYTES,
+    signal?: AbortSignal,
   ): Promise<{ body: Uint8Array; contentType: string }> {
-    const pending = await this.openResponse(path, options, stage)
+    const pending = await this.openResponse(path, options, stage, signal)
     try {
-      const body = await readLimitedBody(pending.response, maxBytes, stage)
+      const body = await readLimitedBody(pending.response, maxBytes, stage, pending.signal)
       if (!pending.response.ok) {
         const message = redactText(new TextDecoder().decode(body))
         throw new SandboxError(stage, message || `Cloudflare bridge returned HTTP ${pending.response.status}`, `CLOUDFLARE_HTTP_${pending.response.status}`)
@@ -257,7 +260,8 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
       body?: BodyInit
     },
     stage: SandboxStage,
-  ): Promise<{ response: Response; close(): void }> {
+    signal?: AbortSignal,
+  ): Promise<{ response: Response; signal: AbortSignal; close(): void }> {
     const url = new URL(this.apiUrl)
     const basePath = url.pathname.replace(/\/$/, "").replace(/\/v1$/, "")
     url.pathname = `${basePath}${path}`
@@ -266,22 +270,37 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs)
+    const abort = () => controller.abort(signal?.reason)
+    if (signal) {
+      if (signal.aborted) controller.abort(signal.reason)
+      else signal.addEventListener("abort", abort, { once: true })
+    }
+    const close = () => {
+      clearTimeout(timeout)
+      signal?.removeEventListener("abort", abort)
+    }
     try {
-      const response = await this.fetcher(url, {
-        method: options.method,
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          ...options.headers,
-        },
-        body: options.body,
-        signal: controller.signal,
-      })
+      if (controller.signal.aborted) throw new Error("Cloudflare bridge request was aborted")
+      const response = await waitForAbort(
+        () => this.fetcher(url, {
+          method: options.method,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            ...options.headers,
+          },
+          body: options.body,
+          signal: controller.signal,
+        }),
+        controller.signal,
+        (lateResponse) => lateResponse.body?.cancel(),
+      )
       return {
         response,
-        close: () => clearTimeout(timeout),
+        signal: controller.signal,
+        close,
       }
     } catch (error) {
-      clearTimeout(timeout)
+      close()
       throw new SandboxError(stage, `Cloudflare bridge request failed: ${redactText(error instanceof Error ? error.message : String(error))}`, "CLOUDFLARE_REQUEST")
     }
   }
@@ -375,7 +394,7 @@ function parseSse(text: string, onLine?: (line: string) => void): ProcessResult 
   return { exitCode, signal: null, stdout, stderr }
 }
 
-async function parseSseStream(response: Response, onLine?: (line: string) => void): Promise<ProcessResult> {
+async function parseSseStream(response: Response, onLine?: (line: string) => void, signal?: AbortSignal): Promise<ProcessResult> {
   if (!response.body) throw new SandboxError("control_channel", "Cloudflare command stream has no body", "CLOUDFLARE_STREAM")
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -436,7 +455,7 @@ async function parseSseStream(response: Response, onLine?: (line: string) => voi
 
   try {
     while (true) {
-      const next = await reader.read()
+      const next = await waitForAbort(() => reader.read(), signal)
       if (next.done) break
       const chunk = decoder.decode(next.value, { stream: true })
       if (Buffer.byteLength(buffer) + Buffer.byteLength(chunk) > MAX_RESPONSE_BYTES) {
@@ -512,18 +531,33 @@ function decodeOutput(value: unknown): string {
   return Buffer.from(value, "base64").toString("utf8")
 }
 
-async function readLimitedBody(response: Response, maxBytes: number, stage: SandboxStage): Promise<Uint8Array> {
+async function readLimitedBody(response: Response, maxBytes: number, stage: SandboxStage, signal?: AbortSignal): Promise<Uint8Array> {
   if (!response.body) {
-    const body = new Uint8Array(await response.arrayBuffer())
+    const body = new Uint8Array(await waitForAbort(() => response.arrayBuffer(), signal))
     if (body.byteLength > maxBytes) throw new SandboxError(stage, "Cloudflare bridge response is too large", "CLOUDFLARE_RESPONSE_LIMIT")
     return body
+  }
+  if (signal?.aborted) {
+    await response.body.cancel().catch(() => undefined)
+    throw signal.reason ?? new Error("Cloudflare bridge response was aborted")
   }
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
+  let cancellation: Promise<void> | undefined
+  const cancel = (): Promise<void> => {
+    if (!cancellation) {
+      try {
+        cancellation = reader.cancel().then(() => undefined, () => undefined)
+      } catch {
+        cancellation = Promise.resolve()
+      }
+    }
+    return cancellation
+  }
   try {
     while (true) {
-      const next = await reader.read()
+      const next = await waitForAbort(() => reader.read(), signal)
       if (next.done) break
       size += next.value.byteLength
       if (size > maxBytes) {
@@ -532,10 +566,60 @@ async function readLimitedBody(response: Response, maxBytes: number, stage: Sand
       }
       chunks.push(next.value)
     }
+  } catch (error) {
+    await cancel()
+    throw error
   } finally {
     reader.releaseLock()
   }
   return Uint8Array.from(Buffer.concat(chunks, size))
+}
+
+export function waitForAbort<T>(
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+  onLateValue?: (value: T) => void | Promise<void>,
+): Promise<T> {
+  if (!signal) return operation()
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error("operation aborted"))
+  return new Promise<T>((resolve, reject) => {
+    let aborted = false
+    let settled = false
+    const cleanup = () => signal.removeEventListener("abort", onAbort)
+    const onAbort = () => {
+      if (settled) return
+      aborted = true
+      settled = true
+      cleanup()
+      reject(signal.reason ?? new Error("operation aborted"))
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    let pending: Promise<T>
+    try {
+      pending = operation()
+    } catch (error) {
+      cleanup()
+      reject(error)
+      return
+    }
+    pending.then(
+      (value) => {
+        if (aborted) {
+          void Promise.resolve().then(() => onLateValue?.(value)).catch(() => undefined)
+          return
+        }
+        settled = true
+        cleanup()
+        resolve(value)
+      },
+      (error) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(error)
+      },
+    )
+  })
 }
 
 function assertWorkspacePath(value: string): void {

@@ -177,50 +177,49 @@ export async function runCli(
   const controlPort = env.SANDBOX_CONTROL_PORT === undefined ? undefined : Number(env.SANDBOX_CONTROL_PORT)
   const token = operation === "inventory" ? env.SANDBOX_CONTROL_PROJECT_TOKEN : env.SANDBOX_CONTROL_TOKEN
   const hasTcpEndpoint = controlHost !== undefined || env.SANDBOX_CONTROL_PORT !== undefined
+  const requestId = randomUUID()
   if (!socketPath && !mailboxPath && !hasTcpEndpoint) {
-    const response = errorResponse(operation, new SandboxError("control_channel", "sandboxctl is not running inside an OpenCode session", "CONTROL_ENDPOINT"))
-    writeJson(writeStdout, response, operation)
+    const response = errorResponse(operation, new SandboxError("control_channel", "sandboxctl is not running inside an OpenCode session", "CONTROL_ENDPOINT"), requestId)
+    writeJson(writeStdout, response, operation, requestId)
     return 1
   }
   if (!token) {
-    const response = errorResponse(operation, new SandboxError("authenticate", "sandbox control token is unavailable", "CONTROL_TOKEN"))
-    writeJson(writeStdout, response, operation)
+    const response = errorResponse(operation, new SandboxError("authenticate", "sandbox control token is unavailable", "CONTROL_TOKEN"), requestId)
+    writeJson(writeStdout, response, operation, requestId)
     return 1
   }
 
   try {
+    const body = {
+      operation,
+      requestId,
+      ...(parsed.force ? { force: true } : {}),
+    }
     const response = socketPath
-      ? await requestControl(socketPath, token, {
-          operation,
-          ...(parsed.force ? { force: true } : {}),
-        })
+      ? await requestControl(socketPath, token, body)
       : mailboxPath
-        ? await requestControlMailbox(mailboxPath, token, {
-            operation,
-            ...(parsed.force ? { force: true } : {}),
-          })
-        : await requestControlTcp(controlHost ?? "", controlPort ?? Number.NaN, token, {
-            operation,
-            ...(parsed.force ? { force: true } : {}),
-          })
-    if (!isV2Response(response.body)) throw new SandboxError("control_channel", "control response has invalid shape", "RESPONSE_SCHEMA")
+        ? await requestControlMailbox(mailboxPath, token, body)
+        : await requestControlTcp(controlHost ?? "", controlPort ?? Number.NaN, token, body)
+    if (!isV2Response(response.body) || response.body.requestId !== requestId) {
+      throw new SandboxError("control_channel", "control response has invalid shape", "RESPONSE_SCHEMA")
+    }
     const result = response.body as unknown as SandboxResponse
-    writeJson(writeStdout, result, operation)
+    writeJson(writeStdout, result, operation, requestId)
     return response.status >= 200 && response.status < 300 && result.ok ? 0 : 1
   } catch (error) {
-    const result = errorResponse(operation, error)
-    writeJson(writeStdout, result, operation)
+    const result = errorResponse(operation, error, requestId)
+    writeJson(writeStdout, result, operation, requestId)
     return 1
   }
 }
 
-function errorResponse(operation: SandboxOperation, error: unknown): SandboxResponse {
+function errorResponse(operation: SandboxOperation, error: unknown, requestId: string = randomUUID()): SandboxResponse {
   const sandboxError = error instanceof SandboxError ? error : undefined
   const stage = sandboxError?.stage ?? "control_channel"
   const code = sandboxError?.code ?? "CONTROL_CHANNEL"
   const message = redactError(error)
   return {
-    ...emptyResult(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }, stage),
+    ...emptyResult(operation, false, message, { code, stage, retryable: stage !== "validate" && code !== "CONTROL_AUTH" }, stage, requestId),
     ok: false,
     operation,
     state: "error",
@@ -245,11 +244,12 @@ function emptyResult(
   message: string,
   error: { code: string; stage: string; retryable: boolean } | null,
   stage = error?.stage ?? "validate",
+  requestId: string = randomUUID(),
 ): SandboxResultV2 & { state: "error"; stage: string } {
   const sources = ["record", "handle", "workspace", "provider", "git"] as const
   return {
     schemaVersion: 2,
-    requestId: randomUUID(),
+    requestId,
     ok,
     operation,
     message: redactError(message),
@@ -278,15 +278,15 @@ function emptyResult(
   }
 }
 
-function writeJson(write: (text: string) => void, value: unknown, operation: SandboxOperation): void {
+function writeJson(write: (text: string) => void, value: unknown, operation: SandboxOperation, requestId?: string): void {
   let text: string
   try {
     text = JSON.stringify(value)
   } catch {
-    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response could not be serialized", "RESPONSE_JSON")))
+    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response could not be serialized", "RESPONSE_JSON"), requestId))
   }
   if (Buffer.byteLength(text) > RESPONSE_LIMIT_BYTES) {
-    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response is too large", "RESPONSE_LIMIT")))
+    text = JSON.stringify(errorResponse(operation, new SandboxError("control_channel", "control response is too large", "RESPONSE_LIMIT"), requestId))
   }
   write(`${text}\n`)
 }
