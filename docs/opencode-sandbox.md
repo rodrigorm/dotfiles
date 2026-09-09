@@ -210,7 +210,7 @@ State files reject credential-shaped keys, use private permissions, write atomic
 |---|---|---|---|---|
 | `sbx` | Docker Sandbox clone | Published OpenCode port plus supervised SSH control proxy | `sbx` CLI and Docker Sandbox support | Session inspect plus project inventory; inspect reads the durable ownership marker |
 | `exedev` | exe.dev VM | SSH and remote control socket | exe.dev access, SSH lobby, pinned host key | Session inspect plus project inventory; inspect matches durable VM identity and owner tag |
-| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter |
+| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter. Exec stdin is staged through the bridge file PUT contract. |
 
 All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
 

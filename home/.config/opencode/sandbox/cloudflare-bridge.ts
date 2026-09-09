@@ -1,3 +1,6 @@
+import { randomBytes } from "node:crypto"
+
+import { quoteRemoteCommandPart } from "./naming"
 import { isRecord, SandboxError, type ProcessResult, type SandboxStage } from "./types"
 import { redactText } from "./redaction"
 
@@ -10,8 +13,9 @@ export interface CloudflareExecInput {
   argv: string[]
   cwd?: string
   timeoutMs?: number
-  stdin?: string
+  stdin?: string | Uint8Array
   onLine?: (line: string) => void
+  signal?: AbortSignal
 }
 
 export interface CloudflareTunnelInfo {
@@ -76,9 +80,7 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
 
   async destroyTunnel(sandboxId: string, port: number): Promise<void> {
     assertSandboxId(sandboxId)
-    if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
-      throw new SandboxError("tunnel", "Cloudflare tunnel port is invalid", "CLOUDFLARE_PORT")
-    }
+    assertTunnelPort(port)
     await this.request(
       `/v1/sandbox/${encodeURIComponent(sandboxId)}/tunnel/${port}`,
       { method: "DELETE" },
@@ -107,41 +109,70 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
     if (input.argv.length === 0 || input.argv.some((value) => typeof value !== "string")) {
       throw new SandboxError("validate", "Cloudflare command argv is empty", "CLOUDFLARE_ARGV")
     }
-    const body: Record<string, unknown> = { argv: input.argv }
-    if (input.cwd !== undefined) body.cwd = input.cwd
-    if (input.timeoutMs !== undefined) body.timeout_ms = input.timeoutMs
-    if (input.stdin !== undefined) body.stdin = input.stdin
-    const pending = await this.openResponse(
-      `/v1/sandbox/${encodeURIComponent(sandboxId)}/exec`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-      "control_channel",
-    )
+    const stdin = input.stdin === undefined ? undefined : toBytes(input.stdin)
+    if (stdin && stdin.byteLength > MAX_HYDRATE_BYTES) {
+      throw new SandboxError("control_channel", "Cloudflare bridge stdin payload exceeds its 32 MiB limit", "CLOUDFLARE_ARCHIVE_LIMIT")
+    }
+    if (input.signal?.aborted) {
+      throw redactExecFailure(normalizeAbortReason(input.signal.reason), stdin)
+    }
+    const deadline = new AbortController()
+    const operation = new AbortController()
+    const cleanupBudgetMs = Math.min(1_000, Math.max(1, Math.floor(this.requestTimeoutMs / 4)))
+    const operationTimeout = setTimeout(() => {
+      operation.abort(new Error("Cloudflare bridge operation timed out"))
+    }, Math.max(1, this.requestTimeoutMs - cleanupBudgetMs))
+    const deadlineTimeout = setTimeout(() => {
+      deadline.abort(new Error("Cloudflare bridge operation timed out"))
+    }, this.requestTimeoutMs)
+    const abortOperation = () => operation.abort(input.signal?.reason)
+    input.signal?.addEventListener("abort", abortOperation, { once: true })
+    const stagedDirectory = stdin ? `/workspace/.opencode-stdin-${randomBytes(16).toString("hex")}` : undefined
+    const stagedPath = stagedDirectory ? `${stagedDirectory}/input` : undefined
+    let stagedDirectoryCreated = false
+    let failure: unknown
+    let result: ProcessResult | undefined
     try {
-      if (!pending.response.ok) {
-        const body = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
-        throw new SandboxError(
-          "control_channel",
-          redactText(new TextDecoder().decode(body)) || `Cloudflare bridge returned HTTP ${pending.response.status}`,
-          `CLOUDFLARE_HTTP_${pending.response.status}`,
-        )
+      if (stdin && stagedDirectory && stagedPath) {
+        await this.runInternal(sandboxId, ["mkdir", "-m", "700", "--", stagedDirectory], operation.signal)
+        stagedDirectoryCreated = true
+        await this.putFileRequest(sandboxId, stagedPath, stdin, operation.signal)
+        await this.runInternal(sandboxId, ["chmod", "600", "--", stagedPath], operation.signal)
       }
-      if (pending.response.headers.get("content-type")?.includes("text/event-stream")) {
-        return await parseSseStream(pending.response, input.onLine, pending.signal)
-      }
-      const responseBody = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
-      return parseExecResponse(responseBody, pending.response.headers.get("content-type") ?? "", input.onLine)
+      const argv = stagedPath
+        ? ["sh", "-lc", `exec "$0" "$@" < ${quoteRemoteCommandPart(stagedPath)}`, ...input.argv]
+        : input.argv
+      result = await this.requestExec(sandboxId, { ...input, argv, signal: operation.signal }, operation.signal)
+    } catch (error) {
+      failure = redactExecFailure(error, stdin)
     } finally {
-      pending.close()
+      if (stagedDirectory && stagedDirectoryCreated) {
+        try {
+          await this.runInternal(sandboxId, ["rm", "-rf", "--", stagedDirectory], deadline.signal)
+        } catch (error) {
+          if (!failure) failure = redactExecFailure(error, stdin)
+        }
+      }
+      clearTimeout(operationTimeout)
+      clearTimeout(deadlineTimeout)
+      input.signal?.removeEventListener("abort", abortOperation)
+    }
+    if (failure) throw failure
+    if (!result) throw new SandboxError("control_channel", "Cloudflare bridge command did not return a result", "CLOUDFLARE_COMMAND")
+    return result
+  }
+
+  private async runInternal(sandboxId: string, argv: string[], signal: AbortSignal): Promise<void> {
+    const result = await this.requestExec(sandboxId, { argv }, signal)
+    if (result.exitCode !== 0 || result.signal !== null) {
+      throw new SandboxError("control_channel", `Cloudflare internal command failed: ${argv[0]}`, "CLOUDFLARE_COMMAND")
     }
   }
 
   async putFile(sandboxId: string, path: string, content: Uint8Array): Promise<void> {
     assertSandboxId(sandboxId)
     assertWorkspacePath(path)
+    assertTransferSize(content)
     await this.request(
       `/v1/sandbox/${encodeURIComponent(sandboxId)}/file/${path.split("/").filter((part) => part.length > 0).map((part) => encodeURIComponent(part)).join("/")}`,
       {
@@ -187,9 +218,7 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
 
   async tunnel(sandboxId: string, port: number, name: string): Promise<CloudflareTunnelInfo> {
     assertSandboxId(sandboxId)
-    if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
-      throw new SandboxError("tunnel", "Cloudflare tunnel port is invalid", "CLOUDFLARE_PORT")
-    }
+    assertTunnelPort(port)
     if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name)) {
       throw new SandboxError("tunnel", "Cloudflare tunnel name is invalid", "CLOUDFLARE_TUNNEL_NAME")
     }
@@ -247,6 +276,56 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
         throw new SandboxError(stage, message || `Cloudflare bridge returned HTTP ${pending.response.status}`, `CLOUDFLARE_HTTP_${pending.response.status}`)
       }
       return { body, contentType: pending.response.headers.get("content-type") ?? "" }
+    } finally {
+      pending.close()
+    }
+  }
+
+  private async putFileRequest(sandboxId: string, path: string, content: Uint8Array, signal: AbortSignal): Promise<void> {
+    assertSandboxId(sandboxId)
+    assertWorkspacePath(path)
+    assertTransferSize(content)
+    await this.request(
+      `/v1/sandbox/${encodeURIComponent(sandboxId)}/file/${path.split("/").filter((part) => part.length > 0).map((part) => encodeURIComponent(part)).join("/")}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: Buffer.from(content),
+      },
+      "control_channel",
+      MAX_RESPONSE_BYTES,
+      signal,
+    )
+  }
+
+  private async requestExec(sandboxId: string, input: CloudflareExecInput, signal: AbortSignal): Promise<ProcessResult> {
+    const body: Record<string, unknown> = { argv: input.argv }
+    if (input.cwd !== undefined) body.cwd = input.cwd
+    if (input.timeoutMs !== undefined) body.timeout_ms = input.timeoutMs
+    const pending = await this.openResponse(
+      `/v1/sandbox/${encodeURIComponent(sandboxId)}/exec`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+      "control_channel",
+      signal,
+    )
+    try {
+      if (!pending.response.ok) {
+        const body = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
+        throw new SandboxError(
+          "control_channel",
+          redactText(new TextDecoder().decode(body)) || `Cloudflare bridge returned HTTP ${pending.response.status}`,
+          `CLOUDFLARE_HTTP_${pending.response.status}`,
+        )
+      }
+      if (pending.response.headers.get("content-type")?.includes("text/event-stream")) {
+        return await parseSseStream(pending.response, input.onLine, pending.signal)
+      }
+      const responseBody = await readLimitedBody(pending.response, MAX_RESPONSE_BYTES, "control_channel", pending.signal)
+      return parseExecResponse(responseBody, pending.response.headers.get("content-type") ?? "", input.onLine)
     } finally {
       pending.close()
     }
@@ -633,6 +712,36 @@ function assertWorkspacePath(value: string): void {
   ) {
     throw new SandboxError("validate", "Cloudflare workspace path is unsafe", "CLOUDFLARE_PATH")
   }
+}
+
+function assertTransferSize(content: Uint8Array): void {
+  if (content.byteLength > MAX_HYDRATE_BYTES) {
+    throw new SandboxError("sync", "Cloudflare bridge PUT payload exceeds its 32 MiB limit", "CLOUDFLARE_ARCHIVE_LIMIT")
+  }
+}
+
+function assertTunnelPort(port: number): void {
+  if (!Number.isSafeInteger(port) || port < 1024 || port > 65535 || port === 3000) {
+    throw new SandboxError("tunnel", "Cloudflare tunnel port is invalid or reserved", "CLOUDFLARE_PORT")
+  }
+}
+
+function toBytes(value: string | Uint8Array): Uint8Array {
+  return typeof value === "string" ? new TextEncoder().encode(value) : value
+}
+
+function redactExecFailure(error: unknown, stdin: Uint8Array | undefined): unknown {
+  if (!(error instanceof Error) || !stdin || stdin.byteLength === 0) return error
+  const secret = new TextDecoder().decode(stdin)
+  if (!secret) return error
+  const message = redactText(error.message, [secret])
+  if (error instanceof SandboxError) return new SandboxError(error.stage, message, error.code)
+  return new Error(message)
+}
+
+function normalizeAbortReason(reason: unknown): Error {
+  if (reason instanceof Error) return reason
+  return new Error(typeof reason === "string" ? reason : "Cloudflare bridge operation was aborted")
 }
 
 function isLoopback(hostname: string): boolean {

@@ -4891,6 +4891,267 @@ describe("Cloudflare Sandbox bridge", () => {
     expect(JSON.parse(requests[0]?.body ?? "{}")).toEqual({ argv: ["printf", "hello"] })
   })
 
+  it("adapts stdin to the official PUT and argv-only exec contract", async () => {
+    const requests: Array<{ path: string; method: string; body: Uint8Array | string }> = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (input, init) => {
+        const url = new URL(String(input))
+        const body = init?.body instanceof Uint8Array || init?.body instanceof ArrayBuffer
+          ? new Uint8Array(init.body instanceof ArrayBuffer ? init.body : init.body.buffer)
+          : String(init?.body ?? "")
+        requests.push({ path: url.pathname, method: init?.method ?? "GET", body })
+        if (url.pathname.endsWith("/exec")) {
+          return new Response(JSON.stringify({ exit_code: 0, stdout: "", stderr: "" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        return new Response(null, { status: 204 })
+      }) as typeof fetch,
+    })
+
+    await client.exec("sandboxa2", { argv: ["printf", "-n", "quoted 'arg'"], stdin: new Uint8Array([0, 255, 10]) })
+    await client.exec("sandboxa2", { argv: ["cat"], stdin: "" })
+    await client.exec("sandboxa2", { argv: ["printf", "no stdin"] })
+
+    const puts = requests.filter((request) => request.method === "PUT")
+    const execs = requests.filter((request) => request.path.endsWith("/exec"))
+    expect(puts).toHaveLength(2)
+    expect(Buffer.from(puts[0]?.body as Uint8Array)).toEqual(Buffer.from([0, 255, 10]))
+    expect(Buffer.from(puts[1]?.body as Uint8Array)).toHaveLength(0)
+    expect(new Set(puts.map((request) => request.path)).size).toBe(2)
+    const payloads = execs.map((request) => JSON.parse(String(request.body)) as { argv: string[]; stdin?: unknown })
+    expect(payloads.every((payload) => payload.stdin === undefined)).toBe(true)
+    expect(payloads[0]?.argv).toEqual(["mkdir", "-m", "700", "--", expect.any(String)])
+    expect(payloads[1]?.argv).toEqual(["chmod", "600", "--", expect.any(String)])
+    expect(payloads[2]?.argv.slice(0, 3)).toEqual(["sh", "-lc", expect.stringContaining("exec \"$0\" \"$@\" < /workspace/.opencode-stdin-")])
+    expect(payloads[2]?.argv.slice(3)).toEqual(["printf", "-n", "quoted 'arg'"])
+    expect(payloads[3]?.argv).toEqual(["rm", "-rf", "--", expect.any(String)])
+    expect(payloads.at(-1)?.argv).toEqual(["printf", "no stdin"])
+  })
+
+  it("bounds file PUTs and rejects the reserved tunnel port before fetch", async () => {
+    let calls = 0
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async () => {
+        calls++
+        return new Response(null, { status: 204 })
+      }) as unknown as typeof fetch,
+    })
+
+    await expect(client.putFile("sandboxa2", "/workspace/input", new Uint8Array(32 * 1024 * 1024 + 1))).rejects.toMatchObject({ code: "CLOUDFLARE_ARCHIVE_LIMIT" })
+    await expect(client.hydrate("sandboxa2", new Uint8Array(32 * 1024 * 1024 + 1))).rejects.toMatchObject({ code: "CLOUDFLARE_ARCHIVE_LIMIT" })
+    await expect(client.tunnel("sandboxa2", 3000, "test")).rejects.toMatchObject({ code: "CLOUDFLARE_PORT" })
+    expect(calls).toBe(0)
+  })
+
+  it("does not request the bridge for an already-aborted stdin operation", async () => {
+    const controller = new AbortController()
+    controller.abort("cancelled")
+    let calls = 0
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async () => {
+        calls++
+        return new Response(null, { status: 204 })
+      }) as unknown as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"], stdin: "secret", signal: controller.signal })).rejects.toMatchObject({ name: "Error" })
+    expect(calls).toBe(0)
+  })
+
+  it("cleans staged stdin and redacts it from bridge failures", async () => {
+    const secret = "stdin-secret-should-not-escape"
+    const requests: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (input, init) => {
+        const url = new URL(String(input))
+        requests.push(url.pathname)
+        if (init?.method === "PUT") return new Response(secret, { status: 500 })
+        return new Response(JSON.stringify({ exit_code: 0, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    let failure: unknown
+    try {
+      await client.exec("sandboxa2", { argv: ["cat"], stdin: secret })
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).not.toContain(secret)
+    expect(requests.filter((path) => path.endsWith("/exec"))).toHaveLength(2)
+  })
+
+  it("cleans staged stdin when the command returns a failure exit code", async () => {
+    const commands: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") return new Response(null, { status: 204 })
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        commands.push(payload.argv[0] ?? "")
+        const exitCode = payload.argv[0] === "sh" ? 7 : 0
+        return new Response(JSON.stringify({ exit_code: exitCode, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"], stdin: "input" })).resolves.toMatchObject({ exitCode: 7 })
+    expect(commands).toEqual(["mkdir", "chmod", "sh", "rm"])
+  })
+
+  it("does not claim or remove a directory when mkdir fails", async () => {
+    const commands: string[] = []
+    let puts = 0
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") {
+          puts++
+          return new Response(null, { status: 204 })
+        }
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        commands.push(payload.argv[0] ?? "")
+        return new Response(JSON.stringify({ exit_code: payload.argv[0] === "mkdir" ? 1 : 0, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"], stdin: "input" })).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
+    expect(commands).toEqual(["mkdir"])
+    expect(puts).toBe(0)
+  })
+
+  it("cleans the owned directory when chmod fails before command execution", async () => {
+    const commands: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") return new Response(null, { status: 204 })
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        commands.push(payload.argv[0] ?? "")
+        const exitCode = payload.argv[0] === "chmod" ? 1 : 0
+        return new Response(JSON.stringify({ exit_code: exitCode, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"], stdin: "input" })).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
+    expect(commands).toEqual(["mkdir", "chmod", "rm"])
+  })
+
+  it("surfaces a nonzero cleanup result when the command succeeds", async () => {
+    const commands: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") return new Response(null, { status: 204 })
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        commands.push(payload.argv[0] ?? "")
+        const exitCode = payload.argv[0] === "rm" ? 1 : 0
+        return new Response(JSON.stringify({ exit_code: exitCode, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    await expect(client.exec("sandboxa2", { argv: ["cat"], stdin: "input" })).rejects.toMatchObject({ code: "CLOUDFLARE_COMMAND" })
+    expect(commands).toEqual(["mkdir", "chmod", "sh", "rm"])
+  })
+
+  it("cleans staged stdin after caller cancellation within the shared deadline", async () => {
+    const controller = new AbortController()
+    let commandStarted!: () => void
+    let cleanupStarted!: () => void
+    const command = new Promise<void>((resolve) => { commandStarted = resolve })
+    const cleanup = new Promise<void>((resolve) => { cleanupStarted = resolve })
+    const requests: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 1_000,
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") return new Response(null, { status: 204 })
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        requests.push(payload.argv[0] ?? "")
+        if (payload.argv[0] === "sh") {
+          commandStarted()
+          return new Promise<Response>(() => {})
+        }
+        if (payload.argv[0] === "rm") {
+          cleanupStarted()
+          return new Response(JSON.stringify({ exit_code: 0, stdout: "", stderr: "" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        return new Response(JSON.stringify({ exit_code: 0, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    const request = client.exec("sandboxa2", { argv: ["cat"], stdin: "cancel-me", signal: controller.signal })
+    await command
+    controller.abort()
+    await expect(request).rejects.toBeDefined()
+    await cleanup
+    expect(requests).toEqual(["mkdir", "chmod", "sh", "rm"])
+  })
+
+  it("reserves deadline time for cleanup after an exec timeout", async () => {
+    let commandStarted!: () => void
+    const started = new Promise<void>((resolve) => { commandStarted = resolve })
+    const commands: string[] = []
+    const client = new CloudflareBridgeClient({
+      apiUrl: "https://bridge.example.test",
+      apiKey: "private",
+      requestTimeoutMs: 100,
+      fetcher: (async (_input, init) => {
+        if (init?.method === "PUT") return new Response(null, { status: 204 })
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { argv: string[] }
+        commands.push(payload.argv[0] ?? "")
+        if (payload.argv[0] === "sh") {
+          commandStarted()
+          return new Promise<Response>(() => {})
+        }
+        return new Response(JSON.stringify({ exit_code: 0, stdout: "", stderr: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }) as typeof fetch,
+    })
+
+    const request = client.exec("sandboxa2", { argv: ["cat"], stdin: "input" })
+    await started
+    await expect(request).rejects.toBeDefined()
+    expect(commands).toEqual(["mkdir", "chmod", "sh", "rm"])
+  })
+
   it("delivers Cloudflare output before the command exits", async () => {
     const output = Buffer.from("hello\n").toString("base64")
     let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
@@ -4909,7 +5170,6 @@ describe("Cloudflare Sandbox bridge", () => {
     const lines: string[] = []
     const result = client.exec("sandboxa2", {
       argv: ["cat"],
-      stdin: "input",
       onLine: (line) => {
         lines.push(line)
         resolveLine?.()

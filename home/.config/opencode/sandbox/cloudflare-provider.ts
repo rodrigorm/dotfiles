@@ -151,8 +151,8 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     this.revokeControlToken = options.revokeControlToken
     this.assetDirectory = options.assetDirectory ?? fileURLToPath(new URL(".", import.meta.url))
 
-    if (!Number.isSafeInteger(this.remotePort) || this.remotePort < 1024 || this.remotePort > 65535) {
-      throw new SandboxError("validate", "Cloudflare remote port must be between 1024 and 65535", "CLOUDFLARE_PORT")
+    if (!Number.isSafeInteger(this.remotePort) || this.remotePort < 1024 || this.remotePort > 65535 || this.remotePort === 3000) {
+      throw new SandboxError("validate", "Cloudflare remote port is invalid or reserved", "CLOUDFLARE_PORT")
     }
     if (!/^[A-Za-z0-9._-]+$/.test(this.openCodeVersion)) {
       throw new SandboxError("validate", "OpenCode version is unsafe", "OPENCODE_VERSION")
@@ -771,7 +771,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   private async execute(
     activation: Activation,
     command: string,
-    options?: { onLine?: (line: string) => void; cwd?: string; sudo?: boolean; stdin?: string },
+    options?: { onLine?: (line: string) => void; cwd?: string; sudo?: boolean; stdin?: string | Uint8Array; signal?: AbortSignal },
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const cwd = options?.cwd ?? this.checkoutDirectory()
     assertRemotePath(cwd, "sandbox working directory")
@@ -782,6 +782,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       stdin: options?.stdin,
       onLine: options?.onLine,
       timeoutMs: this.bootstrapTimeoutMs,
+      signal: options?.signal,
     })
     return {
       stdout: result.stdout,
