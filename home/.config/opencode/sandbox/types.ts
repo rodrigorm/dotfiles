@@ -444,6 +444,8 @@ export interface AuthorizedControlRequest extends ControlRequest {
 
 export interface SandboxConfig {
   provider: WorkspaceProviderId
+  apiUrl?: string | null
+  apiKey?: string | null
   baseVm: string | null
   cpu: number
   memory: string

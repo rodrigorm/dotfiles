@@ -43,6 +43,25 @@ export interface CloudflareBridgeClientOptions {
   requestTimeoutMs?: number
 }
 
+export function parseCloudflareBridgeUrl(value: string | URL): URL {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new SandboxError("validate", "Cloudflare bridge URL is invalid", "CLOUDFLARE_URL")
+  }
+  if (url.username || url.password) {
+    throw new SandboxError("validate", "Cloudflare bridge URL must not contain credentials", "CLOUDFLARE_URL")
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new SandboxError("validate", "Cloudflare bridge URL must use HTTP or HTTPS", "CLOUDFLARE_URL")
+  }
+  if (url.protocol === "http:" && !isLoopback(url.hostname)) {
+    throw new SandboxError("validate", "Cloudflare bridge URL must use HTTPS", "CLOUDFLARE_URL")
+  }
+  return url
+}
+
 export class CloudflareBridgeClient implements CloudflareSandboxClient {
   private readonly apiUrl: URL
   private readonly apiKey: string
@@ -50,13 +69,7 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
   private readonly requestTimeoutMs: number
 
   constructor(options: CloudflareBridgeClientOptions) {
-    this.apiUrl = new URL(options.apiUrl)
-    if (this.apiUrl.protocol !== "http:" && this.apiUrl.protocol !== "https:") {
-      throw new SandboxError("validate", "Cloudflare bridge URL must use HTTP or HTTPS", "CLOUDFLARE_URL")
-    }
-    if (this.apiUrl.protocol === "http:" && !isLoopback(this.apiUrl.hostname)) {
-      throw new SandboxError("validate", "Cloudflare bridge URL must use HTTPS", "CLOUDFLARE_URL")
-    }
+    this.apiUrl = parseCloudflareBridgeUrl(options.apiUrl)
     if (!options.apiKey) throw new SandboxError("validate", "Cloudflare bridge API key is empty", "CLOUDFLARE_KEY")
     this.apiKey = options.apiKey
     this.fetcher = options.fetcher ?? fetch
@@ -243,11 +256,8 @@ export class CloudflareBridgeClient implements CloudflareSandboxClient {
     }
     let url: URL
     try {
-      url = new URL(value.url)
+      url = parseCloudflareBridgeUrl(value.url)
     } catch {
-      throw new SandboxError("tunnel", "Cloudflare bridge returned an invalid tunnel URL", "CLOUDFLARE_SCHEMA")
-    }
-    if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
       throw new SandboxError("tunnel", "Cloudflare bridge returned an invalid tunnel URL", "CLOUDFLARE_SCHEMA")
     }
     return {

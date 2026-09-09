@@ -135,11 +135,29 @@ describe("configuration", () => {
 
   it("rejects unknown keys and unsafe provider identifiers", () => {
     expect(parseConfig({ provider: "sbx" }, { HOME: "/tmp" }).provider).toBe("sbx")
-    expect(parseConfig({ provider: "cloudflare" }, { HOME: "/tmp" }).provider).toBe("cloudflare")
+    expect(parseConfig({ provider: "cloudflare", apiUrl: "https://bridge.example.test", apiKey: "test-key" }, { HOME: "/tmp" }).provider).toBe("cloudflare")
     expect(parseConfig({ openCodeVersion: "1.2.3" }, { HOME: "/tmp" }).openCodeVersion).toBe("1.2.3")
     expect(() => parseConfig({ unexpected: true }, { HOME: "/tmp" })).toThrow(/unknown configuration key/i)
     expect(() => parseConfig({ baseVm: "vm; rm -rf /" }, { HOME: "/tmp" })).toThrow(/baseVm/i)
     expect(() => parseConfig({ sshLobby: "exe.dev && whoami" }, { HOME: "/tmp" })).toThrow(/sshLobby/i)
+  })
+
+  it("validates optional Cloudflare settings without exposing credentials", () => {
+    expect(parseConfig({ provider: "sbx", apiUrl: null, apiKey: null }, { HOME: "/tmp" })).toMatchObject({ apiUrl: null, apiKey: null })
+    expect(() => parseConfig({ provider: "cloudflare" }, { HOME: "/tmp" })).toThrow(/requires apiUrl and apiKey/i)
+    expect(() => parseConfig({ provider: "cloudflare", apiUrl: "https://bridge.example.test" }, { HOME: "/tmp" })).toThrow(/requires apiUrl and apiKey/i)
+    expect(() => parseConfig({ apiUrl: "" }, { HOME: "/tmp" })).toThrow(/apiUrl/i)
+    expect(() => parseConfig({ apiKey: "" }, { HOME: "/tmp" })).toThrow(/apiKey/i)
+    expect(() => parseConfig({ apiUrl: 42 }, { HOME: "/tmp" })).toThrow(/apiUrl/i)
+
+    const secret = "config-secret-that-must-not-escape"
+    let error: unknown
+    try {
+      parseConfig({ apiUrl: `https://${secret}@bridge.example.test` }, { HOME: "/tmp" })
+    } catch (value) {
+      error = value
+    }
+    expect(String(error)).not.toContain(secret)
   })
 })
 
@@ -3253,7 +3271,12 @@ describe("plugin runtime", () => {
   it("loads provider configuration from the project file", async () => {
     const root = await temporaryDirectory()
     await mkdir(join(root, ".opencode"))
-    await writeFile(join(root, ".opencode", "sandbox.json"), JSON.stringify({ provider: "sbx" }))
+    const apiKey = "project-file-test-key"
+    await writeFile(join(root, ".opencode", "sandbox.json"), JSON.stringify({
+      provider: "cloudflare",
+      apiUrl: "https://bridge.example.test",
+      apiKey,
+    }))
     let registeredType = ""
     const hooks = await createSandboxPlugin(
       {
@@ -3268,7 +3291,60 @@ describe("plugin runtime", () => {
     if (!hooks) throw new Error("plugin did not initialize")
     cleanups.push(hooks.dispose)
 
-    expect(registeredType).toBe("sbx")
+    expect(registeredType).toBe("cloudflare")
+    const shell = { env: {} as Record<string, string> }
+    await hooks["shell.env"]({ cwd: root, sessionID: "ses_project_file" }, shell)
+    const output: string[] = []
+    await expect(runCli(["diagnose"], {
+      SANDBOX_CONTROL_SOCKET: shell.env.SANDBOX_CONTROL_SOCKET,
+      SANDBOX_CONTROL_TOKEN: shell.env.SANDBOX_CONTROL_TOKEN,
+    }, { stdout: (text) => output.push(text) })).resolves.toBe(0)
+    expect(output[0]).not.toContain(apiKey)
+  })
+
+  it("applies SANDBOX_CONFIG before present per-field API environment overrides", async () => {
+    const root = await temporaryDirectory()
+    await mkdir(join(root, ".opencode"))
+    await writeFile(join(root, ".opencode", "sandbox.json"), JSON.stringify({
+      provider: "cloudflare",
+      apiUrl: "https://file.example.test",
+      apiKey: "file-key",
+    }))
+    const input = {
+      project: { id: "prj_1" },
+      directory: root,
+      worktree: root,
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      experimental_workspace: { register: () => {} },
+    }
+    const baseEnv = { HOME: root, XDG_RUNTIME_DIR: root, OPENCODE_EXPERIMENTAL_WORKSPACES: "1" }
+    const configLogs: string[] = []
+    await expect(createSandboxPlugin(input, {
+      env: {
+        ...baseEnv,
+        SANDBOX_CONFIG: JSON.stringify({ apiUrl: "http://public.example.test", apiKey: "json-key" }),
+      },
+      log: (message) => configLogs.push(message),
+    })).resolves.toBeUndefined()
+    expect(configLogs.join(" ")).not.toContain("json-key")
+
+    const hooks = await createSandboxPlugin(input, {
+      env: {
+        ...baseEnv,
+        SANDBOX_CONFIG: JSON.stringify({ apiUrl: "http://public.example.test", apiKey: "" }),
+        SANDBOX_API_URL: "https://env.example.test",
+        SANDBOX_API_KEY: "env-key",
+      },
+    })
+    if (!hooks) throw new Error("environment-overridden sandbox plugin did not initialize")
+    cleanups.push(hooks.dispose)
+
+    const emptyLogs: string[] = []
+    await expect(createSandboxPlugin(input, {
+      env: { ...baseEnv, SANDBOX_API_KEY: "" },
+      log: (message) => emptyLogs.push(message),
+    })).resolves.toBeUndefined()
+    expect(emptyLogs.join(" ")).not.toContain("file-key")
   })
 })
 
@@ -4863,6 +4939,13 @@ describe("Docker Sandbox provider", () => {
 })
 
 describe("Cloudflare Sandbox bridge", () => {
+  it("uses HTTPS or loopback HTTP and rejects URL credentials", () => {
+    const options = { apiKey: "test-key" }
+    expect(() => new CloudflareBridgeClient({ ...options, apiUrl: "https://user:password@bridge.example.test" })).toThrow(/credentials/i)
+    expect(() => new CloudflareBridgeClient({ ...options, apiUrl: "http://bridge.example.test" })).toThrow(/HTTPS/i)
+    expect(() => new CloudflareBridgeClient({ ...options, apiUrl: "http://127.0.0.1" })).not.toThrow()
+  })
+
   it("sends bearer authentication and parses streamed command output", async () => {
     const requests: Array<{ url: string; headers: Headers; body: string }> = []
     const output = Buffer.from("hello\n").toString("base64")

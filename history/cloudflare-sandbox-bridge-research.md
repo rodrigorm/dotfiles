@@ -145,9 +145,36 @@ Não atualizar apenas um dos dois.
 
 ## Configuração local
 
-Depois do deploy, o adapter local requer `SANDBOX_API_URL` e
-`SANDBOX_API_KEY`; `SANDBOX_PROVIDER=cloudflare` seleciona o provider. A URL é
-a raiz do Worker, sem acrescentar `/v1`:
+Depois do deploy, `SANDBOX_PROVIDER=cloudflare` seleciona o provider. A URL é a
+raiz do Worker, sem acrescentar `/v1`. Também é possível configurar um projeto
+literalmente em `.opencode/sandbox.json`:
+
+```json
+{
+  "provider": "cloudflare",
+  "apiUrl": "https://<worker>.<subdomain>.workers.dev",
+  "apiKey": "<sandbox-api-key>"
+}
+```
+
+A precedência, da menor para a maior, é: defaults (com `apiUrl` e `apiKey`
+nulos), arquivo do projeto, objeto JSON em `SANDBOX_CONFIG`, e cada variável de
+ambiente correspondente (`SANDBOX_API_URL` ou `SANDBOX_API_KEY`) quando ela
+está presente. Uma variável vazia ainda sobrescreve o campo e falha na
+validação. Cloudflare exige os dois campos; outros providers podem omiti-los
+ou usar `null`. A URL aceita HTTPS ou HTTP apenas em loopback permitido e não
+pode conter credenciais.
+
+A opção de arquivo não exclui o segredo do Git: este repositório já rastreia
+`.opencode/sandbox.json`, e não se deve inserir uma chave real nele nem alterar
+silenciosamente seu provider ou versão. Um arquivo com segredo precisa ser
+não rastreado e ignorado antes do uso; adicionar uma regra ao `.gitignore` não
+desrastreia um arquivo existente. Arquivos rastreados podem entrar no capture
+ou archive do Git e no checkout do provider. Portanto, não se deve afirmar que
+uma chave no arquivo será automaticamente excluída; prefira variáveis de
+ambiente ou `SANDBOX_CONFIG`.
+
+A configuração equivalente por ambiente é:
 
 ```sh
 export SANDBOX_PROVIDER=cloudflare

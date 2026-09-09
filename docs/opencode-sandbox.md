@@ -210,7 +210,7 @@ State files reject credential-shaped keys, use private permissions, write atomic
 |---|---|---|---|---|
 | `sbx` | Docker Sandbox clone | Published OpenCode port plus supervised SSH control proxy | `sbx` CLI and Docker Sandbox support | Session inspect plus project inventory; inspect reads the durable ownership marker |
 | `exedev` | exe.dev VM | SSH and remote control socket | exe.dev access, SSH lobby, pinned host key | Session inspect plus project inventory; inspect matches durable VM identity and owner tag |
-| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `SANDBOX_API_URL` and `SANDBOX_API_KEY` | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter. Exec stdin is staged through the bridge file PUT contract. |
+| `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `apiUrl` and `apiKey` in the project config, or matching `SANDBOX_API_URL` and `SANDBOX_API_KEY` environment variables | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter. Exec stdin is staged through the bridge file PUT contract. |
 
 All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
 
@@ -220,10 +220,33 @@ The five-method `RuntimeDriver` seam is exercised by the fake adapter and the de
 
 Configuration precedence, lowest to highest:
 
-1. Defaults in `sandbox/config.ts`.
+1. Defaults in `sandbox/config.ts` (`apiUrl` and `apiKey` are `null`).
 2. `<project-worktree>/.opencode/sandbox.json`.
 3. The JSON object in `SANDBOX_CONFIG`.
 4. `SANDBOX_PROVIDER` for provider selection.
+5. A present `SANDBOX_API_URL` or `SANDBOX_API_KEY`, independently overriding its matching field. An empty value is still an override and is invalid.
+
+Cloudflare project configuration can use these literal fields:
+
+```json
+{
+  "provider": "cloudflare",
+  "apiUrl": "https://<worker>.<subdomain>.workers.dev",
+  "apiKey": "<sandbox-api-key>"
+}
+```
+
+`apiUrl` and `apiKey` may be absent or `null` for other providers. Cloudflare
+requires both. The URL must use HTTPS, or HTTP on an allowed loopback host,
+and must not contain credentials.
+
+This repository's `.opencode/sandbox.json` is tracked and intentionally keeps
+its existing provider and version settings. Do not put a real Cloudflare key
+in that file. A secret-bearing project file must be untracked and ignored
+before use; adding a `.gitignore` rule does not stop an already tracked file
+from being tracked. Tracked configuration is eligible for Git capture/archive
+and provider checkout, so credentials in the file are not automatically
+excluded. Prefer environment variables or `SANDBOX_CONFIG` for secrets.
 
 This repository selects `sbx` and OpenCode `1.18.25` in `.opencode/sandbox.json`. The tracked plugin dependency and default remote version remain `1.18.23`; the project override is deliberate. `/sandbox diagnose` reports these configured, dependency, and observed remote version sources when available, without inferring a missing local version.
 

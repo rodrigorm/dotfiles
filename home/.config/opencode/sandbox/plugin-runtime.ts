@@ -92,7 +92,8 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
 
   try {
     assertExperimentalWorkspacesEnabled(env)
-    const config = parseConfig(options.config ?? (await configFromEnvironment(input.worktree, env)), env)
+    const configInput = options.config ?? (await configFromEnvironment(input.worktree, env))
+    const config = parseConfig(withApiEnvironmentOverrides(configInput, env), env)
     const authContent = await resolveAuthContent(env)
     const runtimeRoot = runtimeDirectory(env)
     const controlSocket = join(runtimeRoot, `oe-${shortHash(`${process.pid}:${input.project.id}`)}`, "c.sock")
@@ -273,16 +274,14 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
                 })
               }
               if (config.provider === "cloudflare") {
-                const apiUrl = env.SANDBOX_API_URL
-                const apiKey = env.SANDBOX_API_KEY
-                if (!apiUrl || !apiKey) {
-                  throw new SandboxError("validate", "Cloudflare provider requires SANDBOX_API_URL and SANDBOX_API_KEY", "CLOUDFLARE_CONFIG")
+                if (!config.apiUrl || !config.apiKey) {
+                  throw new SandboxError("validate", "Cloudflare provider requires apiUrl and apiKey", "CLOUDFLARE_CONFIG")
                 }
                 return createCloudflareSandcastleAdapter({
                   input: adapterInput,
                   worktree: input.worktree,
-                  apiUrl,
-                  apiKey,
+                  apiUrl: config.apiUrl,
+                  apiKey: config.apiKey,
                   fetcher: options.fetcher,
                   remotePort: config.remotePort,
                   healthTimeoutMs: config.healthTimeoutMs,
@@ -794,15 +793,26 @@ function createWorkspaceAdapter(provider: WorkspaceProviderBase): WorkspaceAdapt
 async function configFromEnvironment(worktree: string, env: Record<string, string | undefined>): Promise<unknown> {
   const fileConfig = await configFromProjectFile(worktree)
   const text = env.SANDBOX_CONFIG
-  if (!text) return { ...fileConfig, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
-  try {
-    const value = JSON.parse(text)
-    if (!isRecord(value)) throw new SandboxError("validate", "SANDBOX_CONFIG must contain a JSON object", "CONFIG_JSON_TYPE")
-    return { ...fileConfig, ...value, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
-  } catch (error) {
-    if (error instanceof SandboxError) throw error
-    throw new SandboxError("validate", "SANDBOX_CONFIG is not valid JSON", "CONFIG_JSON")
+  let config = { ...fileConfig, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
+  if (text) {
+    try {
+      const value = JSON.parse(text)
+      if (!isRecord(value)) throw new SandboxError("validate", "SANDBOX_CONFIG must contain a JSON object", "CONFIG_JSON_TYPE")
+      config = { ...fileConfig, ...value, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
+    } catch (error) {
+      if (error instanceof SandboxError) throw error
+      throw new SandboxError("validate", "SANDBOX_CONFIG is not valid JSON", "CONFIG_JSON")
+    }
   }
+  return config
+}
+
+function withApiEnvironmentOverrides(value: unknown, env: Record<string, string | undefined>): unknown {
+  if (!isRecord(value)) return value
+  const result = { ...value }
+  if (Object.hasOwn(env, "SANDBOX_API_URL")) result.apiUrl = env.SANDBOX_API_URL
+  if (Object.hasOwn(env, "SANDBOX_API_KEY")) result.apiKey = env.SANDBOX_API_KEY
+  return result
 }
 
 async function configFromProjectFile(worktree: string): Promise<Record<string, unknown>> {

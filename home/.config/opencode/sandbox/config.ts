@@ -1,9 +1,12 @@
 import { isAbsolute, join } from "node:path"
 
+import { parseCloudflareBridgeUrl } from "./cloudflare-bridge"
 import { isRecord, SandboxError, type SandboxConfig, type WorkspaceProviderId } from "./types"
 
 export const DEFAULT_CONFIG = {
   provider: "exedev",
+  apiUrl: null,
+  apiKey: null,
   baseVm: null,
   cpu: 2,
   memory: "8GB",
@@ -39,6 +42,27 @@ export function parseConfig(
   const provider = input.provider === undefined ? DEFAULT_CONFIG.provider : input.provider
   if (provider !== "exedev" && provider !== "sbx" && provider !== "cloudflare") {
     throw new SandboxError("validate", "provider must be exedev, sbx, or cloudflare", "CONFIG_PROVIDER")
+  }
+
+  const apiUrl = input.apiUrl === undefined ? DEFAULT_CONFIG.apiUrl : input.apiUrl
+  if (apiUrl !== null && (!isString(apiUrl) || apiUrl.length === 0)) {
+    throw new SandboxError("validate", "apiUrl must be null or a non-empty string", "CONFIG_API_URL")
+  }
+  if (apiUrl !== null) {
+    try {
+      parseCloudflareBridgeUrl(apiUrl)
+    } catch (error) {
+      if (error instanceof SandboxError) throw new SandboxError("validate", error.message, "CONFIG_API_URL")
+      throw error
+    }
+  }
+
+  const apiKey = input.apiKey === undefined ? DEFAULT_CONFIG.apiKey : input.apiKey
+  if (apiKey !== null && (!isString(apiKey) || apiKey.length === 0)) {
+    throw new SandboxError("validate", "apiKey must be null or a non-empty string", "CONFIG_API_KEY")
+  }
+  if (provider === "cloudflare" && (apiUrl === null || apiKey === null)) {
+    throw new SandboxError("validate", "Cloudflare provider requires apiUrl and apiKey", "CLOUDFLARE_CONFIG")
   }
 
   const cpu = input.cpu === undefined ? DEFAULT_CONFIG.cpu : input.cpu
@@ -96,6 +120,8 @@ export function parseConfig(
 
   return {
     provider: provider as WorkspaceProviderId,
+    apiUrl,
+    apiKey,
     baseVm,
     cpu,
     memory,
