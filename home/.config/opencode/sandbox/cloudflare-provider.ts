@@ -47,6 +47,7 @@ const TRANSFER_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-sandbox/transfers`
 const BOOTSTRAP = (version: string) => `set -eu
 command -v git >/dev/null 2>&1
 command -v bun >/dev/null 2>&1
+export PATH="\${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
 if ! command -v opencode >/dev/null 2>&1; then
     bun install --global opencode-ai@${shellQuote(version)}
 fi
@@ -702,17 +703,24 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const tunnel = activation.tunnel
     if (!tunnel) throw new SandboxError("tunnel", "Cloudflare sandbox tunnel is unavailable", "RUNTIME_UNAVAILABLE")
     const deadline = Date.now() + this.healthTimeoutMs
+    let lastFailure: HealthFailure | undefined
     while (Date.now() < deadline) {
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 2_000)
       try {
-        const response = await this.fetcher(`${tunnel.url}/global/health`, {
-          headers: { Authorization: basicAuthHeader(activation.password) },
-          signal: controller.signal,
-        })
-        if (response.ok) {
-          const value = await readHealthResponse(response, controller.signal).catch(() => undefined)
-          if (isRecord(value) && value.healthy === true) return
+        const response = await waitForAbort(
+          () => this.fetcher(`${tunnel.url}/global/health`, {
+            headers: { Authorization: basicAuthHeader(activation.password) },
+            signal: controller.signal,
+          }),
+          controller.signal,
+          (lateResponse) => lateResponse.body?.cancel(),
+        )
+        const health = await readHealthResponse(response, controller.signal)
+        if (!response.ok) {
+          lastFailure = { status: response.status, subcode: health.subcode }
+        } else if (isRecord(health.value) && health.value.healthy === true) {
+          return
         }
       } catch {
         // The tunnel may need a moment after the container starts.
@@ -721,7 +729,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       }
       await delay(250)
     }
-    throw new SandboxError("remote_health", "Cloudflare OpenCode health check timed out", "REMOTE_HEALTH_TIMEOUT")
+    throw new SandboxError("remote_health", healthTimeoutMessage(lastFailure), "REMOTE_HEALTH_TIMEOUT")
   }
 
   private async activeHealth(activation: Activation, signal?: AbortSignal): Promise<{ healthy?: boolean; version?: string } | undefined> {
@@ -741,9 +749,9 @@ export class CloudflareProvider implements WorkspaceProviderBase {
         controller.signal,
         (lateResponse) => lateResponse.body?.cancel(),
       )
-      if (!response.ok) return undefined
-      const value = await readHealthResponse(response, controller.signal)
-      if (!isRecord(value)) return undefined
+      const health = await readHealthResponse(response, controller.signal)
+      if (!response.ok || !isRecord(health.value)) return undefined
+      const value = health.value
       return {
         ...(typeof value.healthy === "boolean" ? { healthy: value.healthy } : {}),
         ...(typeof value.version === "string" && /^[A-Za-z0-9._-]{1,128}$/.test(value.version) ? { version: value.version } : {}),
@@ -885,12 +893,53 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   }
 }
 
-async function readHealthResponse(response: Response, signal: AbortSignal): Promise<unknown> {
+interface HealthResponse {
+  value?: unknown
+  subcode?: number
+}
+
+async function readHealthResponse(response: Response, signal: AbortSignal): Promise<HealthResponse> {
+  let text: string
   try {
-    return JSON.parse(await readLimitedBody(response, signal, "diagnose"))
+    text = await readLimitedBody(response, signal, "diagnose")
   } catch {
-    return undefined
+    return {}
   }
+  let value: unknown
+  try {
+    value = JSON.parse(text)
+  } catch {
+    // Cloudflare error pages are often HTML rather than JSON.
+  }
+  return { value, subcode: cloudflareSubcode(text) }
+}
+
+interface HealthFailure {
+  status: number
+  subcode?: number
+}
+
+function cloudflareSubcode(text: string): number | undefined {
+  for (const pattern of [
+    /\b(?:cloudflare\s+)?error\s+(1\d{3})\b/i,
+    /\b(?:cf[-\s]?|subcode\s*[:=]\s*|code\s*[:=]\s*)(1\d{3})\b/i,
+  ]) {
+    const value = text.match(pattern)?.[1]
+    if (value) return Number(value)
+  }
+  return undefined
+}
+
+function healthTimeoutMessage(failure: HealthFailure | undefined): string {
+  const status = failure && Number.isInteger(failure.status) && failure.status >= 100 && failure.status <= 599 ? `HTTP ${failure.status}` : undefined
+  const subcodeValue = failure?.subcode
+  const subcode = typeof subcodeValue === "number" && Number.isInteger(subcodeValue) && subcodeValue >= 1000 && subcodeValue <= 1999
+    ? `CF${subcodeValue}`
+    : undefined
+  const details = [status, subcode].filter((value): value is string => Boolean(value))
+  return details.length > 0
+    ? `Cloudflare OpenCode health check timed out (last ${details.join(", ")})`
+    : "Cloudflare OpenCode health check timed out"
 }
 
 export interface CloudflareSandcastleAdapterOptions extends CloudflareProviderOptions {
@@ -1107,7 +1156,7 @@ password_file=${quotedPassword}
 workspace_id=${quotedWorkspaceId}
 log_file=${quotedLog}
 pid_file=${quotedPid}
-${controlSetup}export PATH="$runtime/bin:$PATH"
+${controlSetup}export PATH="$runtime/bin:\${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
 if [ -s "$pid_file" ]; then
     old_pid=$(cat "$pid_file")
     case "$old_pid" in

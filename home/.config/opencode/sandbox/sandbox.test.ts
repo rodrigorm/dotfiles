@@ -5434,6 +5434,47 @@ describe("provider health responses", () => {
     }
   })
 
+  it("retains safe Cloudflare health status and subcode diagnostics", async () => {
+    const body = "<html>Error 1033 https://secret.example.test Cookie: session=private Authorization: Bearer private</html>"
+    const provider = new CloudflareProvider({
+      worktree: await temporaryDirectory(),
+      client: {} as CloudflareSandboxClient,
+      healthTimeoutMs: 1,
+      fetcher: (async () => new Response(body, { status: 530 })) as unknown as typeof fetch,
+    })
+
+    let error: unknown
+    try {
+      await invokeHealthCheck(provider, { tunnel: { url: "https://sandbox.example.test" }, password: "private" })
+    } catch (value) {
+      error = value
+    }
+
+    expect(error).toMatchObject({ code: "REMOTE_HEALTH_TIMEOUT" })
+    const message = String((error as Error).message)
+    expect(message).toContain("530")
+    expect(message).toContain("1033")
+    expect(message).not.toContain("<html>")
+    expect(message).not.toContain("secret.example.test")
+    expect(message).not.toContain("session=private")
+    expect(message).not.toContain("Bearer private")
+  })
+
+  it("cancels oversized non-OK Cloudflare health bodies", async () => {
+    const health = oversizedHealthFetcher(530)
+    const provider = new CloudflareProvider({
+      worktree: await temporaryDirectory(),
+      client: {} as CloudflareSandboxClient,
+      healthTimeoutMs: 1,
+      fetcher: health.fetcher,
+    })
+
+    await expect(invokeHealthCheck(provider, { tunnel: { url: "https://sandbox.example.test" }, password: "private" })).rejects.toMatchObject({
+      code: "REMOTE_HEALTH_TIMEOUT",
+    })
+    expect(health.cancelled()).toBe(true)
+  })
+
   it("settles Cloudflare diagnostic health when the injected fetcher ignores abort", async () => {
     const diagnostic = new AbortController()
     let signal: AbortSignal | undefined
@@ -5488,6 +5529,7 @@ describe("Cloudflare Sandbox provider", () => {
     const checkoutHead = "fedcba9876543210fedcba9876543210fedcba98"
     let observedHead = checkoutHead
     const calls: string[] = []
+    const remoteCommands: string[] = []
     const client: CloudflareSandboxClient = {
       async createSandbox() {
         calls.push("create")
@@ -5505,6 +5547,7 @@ describe("Cloudflare Sandbox provider", () => {
       },
       async exec(id, input) {
         calls.push(`exec:${id}:${input.argv[0] ?? ""}`)
+        if (input.argv[0] === "sh" && input.argv[1] === "-lc") remoteCommands.push(input.argv[2] ?? "")
         if (input.argv.includes("--is-inside-work-tree")) return { exitCode: 0, signal: null, stdout: "true\n", stderr: "" }
         if (input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") return { exitCode: 0, signal: null, stdout: `${observedHead}\n`, stderr: "" }
         if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: "opencode/sandbox-cf\n", stderr: "" }
@@ -5551,6 +5594,8 @@ describe("Cloudflare Sandbox provider", () => {
 
     await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
     expect(calls).toContain("create")
+    expect(remoteCommands.some((command) => command.includes('export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"'))).toBe(true)
+    expect(remoteCommands.some((command) => command.includes('export PATH="$runtime/bin:${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"'))).toBe(true)
     expect(calls.some((call) => call.startsWith("hydrate:sandboxa2:"))).toBe(true)
     expect(calls.some((call) => call.startsWith("tunnel:sandboxa2:4096:oc-"))).toBe(true)
     await expect(provider.target(info)).resolves.toMatchObject({
@@ -6146,7 +6191,7 @@ describe("working tree capture", () => {
   })
 })
 
-function oversizedHealthFetcher(): { fetcher: typeof fetch; cancelled: () => boolean } {
+function oversizedHealthFetcher(status = 200): { fetcher: typeof fetch; cancelled: () => boolean } {
   let cancelled = false
   let closeTimer: ReturnType<typeof setTimeout> | undefined
   const body = Buffer.concat([
@@ -6170,7 +6215,7 @@ function oversizedHealthFetcher(): { fetcher: typeof fetch; cancelled: () => boo
         cancelled = true
         if (closeTimer) clearTimeout(closeTimer)
       },
-    }), { status: 200 })) as unknown as typeof fetch,
+    }), { status })) as unknown as typeof fetch,
     cancelled: () => cancelled,
   }
 }
