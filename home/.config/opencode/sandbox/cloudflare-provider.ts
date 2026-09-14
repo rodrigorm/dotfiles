@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url"
 
 import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 
+import { DEFAULT_CLOUDFLARE_HEALTH_TIMEOUT_MS } from "./config"
 import {
   assertSandboxId,
   CloudflareBridgeClient,
@@ -20,6 +21,7 @@ import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart
 import { redactError, redactText } from "./redaction"
 import { readLimitedBody } from "./workspace-http"
 import { requestControl } from "./cli"
+import { captureWorkingTree, syncBackWorkingTree as syncBackLocalWorkingTree } from "./working-tree"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
   isNodeError,
@@ -36,12 +38,12 @@ import {
 } from "./types"
 
 const REMOTE_DIRECTORY = "/workspace"
-const REMOTE_CHECKOUT_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-worktree`
+export const REMOTE_CHECKOUT_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-worktree`
 const DEFAULT_REMOTE_PORT = 4096
-const DEFAULT_HEALTH_TIMEOUT_MS = 30_000
 const DEFAULT_BOOTSTRAP_TIMEOUT_MS = 600_000
 const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
+const MAX_HEALTH_EVIDENCE_BYTES = 1024
 const TRANSFER_DIRECTORY = `${REMOTE_DIRECTORY}/.opencode-sandbox/transfers`
 
 const BOOTSTRAP = (version: string) => `set -eu
@@ -140,10 +142,11 @@ export class CloudflareProvider implements WorkspaceProviderBase {
   constructor(options: CloudflareProviderOptions) {
     this.client = options.client ?? createClient(options)
     this.worktree = options.worktree
+    assertAliasPath(this.worktree, "host worktree alias")
     this.runner = options.runner ?? nodeProcessRunner
     this.fetcher = options.fetcher ?? fetch
     this.remotePort = options.remotePort ?? DEFAULT_REMOTE_PORT
-    this.healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS
+    this.healthTimeoutMs = options.healthTimeoutMs ?? DEFAULT_CLOUDFLARE_HEALTH_TIMEOUT_MS
     this.bootstrapTimeoutMs = options.bootstrapTimeoutMs ?? DEFAULT_BOOTSTRAP_TIMEOUT_MS
     this.openCodeVersion = options.openCodeVersion ?? DEFAULT_OPENCODE_VERSION
     this.deferActivation = options.deferActivation ?? false
@@ -252,6 +255,12 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     if (activation.tunnel) return
     if (!activation.authContent) throw new SandboxError("bootstrap", "OpenCode auth content is unavailable", "AUTH_UNAVAILABLE")
 
+    // Sandcastle's bundle clone does not carry the host repo's project cache.
+    await this.client.putFile(
+      activation.sandboxId,
+      `${this.checkoutDirectory()}/.git/opencode`,
+      new TextEncoder().encode(activation.projectId),
+    )
     await this.startServer(activation)
     activation.tunnel = await this.client.tunnel(activation.sandboxId, this.remotePort, activation.tunnelName)
     await this.waitForHealth(activation)
@@ -682,6 +691,11 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const passwordPath = `${runtime}/password`
     const controlTokenPath = activation.controlToken ? `${runtime}/control-token` : undefined
     if (!activation.authContent) throw new SandboxError("bootstrap", "OpenCode auth content is unavailable", "AUTH_UNAVAILABLE")
+    await this.run(
+      activation.sandboxId,
+      { argv: ["sh", "-lc", worktreeAliasCommand(this.worktree, this.checkoutDirectory())], cwd: this.checkoutDirectory() },
+      "bootstrap",
+    )
     await this.run(activation.sandboxId, { argv: ["mkdir", "-p", "--", runtime] }, "bootstrap")
     try {
       await this.client.putFile(activation.sandboxId, authPath, new TextEncoder().encode(activation.authContent))
@@ -705,6 +719,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const deadline = Date.now() + this.healthTimeoutMs
     let lastFailure: HealthFailure | undefined
     while (Date.now() < deadline) {
+      const attemptStartedAt = Date.now()
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 2_000)
       try {
@@ -717,10 +732,21 @@ export class CloudflareProvider implements WorkspaceProviderBase {
           (lateResponse) => lateResponse.body?.cancel(),
         )
         const health = await readHealthResponse(response, controller.signal)
-        if (!response.ok) {
-          lastFailure = { status: response.status, subcode: health.subcode }
-        } else if (isRecord(health.value) && health.value.healthy === true) {
-          return
+        if (response.ok && isRecord(health.value) && health.value.healthy === true) return
+        const hostname = new URL(tunnel.url).hostname
+        const secrets = [activation.password, basicAuthHeader(activation.password), activation.authContent ?? ""]
+        const tunnelId = typeof tunnel.id === "string" && tunnel.id.length > 0
+          ? trimHealthEvidence(redactText(tunnel.id.replace(/[\r\n]/g, " "), secrets))
+          : undefined
+        const cfRay = response.headers.get("cf-ray")
+        lastFailure = {
+          status: response.status,
+          ...(health.subcode === undefined ? {} : { subcode: health.subcode }),
+          hostname,
+          ...(tunnelId ? { tunnelId } : {}),
+          elapsedMs: Math.max(0, Date.now() - attemptStartedAt),
+          ...(cfRay ? { cfRay: trimHealthEvidence(redactText(cfRay, secrets)) } : {}),
+          ...(health.text ? { body: trimHealthEvidence(redactText(health.text, secrets)) } : {}),
         }
       } catch {
         // The tunnel may need a moment after the container starts.
@@ -729,7 +755,12 @@ export class CloudflareProvider implements WorkspaceProviderBase {
       }
       await delay(250)
     }
-    throw new SandboxError("remote_health", healthTimeoutMessage(lastFailure), "REMOTE_HEALTH_TIMEOUT")
+    throw new SandboxError(
+      "remote_health",
+      healthTimeoutMessage(lastFailure),
+      "REMOTE_HEALTH_TIMEOUT",
+      lastFailure ? { ...lastFailure } : undefined,
+    )
   }
 
   private async activeHealth(activation: Activation, signal?: AbortSignal): Promise<{ healthy?: boolean; version?: string } | undefined> {
@@ -832,8 +863,8 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     const stagedPath = `${TRANSFER_DIRECTORY}/out-${randomBytes(8).toString("hex")}`
     await this.run(activation.sandboxId, { argv: ["mkdir", "-p", "--", TRANSFER_DIRECTORY] }, "sync")
     try {
-      await this.run(activation.sandboxId, { argv: ["test", "-f", "--", sandboxPath] }, "sync")
-      const link = await this.client.exec(activation.sandboxId, { argv: ["test", "-L", "--", sandboxPath] })
+      await this.run(activation.sandboxId, { argv: ["test", "-f", sandboxPath] }, "sync")
+      const link = await this.client.exec(activation.sandboxId, { argv: ["test", "-L", sandboxPath] })
       if (link.exitCode === 0) throw new SandboxError("sync", "refusing to copy a symbolic link from the sandbox", "COPY_OUT")
       await this.run(activation.sandboxId, { argv: ["cp", "--", sandboxPath, stagedPath] }, "sync")
       const content = await this.client.getFile(activation.sandboxId, stagedPath)
@@ -896,6 +927,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
 interface HealthResponse {
   value?: unknown
   subcode?: number
+  text?: string
 }
 
 async function readHealthResponse(response: Response, signal: AbortSignal): Promise<HealthResponse> {
@@ -911,12 +943,18 @@ async function readHealthResponse(response: Response, signal: AbortSignal): Prom
   } catch {
     // Cloudflare error pages are often HTML rather than JSON.
   }
-  return { value, subcode: cloudflareSubcode(text) }
+  const visibleText = visibleHealthText(text)
+  return { value, subcode: cloudflareSubcode(text) ?? cloudflareSubcode(visibleText), text: visibleText }
 }
 
 interface HealthFailure {
   status: number
   subcode?: number
+  hostname: string
+  tunnelId?: string
+  elapsedMs: number
+  cfRay?: string
+  body?: string
 }
 
 function cloudflareSubcode(text: string): number | undefined {
@@ -928,6 +966,24 @@ function cloudflareSubcode(text: string): number | undefined {
     if (value) return Number(value)
   }
   return undefined
+}
+
+function visibleHealthText(text: string): string {
+  const withoutEmbeddedContent = text
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ")
+  return withoutEmbeddedContent
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&(?:nbsp|#160|#xA0);/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function trimHealthEvidence(value: string): string {
+  const bytes = Buffer.from(value)
+  return bytes.byteLength <= MAX_HEALTH_EVIDENCE_BYTES
+    ? value
+    : new TextDecoder().decode(bytes.subarray(0, MAX_HEALTH_EVIDENCE_BYTES))
 }
 
 function healthTimeoutMessage(failure: HealthFailure | undefined): string {
@@ -950,6 +1006,7 @@ export interface CloudflareSandcastleAdapterOptions extends CloudflareProviderOp
 export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleAdapterOptions): OpenCodeSandboxAdapter {
   const { input, authContent, ...providerOptions } = options
   const provider = new CloudflareProvider({ ...providerOptions, deferActivation: true })
+  let baseline: WorkingTreeCapture | undefined
   const info: WorkspaceInfo = {
     id: input.workspaceId,
     type: "cloudflare",
@@ -979,9 +1036,29 @@ export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleA
     applyCapture: async ({ capture }) => {
       await provider.syncIn(input.workspaceId, capture)
       await provider.activate(input.workspaceId)
+      baseline = capture
+    },
+    syncBackWorkingTree: async ({ sandbox, worktreePath }) => {
+      if (!baseline) throw new SandboxError("sync", "Cloudflare working tree baseline is unavailable", "SYNC_BASELINE_UNAVAILABLE")
+      let remoteTreeResult: Awaited<ReturnType<typeof sandbox.exec>>
+      try {
+        remoteTreeResult = await sandbox.exec("git rev-parse HEAD^{tree}")
+      } catch (error) {
+        if (error instanceof SandboxError) throw error
+        throw new SandboxError("sync", redactError(error), "REMOTE_TREE")
+      }
+      if (remoteTreeResult.exitCode !== 0) {
+        throw new SandboxError("sync", redactText(remoteTreeResult.stderr || "could not read the Cloudflare Git tree"), "REMOTE_TREE")
+      }
+      const remoteTree = remoteTreeResult.stdout.trim()
+      if (!/^[a-f0-9]{40}$/i.test(remoteTree)) {
+        throw new SandboxError("sync", "Cloudflare returned an invalid Git tree", "REMOTE_TREE")
+      }
+      await syncBackLocalWorkingTree(input.context, baseline, { worktreePath, remoteTree })
+      baseline = await captureWorkingTree(input.context)
     },
     target: () => provider.target(info),
-    inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
+    inspect: (signal?: AbortSignal) => provider.diagnose(info, signal),
     diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
     recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
     close: () => provider.close(info),
@@ -1104,7 +1181,15 @@ function runtimeDirectory(workspaceId: string): string {
 }
 
 function assertRemotePath(value: string, label: string): void {
-  if (!isAbsolute(value) || value.includes("\0") || value.includes("\n") || value.includes("\r")) {
+  if (typeof value !== "string" || !isAbsolute(value) || value.includes("\0") || value.includes("\n") || value.includes("\r")) {
+    throw new SandboxError("validate", `${label} path is unsafe`, "PATH_INVALID")
+  }
+}
+
+function assertAliasPath(value: string, label: string): void {
+  assertRemotePath(value, label)
+  const parts = value.split("/").slice(1)
+  if (value === "/" || parts.some((part) => part.length === 0 || part === "." || part === "..")) {
     throw new SandboxError("validate", `${label} path is unsafe`, "PATH_INVALID")
   }
 }
@@ -1123,6 +1208,34 @@ function sameSecret(left: string, right: string): boolean {
 
 function tunnelNameFor(workspaceId: string): string {
   return `oc-${shortHash(workspaceId)}`
+}
+
+function worktreeAliasCommand(worktree: string, checkoutDirectory: string): string {
+  assertAliasPath(worktree, "host worktree alias")
+  assertAliasPath(checkoutDirectory, "remote checkout")
+  const quotedWorktree = shellQuote(worktree)
+  const quotedCheckout = shellQuote(checkoutDirectory)
+  const quotedParent = shellQuote(posix.dirname(worktree))
+  return `set -eu
+alias_path=${quotedWorktree}
+checkout_path=${quotedCheckout}
+if [ "$alias_path" = "$checkout_path" ]; then
+    exit 0
+fi
+if [ -L "$alias_path" ]; then
+    existing_target=$(readlink -- "$alias_path")
+    if [ "$existing_target" != "$checkout_path" ]; then
+        printf '%s\\n' 'Cloudflare worktree alias conflicts with an existing remote path' >&2
+        exit 1
+    fi
+elif [ -e "$alias_path" ]; then
+    printf '%s\\n' 'Cloudflare worktree alias conflicts with an existing remote path' >&2
+    exit 1
+else
+    mkdir -p -- ${quotedParent}
+    ln -s -- "$checkout_path" "$alias_path"
+fi
+`
 }
 
 function serverCommand(

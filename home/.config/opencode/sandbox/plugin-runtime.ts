@@ -4,14 +4,14 @@ import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { Database } from "bun:sqlite"
 
-import { assertExperimentalWorkspacesEnabled, parseConfig } from "./config"
+import { assertExperimentalWorkspacesEnabled, loadConfig, parseConfig, withApiEnvironmentOverrides } from "./config"
 import { ControlChannel } from "./control-channel"
 import { SshExeControl, type ExeControl } from "./exe-control"
 import { LifecycleController, type InfrastructureOperations } from "./lifecycle"
 import { shortHash } from "./naming"
 import { createExedevSandcastleAdapter, ExedevProvider, ensureExeDevHostKey } from "./exedev-provider"
 import { createSbxSandcastleAdapter, SbxProvider } from "./sbx-provider"
-import { createCloudflareSandcastleAdapter } from "./cloudflare-provider"
+import { createCloudflareSandcastleAdapter, REMOTE_CHECKOUT_DIRECTORY } from "./cloudflare-provider"
 import { redactError } from "./redaction"
 import { FileStateStore } from "./state-store"
 import type { SandcastleAdapterInput, SandcastleSessionFactory } from "./sandcastle-session"
@@ -92,8 +92,9 @@ export async function createSandboxPlugin(input: PluginInputLike, options: Sandb
 
   try {
     assertExperimentalWorkspacesEnabled(env)
-    const configInput = options.config ?? (await configFromEnvironment(input.worktree, env))
-    const config = parseConfig(withApiEnvironmentOverrides(configInput, env), env)
+    const config = options.config !== undefined && options.config !== null
+      ? parseConfig(withApiEnvironmentOverrides(options.config, env), env)
+      : await loadConfig(input.worktree, env)
     const authContent = await resolveAuthContent(env)
     const runtimeRoot = runtimeDirectory(env)
     const controlSocket = join(runtimeRoot, `oe-${shortHash(`${process.pid}:${input.project.id}`)}`, "c.sock")
@@ -755,7 +756,11 @@ function createSandcastleWorkspaceAdapter(options: SandcastleWorkspaceOptions, c
     name: options.name,
     description: options.description,
     configure(info) {
-      return { ...info, extra: nonSecretExtra(info.extra) }
+      return {
+        ...info,
+        directory: options.type === "cloudflare" ? REMOTE_CHECKOUT_DIRECTORY : info.directory,
+        extra: nonSecretExtra(info.extra),
+      }
     },
     async create() {},
     async remove() {},
@@ -787,50 +792,6 @@ function createWorkspaceAdapter(provider: WorkspaceProviderBase): WorkspaceAdapt
     target(info) {
       return provider.target(info)
     },
-  }
-}
-
-async function configFromEnvironment(worktree: string, env: Record<string, string | undefined>): Promise<unknown> {
-  const fileConfig = await configFromProjectFile(worktree)
-  const text = env.SANDBOX_CONFIG
-  let config = { ...fileConfig, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
-  if (text) {
-    try {
-      const value = JSON.parse(text)
-      if (!isRecord(value)) throw new SandboxError("validate", "SANDBOX_CONFIG must contain a JSON object", "CONFIG_JSON_TYPE")
-      config = { ...fileConfig, ...value, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
-    } catch (error) {
-      if (error instanceof SandboxError) throw error
-      throw new SandboxError("validate", "SANDBOX_CONFIG is not valid JSON", "CONFIG_JSON")
-    }
-  }
-  return config
-}
-
-function withApiEnvironmentOverrides(value: unknown, env: Record<string, string | undefined>): unknown {
-  if (!isRecord(value)) return value
-  const result = { ...value }
-  if (Object.hasOwn(env, "SANDBOX_API_URL")) result.apiUrl = env.SANDBOX_API_URL
-  if (Object.hasOwn(env, "SANDBOX_API_KEY")) result.apiKey = env.SANDBOX_API_KEY
-  return result
-}
-
-async function configFromProjectFile(worktree: string): Promise<Record<string, unknown>> {
-  const path = join(worktree, ".opencode", "sandbox.json")
-  let text: string
-  try {
-    text = await readFile(path, "utf8")
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) return {}
-    throw new SandboxError("validate", `could not read ${path}`, "CONFIG_FILE")
-  }
-  try {
-    const value = JSON.parse(text)
-    if (!isRecord(value)) throw new SandboxError("validate", `${path} must contain a JSON object`, "CONFIG_FILE_TYPE")
-    return value
-  } catch (error) {
-    if (error instanceof SandboxError) throw error
-    throw new SandboxError("validate", `${path} is not valid JSON`, "CONFIG_FILE_JSON")
   }
 }
 

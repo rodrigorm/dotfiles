@@ -1,7 +1,8 @@
 import { isAbsolute, join } from "node:path"
+import { readFile } from "node:fs/promises"
 
 import { parseCloudflareBridgeUrl } from "./cloudflare-bridge"
-import { isRecord, SandboxError, type SandboxConfig, type WorkspaceProviderId } from "./types"
+import { isNodeError, isRecord, SandboxError, type SandboxConfig, type WorkspaceProviderId } from "./types"
 
 export const DEFAULT_CONFIG = {
   provider: "exedev",
@@ -17,6 +18,36 @@ export const DEFAULT_CONFIG = {
   healthTimeoutMs: 30_000,
   openCodeVersion: "1.18.23",
 } as const
+
+export const DEFAULT_CLOUDFLARE_HEALTH_TIMEOUT_MS = 180_000
+
+export async function loadConfig(
+  worktree: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<SandboxConfig> {
+  const fileConfig = await configFromProjectFile(worktree)
+  const text = env.SANDBOX_CONFIG
+  let input = { ...fileConfig, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
+  if (text) {
+    try {
+      const value = JSON.parse(text)
+      if (!isRecord(value)) throw new SandboxError("validate", "SANDBOX_CONFIG must contain a JSON object", "CONFIG_JSON_TYPE")
+      input = { ...fileConfig, ...value, ...(env.SANDBOX_PROVIDER ? { provider: env.SANDBOX_PROVIDER } : {}) }
+    } catch (error) {
+      if (error instanceof SandboxError) throw error
+      throw new SandboxError("validate", "SANDBOX_CONFIG is not valid JSON", "CONFIG_JSON")
+    }
+  }
+  return parseConfig(withApiEnvironmentOverrides(input, env), env)
+}
+
+export function withApiEnvironmentOverrides(value: unknown, env: Record<string, string | undefined>): unknown {
+  if (!isRecord(value)) return value
+  const result = { ...value }
+  if (Object.hasOwn(env, "SANDBOX_API_URL")) result.apiUrl = env.SANDBOX_API_URL
+  if (Object.hasOwn(env, "SANDBOX_API_KEY")) result.apiKey = env.SANDBOX_API_KEY
+  return result
+}
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const HOSTNAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,253}$/
@@ -108,7 +139,9 @@ export function parseConfig(
     throw new SandboxError("validate", "bootstrapTimeoutMs must be a positive timeout", "CONFIG_BOOTSTRAP_TIMEOUT")
   }
 
-  const healthTimeoutMs = input.healthTimeoutMs === undefined ? DEFAULT_CONFIG.healthTimeoutMs : input.healthTimeoutMs
+  const healthTimeoutMs = input.healthTimeoutMs === undefined
+    ? provider === "cloudflare" ? DEFAULT_CLOUDFLARE_HEALTH_TIMEOUT_MS : DEFAULT_CONFIG.healthTimeoutMs
+    : input.healthTimeoutMs
   if (!isPositiveInteger(healthTimeoutMs) || healthTimeoutMs > 600_000) {
     throw new SandboxError("validate", "healthTimeoutMs must be a positive timeout", "CONFIG_HEALTH_TIMEOUT")
   }
@@ -132,6 +165,25 @@ export function parseConfig(
     bootstrapTimeoutMs,
     healthTimeoutMs,
     openCodeVersion,
+  }
+}
+
+async function configFromProjectFile(worktree: string): Promise<Record<string, unknown>> {
+  const path = join(worktree, ".opencode", "sandbox.json")
+  let text: string
+  try {
+    text = await readFile(path, "utf8")
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return {}
+    throw new SandboxError("validate", `could not read ${path}`, "CONFIG_FILE")
+  }
+  try {
+    const value = JSON.parse(text)
+    if (!isRecord(value)) throw new SandboxError("validate", `${path} must contain a JSON object`, "CONFIG_FILE_TYPE")
+    return value
+  } catch (error) {
+    if (error instanceof SandboxError) throw error
+    throw new SandboxError("validate", `${path} is not valid JSON`, "CONFIG_FILE_JSON")
   }
 }
 

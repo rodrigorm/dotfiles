@@ -18,7 +18,7 @@ import { nodeProcessRunner } from "./process"
 import { FileStateStore } from "./state-store"
 import { runSyncBarrier } from "./sync-barrier"
 import { captureWorkingTree } from "./working-tree"
-import type { SandcastleSessionFactory } from "./sandcastle-session"
+import { createSandcastleSession, type SandcastleSessionFactory } from "./sandcastle-session"
 import type { GitWorkingTreeObservation, SandboxRecord, SessionContext, WorkspaceInfo } from "./types"
 
 const temporaryDirectories: string[] = []
@@ -28,6 +28,43 @@ afterEach(async () => {
 })
 
 describe("Sandcastle sync barrier", () => {
+  it("runs the adapter sync-back hook after the barrier", async () => {
+    const repository = await createRepository()
+    const baseSha = await runGit(repository, ["rev-parse", "HEAD"])
+    const calls: string[] = []
+    const fake = createFakeProvider({
+      onCommand(command) {
+        if (command.trim() === "true") calls.push("barrier")
+      },
+    })
+    const session = await createSandcastleSession({
+      factory: {
+        createAdapter: async () => ({
+          provider: fake.provider,
+          async applyCapture() {},
+          target: () => ({ type: "remote", url: "https://fake.example.test" }),
+          async syncBackWorkingTree() {
+            calls.push("sync-back")
+          },
+        }),
+      } satisfies SandcastleSessionFactory,
+      context: { sessionId: "ses_sync_hook", projectId: "prj_sync_hook", directory: repository, worktree: repository },
+      workspaceId: "wrk_sync_hook",
+      generation: 1,
+      branch: "opencode/sync-hook",
+      baseSha,
+    })
+
+    try {
+      await session.applyCapture({ baseSha, patch: "", untracked: [] })
+      await session.sync()
+    } finally {
+      await session.close()
+    }
+
+    expect(calls).toEqual(["barrier", "sync-back"])
+  })
+
   it("syncs out-of-band commits and dirty files through the public lifecycle", async () => {
     const repository = await createRepository()
     const fake = createFakeProvider()

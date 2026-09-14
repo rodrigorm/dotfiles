@@ -494,12 +494,14 @@ export interface ProcessSupervisor {
 export class SandboxError extends Error {
   readonly stage: SandboxStage
   readonly code: string
+  readonly details?: Record<string, unknown>
 
-  constructor(stage: SandboxStage, message: string, code = "SANDBOX_ERROR") {
+  constructor(stage: SandboxStage, message: string, code = "SANDBOX_ERROR", details?: Record<string, unknown>) {
     super(message)
     this.name = "SandboxError"
     this.stage = stage
     this.code = code
+    this.details = details
   }
 }
 

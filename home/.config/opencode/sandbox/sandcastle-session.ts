@@ -23,6 +23,7 @@ import {
 export interface OpenCodeSandboxAdapter {
   readonly provider: SandboxProvider
   applyCapture(input: { sandbox: Sandbox; capture: WorkingTreeCapture }): Promise<void>
+  syncBackWorkingTree?(input: { sandbox: Sandbox; worktreePath: string }): Promise<void>
   target(): WorkspaceTarget | Promise<WorkspaceTarget>
   inspect?(signal?: AbortSignal): Promise<ProviderResourceObservation>
   diagnose?(signal?: AbortSignal): Promise<ProviderResourceObservation>
@@ -147,7 +148,9 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
         if (commit.exitCode !== 0) {
           throw new SandboxError("sync", redactText(commit.stderr || "could not commit sandbox changes"), "SANDBOX_COMMIT")
         }
-        return runSyncBarrier(sessionSandbox)
+        const result = await runSyncBarrier(sessionSandbox)
+        await adapter.syncBackWorkingTree?.({ sandbox: sessionSandbox, worktreePath: sessionWorktree.worktreePath })
+        return result
       },
       close() {
         closing ??= (async () => {

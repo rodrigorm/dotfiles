@@ -1,2 +1,3 @@
 .sandcastle/
 .opencode/sandbox.json
+.cloudflare-e2e-*/

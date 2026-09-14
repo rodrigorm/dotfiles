@@ -1,5 +1,7 @@
 import { createCapability } from "./control-channel"
 import { shortHash } from "./naming"
+import { remoteWorkspaceDirectory } from "./exedev-provider"
+import { REMOTE_CHECKOUT_DIRECTORY } from "./cloudflare-provider"
 import { redactError, redactText } from "./redaction"
 import { compatibilityStateForIntent } from "./state"
 import { boundOperationJournal, FileStateStore } from "./state-store"
@@ -4202,7 +4204,7 @@ function workspaceMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
     info.projectID !== record.projectId ||
     info.type !== record.provider ||
     info.branch !== record.branch ||
-    info.directory !== record.directory
+    !workspaceDirectoryMatches(record, info)
   ) return false
   const extra = isRecord(info.extra) ? info.extra : {}
   const state = isRecord(extra.providerState) ? extra.providerState : extra
@@ -4223,7 +4225,28 @@ function workspaceMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
 function workspaceMatchesExactly(record: SandboxRecord, info: WorkspaceInfo): boolean {
   if (!workspaceMatches(record, info)) return false
   const extra = isRecord(info.extra) ? info.extra : undefined
-  return extra?.owner === "opencode-sandbox"
+  if (extra?.owner !== "opencode-sandbox") return false
+  const state = isRecord(extra.providerState) ? extra.providerState : extra
+  for (const [key, expected] of [
+    ["sessionId", record.sessionId],
+    ["generation", record.generation],
+    ["workspaceId", record.workspaceId],
+    ["projectId", record.projectId],
+    ["provider", record.provider],
+  ] as const) {
+    const actual = extra[key] ?? state[key]
+    if (actual !== expected) return false
+  }
+  return true
+}
+
+function workspaceDirectoryMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
+  const remoteDirectory = record.provider === "exedev"
+    ? remoteWorkspaceDirectory(record.workspaceId)
+    : record.provider === "cloudflare"
+      ? REMOTE_CHECKOUT_DIRECTORY
+      : undefined
+  return info.directory === record.directory || (remoteDirectory !== undefined && info.directory === remoteDirectory)
 }
 
 function classifySituation(record: SandboxRecord, observations: SandboxObservation[]): SandboxResultV2["classification"] {

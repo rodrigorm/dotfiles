@@ -252,6 +252,47 @@ This repository selects `sbx` and OpenCode `1.18.25` in `.opencode/sandbox.json`
 
 `OPENCODE_EXPERIMENTAL_WORKSPACES=1` enables the OpenCode workspace hooks. `home/.bashrc.d/20-opencode.sh` sets it for interactive shells.
 
+### Cloudflare worker image
+
+The Cloudflare E2E requires the worker image to run as the non-root `sandbox` user with a writable `/Users` directory. Before `USER sandbox` in `bridge/worker/Dockerfile`, create `/Users` and assign it to the sandbox user:
+
+```dockerfile
+RUN mkdir -p /Users \
+    && chown sandbox:sandbox /Users
+```
+
+### Standalone Cloudflare smoke check
+
+From the repository root, run:
+
+```bash
+bun home/.config/opencode/sandbox/cloudflare-startup-smoke.ts
+```
+
+The script defaults to the current directory, loads `<worktree>/.opencode/sandbox.json` through the same loader as the plugin, and accepts the loader's `SANDBOX_CONFIG` and API URL/key environment overrides. It selects `cloudflare` in code for this check, so `SANDBOX_PROVIDER`, `SANDBOX_WORKTREE`, `SANDBOX_API_URL`, and `SANDBOX_API_KEY` are not required when bridge access is already in the project file. This does not change the plugin's configured `sbx` provider. The smoke then checks the bridge, bootstraps one sandbox, verifies the owned resource, activates the server, checks authenticated loopback and public tunnel health separately, and best-effort reads a bounded server log. Evidence collection runs before cleanup even when activation or public health fails. It does not create an OpenCode session or invoke an LLM.
+
+Workers Logs correlation is optional, bounded, and read-only. The bridge `apiKey` authenticates bridge routes but cannot query account Observability, so set the separate `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` only when telemetry is needed; do not add them to the bridge config. Workers Observability Write is optional and separate from the smoke's bridge access. `CLOUDFLARE_WORKER_NAME` filters on the Workers Observability `$workers.scriptName` field. Bridge requests carry the generated smoke run ID in the URL and header, and returned events retain their actual `$metadata.id` and `$workers.requestId`. A query with no event is reported as `incomplete`; missing credentials or a query failure is `unavailable`, not a runtime failure claim. `SANDBOX_SMOKE_OUTPUT=/absolute/path/result.json` is optional and writes the same redacted JSON result with mode `0600`.
+
+The normal command requires no extra account, zone, or token environment variables. Cloudflare's health timeout defaults to 180 seconds; `SANDBOX_HEALTH_TIMEOUT_MS` is an explicit override and is honored. SBX and exe.dev retain their 30-second default. The config stage reports the effective `healthTimeoutMs`, and successful reports preserve the validated `tunnelHostname` alongside the redacted tunnel URL. Each health wait exits early when the response is healthy. The smoke does not configure tunnel ingress or DNS, so no manual ingress setup is required. It does not exercise the full OpenCode workspace warp/session path.
+
+### Diagnóstico verificado
+
+The failure was startup convergence, not missing ingress configuration. On 2026-09-12 UTC, the official run with the 30-second health budget aborted during activation from `2026-09-12T21:57:03.024Z` to `2026-09-12T21:57:40.724Z`; the last recorded failure was HTTP 530/1033 with CF-Ray `a3a22b4fb9806d53-GRU`. The normal follow-up on 2026-09-13 used tunnel config version 0 and made no PUT: activation ran from `2026-09-13T14:27:23.095Z` to `2026-09-13T14:29:31.538Z` (128.443 seconds), then public health returned HTTP 200 from `2026-09-13T14:29:36.304Z` to `2026-09-13T14:29:36.547Z`. The evidence files are outside this repository: `cloudflare-startup-smoke-identity-official.json` and `cloudflare-startup-smoke-time-only.json`.
+
+The command exits nonzero for a failed stage, missing required configuration, or failed cleanup. Logs and telemetry are diagnostic and do not turn an otherwise healthy run into a pass/fail claim. A failed loopback command records `commandFailed` explicitly rather than treating missing output as a runtime result. Cleanup addresses only the provider-observed sandbox ID from this run, deletes its tunnel before the sandbox through one provider-owned close, and never probes with `running()` after deletion. If ownership is not observed, cleanup fails closed and does not guess at a resource.
+
+### Full Cloudflare E2E
+
+From the repository root, run:
+
+```bash
+bun home/.config/opencode/sandbox/cloudflare-e2e.ts
+```
+
+This validated command runs without an LLM or subagents. It uses the local `.opencode/sandbox.json` configuration, with the same `SANDBOX_CONFIG`, `SANDBOX_API_URL`, and `SANDBOX_API_KEY` overrides, and selects Cloudflare for the run. It creates an isolated local host/session and worktree, invokes `sandboxctl start`, waits for the OpenCode Warp and replay to establish the remote session, applies fixed remote edits, invokes `sandboxctl stop`, verifies sync-back and the return to the local session, then performs bounded cleanup of the sandbox, host, and worktree. Failures preserve the `.cloudflare-e2e-*` evidence directory because it can contain private credentials and artifacts.
+
+Validation status: **PASS**, 2026-09-14. `SANDBOX_E2E_OUTPUT=/absolute/path/result.json` is optional; when set, the command writes the redacted JSON report with mode `0600`.
+
 ## Files and evidence
 
 | Path | Purpose |

@@ -142,6 +142,15 @@ describe("configuration", () => {
     expect(() => parseConfig({ sshLobby: "exe.dev && whoami" }, { HOME: "/tmp" })).toThrow(/sshLobby/i)
   })
 
+  it("uses a longer Cloudflare health default without changing other providers", () => {
+    const cloudflare = { provider: "cloudflare", apiUrl: "https://bridge.example.test", apiKey: "test-key" }
+
+    expect(parseConfig(cloudflare, { HOME: "/tmp" }).healthTimeoutMs).toBe(180_000)
+    expect(parseConfig({ provider: "sbx" }, { HOME: "/tmp" }).healthTimeoutMs).toBe(DEFAULT_CONFIG.healthTimeoutMs)
+    expect(parseConfig({ provider: "exedev" }, { HOME: "/tmp" }).healthTimeoutMs).toBe(DEFAULT_CONFIG.healthTimeoutMs)
+    expect(parseConfig({ ...cloudflare, healthTimeoutMs: 15_000 }, { HOME: "/tmp" }).healthTimeoutMs).toBe(15_000)
+  })
+
   it("validates optional Cloudflare settings without exposing credentials", () => {
     expect(parseConfig({ provider: "sbx", apiUrl: null, apiKey: null }, { HOME: "/tmp" })).toMatchObject({ apiUrl: null, apiKey: null })
     expect(() => parseConfig({ provider: "cloudflare" }, { HOME: "/tmp" })).toThrow(/requires apiUrl and apiKey/i)
@@ -1529,6 +1538,62 @@ describe("lifecycle controller", () => {
       expect(deletion.calls).not.toContain("workspace:remove")
       expect(deletion.calls).not.toContain("destroy")
     }
+  })
+
+  it("stops a runtime whose workspace reports its remote checkout directory", async () => {
+    const fixture = await setupRecoveryFixture({
+      provider: "exedev",
+      state: "remote",
+      workspaceDirectory: remoteWorkspaceDirectory("wrk_1"),
+    })
+    const pending = {
+      ...fixture.record,
+      state: "stop_pending" as const,
+      desiredLocation: "local" as const,
+      phase: "detaching" as const,
+      operation: { kind: "stop" as const, phase: "adopting" },
+    }
+    await fixture.store.write(pending)
+
+    await fixture.controller.onSessionIdle(pending.sessionId)
+
+    expect(await fixture.store.get(pending.sessionId)).toMatchObject({
+      state: "detached",
+      operation: { kind: "stop", phase: "detached" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "sync", "warp:local", "close", "workspace:remove"])
+  })
+
+  it("rejects stop when the workspace ownership tuple diverges", async () => {
+    const fixture = await setupRecoveryFixture({
+      provider: "exedev",
+      state: "remote",
+      workspaceDirectory: remoteWorkspaceDirectory("wrk_1"),
+      workspaceExtra: {
+        owner: "opencode-sandbox",
+        sessionId: "ses_other",
+        generation: 1,
+        workspaceId: "wrk_1",
+        projectId: "prj_1",
+        provider: "exedev",
+      },
+    })
+    const pending = {
+      ...fixture.record,
+      state: "stop_pending" as const,
+      desiredLocation: "local" as const,
+      phase: "detaching" as const,
+      operation: { kind: "stop" as const, phase: "adopting" },
+    }
+    await fixture.store.write(pending)
+
+    await fixture.controller.onSessionIdle(pending.sessionId)
+
+    expect(await fixture.store.get(pending.sessionId)).toMatchObject({
+      state: "error",
+      lastError: { code: "STOP_CONFLICT" },
+    })
+    expect(fixture.calls).toEqual(["inspect:resource-1"])
   })
 
   it("single-flights concurrent recovery and adopts the resource once", async () => {
@@ -3234,6 +3299,15 @@ describe("plugin runtime", () => {
 
     expect(adapter.name).toBe("Cloudflare Sandbox")
     expect(registeredType).toBe("cloudflare")
+    expect((await adapter.configure({
+      id: "wrk_1",
+      type: "cloudflare",
+      name: "workspace",
+      branch: null,
+      directory: null,
+      extra: null,
+      projectID: "prj_1",
+    })).directory).toBe("/workspace/.opencode-worktree")
   })
 
   it("registers a Sandcastle workspace adapter without the legacy provider", async () => {
@@ -5435,17 +5509,23 @@ describe("provider health responses", () => {
   })
 
   it("retains safe Cloudflare health status and subcode diagnostics", async () => {
-    const body = "<html>Error 1033 https://secret.example.test Cookie: session=private Authorization: Bearer private</html>"
+    const body = [
+      "<!doctype html><html><head><title>Cloudflare Tunnel error</title>",
+      `<style>${"x".repeat(700)}</style><script>${"y".repeat(700)}</script>`,
+      "</head><body><h1>Cloudflare Tunnel error</h1><p>Error <span>1033</span></p>",
+      "<p>https://secret.example.test Cookie: session=private Authorization: Bearer private</p></body></html>",
+    ].join("")
+    expect(Buffer.byteLength(body)).toBeGreaterThan(1024)
     const provider = new CloudflareProvider({
       worktree: await temporaryDirectory(),
       client: {} as CloudflareSandboxClient,
-      healthTimeoutMs: 1,
-      fetcher: (async () => new Response(body, { status: 530 })) as unknown as typeof fetch,
+      healthTimeoutMs: 100,
+      fetcher: (async () => new Response(body, { status: 530, headers: { "CF-Ray": "ray-123" } })) as unknown as typeof fetch,
     })
 
     let error: unknown
     try {
-      await invokeHealthCheck(provider, { tunnel: { url: "https://sandbox.example.test" }, password: "private" })
+      await invokeHealthCheck(provider, { tunnel: { id: "tunnel-health-1033", url: "https://sandbox.example.test" }, password: "private" })
     } catch (value) {
       error = value
     }
@@ -5458,6 +5538,14 @@ describe("provider health responses", () => {
     expect(message).not.toContain("secret.example.test")
     expect(message).not.toContain("session=private")
     expect(message).not.toContain("Bearer private")
+    const details = (error as { details?: Record<string, unknown> }).details
+    expect(details).toMatchObject({ status: 530, subcode: 1033, hostname: "sandbox.example.test", tunnelId: "tunnel-health-1033", cfRay: "ray-123" })
+    expect(details?.elapsedMs).toEqual(expect.any(Number))
+    expect(String(details?.body)).toContain("Error 1033")
+    expect(String(details?.body)).not.toContain("secret.example.test")
+    expect(String(details?.body)).not.toContain("session=private")
+    expect(String(details?.body)).not.toContain("Bearer private")
+    expect(Buffer.byteLength(String(details?.body))).toBeLessThanOrEqual(1024)
   })
 
   it("cancels oversized non-OK Cloudflare health bodies", async () => {
@@ -5523,6 +5611,173 @@ describe("provider health responses", () => {
 })
 
 describe("Cloudflare Sandbox provider", () => {
+  it("uses authenticated health for Sandcastle inspection", async () => {
+    const root = await temporaryDirectory()
+    await runGit(root, ["init", "-q"])
+    await runGit(root, ["config", "user.email", "test@example.invalid"])
+    await runGit(root, ["config", "user.name", "Sandbox Test"])
+    await writeFile(join(root, "tracked.txt"), "base\n")
+    await runGit(root, ["add", "tracked.txt"])
+    await runGit(root, ["commit", "-q", "-m", "initial"])
+    const head = await nodeProcessRunner.run({ argv: ["git", "-C", root, "rev-parse", "HEAD"], cwd: root })
+    const baseSha = head.stdout.trim()
+    const authorization: string[] = []
+    const client: CloudflareSandboxClient = {
+      async createSandbox() { return "sandboxa2" },
+      async destroySandbox() {},
+      async destroyTunnel() {},
+      async running() { return true },
+      async exec(_id, input) {
+        const command = input.argv.at(-1) ?? ""
+        if ((input.argv.includes("rev-parse") && input.argv.at(-1) === "HEAD") || command.includes("git rev-parse HEAD")) {
+          return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+      async putFile() {},
+      async getFile() { return new Uint8Array() },
+      async hydrate() {},
+      async tunnel(_id, port, name) { return { id: "tunnel_1", port, url: `https://${name}.example.test` } },
+    }
+    const adapter = createCloudflareSandcastleAdapter({
+      input: {
+        sessionId: "ses_cf_inspect",
+        projectId: "prj_1",
+        workspaceId: "wrk_cf_inspect",
+        generation: 1,
+        branch: "opencode/cloudflare-inspect",
+        baseSha,
+        context: { sessionId: "ses_cf_inspect", projectId: "prj_1", directory: root, worktree: root },
+      },
+      worktree: root,
+      client,
+      authContent: "{}",
+      fetcher: (async (_input, init) => {
+        authorization.push(new Headers(init?.headers).get("authorization") ?? "")
+        return new Response(JSON.stringify({ healthy: true }), { status: 200 })
+      }) as typeof fetch,
+    })
+    const worktree = await createWorktree({
+      cwd: root,
+      branchStrategy: { type: "branch", branch: "opencode/cloudflare-inspect", baseBranch: baseSha },
+    })
+    let sandbox: Awaited<ReturnType<typeof worktree.createSandbox>> | undefined
+    try {
+      sandbox = await worktree.createSandbox({ sandbox: adapter.provider })
+      await adapter.applyCapture({ sandbox, capture: { baseSha, patch: "", untracked: [] } })
+
+      await expect(adapter.inspect?.()).resolves.toMatchObject({
+        resource: "present",
+        ownership: "verified",
+        health: "healthy",
+      })
+    } finally {
+      await sandbox?.close()
+      await worktree.close()
+    }
+
+    expect(authorization.length).toBeGreaterThanOrEqual(2)
+    expect(authorization.every((value) => value.startsWith("Basic "))).toBe(true)
+  })
+
+  it("creates the host worktree alias before starting OpenCode", async () => {
+    const commands: string[] = []
+    const client = {
+      async exec(_sandboxId: string, input: { argv: string[] }) {
+        if (input.argv[0] === "sh" && input.argv[1] === "-lc") commands.push(input.argv[2] ?? "")
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+      async putFile() {},
+    } as unknown as CloudflareSandboxClient
+    const provider = new CloudflareProvider({ worktree: "/Users/tester/project with space", client, deferActivation: true })
+    const startServer = (provider as unknown as { startServer(activation: unknown): Promise<void> }).startServer.bind(provider)
+
+    await startServer({ sandboxId: "sandboxa2", workspaceId: "wrk_cf_alias", authContent: "{}", password: "private" })
+
+    const aliasIndex = commands.findIndex((command) => command.includes("ln -s --"))
+    const serverIndex = commands.findIndex((command) => command.includes("opencode serve"))
+    expect(aliasIndex).toBeGreaterThanOrEqual(0)
+    expect(aliasIndex).toBeLessThan(serverIndex)
+    expect(commands[aliasIndex]).toContain("alias_path='/Users/tester/project with space'")
+    expect(commands[aliasIndex]).toContain("checkout_path='/workspace/.opencode-worktree'")
+  })
+
+  it("rejects an incompatible existing host worktree alias", async () => {
+    const commands: string[] = []
+    const client = {
+      async exec(_sandboxId: string, input: { argv: string[] }) {
+        if (input.argv[0] === "sh" && input.argv[1] === "-lc") {
+          const command = input.argv[2] ?? ""
+          commands.push(command)
+          if (command.includes("ln -s --")) return { exitCode: 1, signal: null, stdout: "", stderr: "alias conflict" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    } as unknown as CloudflareSandboxClient
+    const provider = new CloudflareProvider({ worktree: "/Users/tester/project", client, deferActivation: true })
+    const startServer = (provider as unknown as { startServer(activation: unknown): Promise<void> }).startServer.bind(provider)
+
+    await expect(startServer({ sandboxId: "sandboxa2", workspaceId: "wrk_cf_alias", authContent: "{}", password: "private" })).rejects.toMatchObject({
+      stage: "bootstrap",
+      code: "CLOUDFLARE_COMMAND",
+    })
+    expect(commands).toHaveLength(1)
+    expect(commands[0]).toContain("conflicts with an existing remote path")
+    expect(commands.some((command) => command.includes("opencode serve"))).toBe(false)
+  })
+
+  it("uses builtin-test-compatible argv when copying a regular file out", async () => {
+    const root = await temporaryDirectory()
+    const remoteRoot = await temporaryDirectory()
+    const sandboxPath = join(remoteRoot, "output.bin")
+    const hostPath = join(root, "output.bin")
+    const content = new Uint8Array([0, 1, 2, 255])
+    const testArgv: string[][] = []
+    await writeFile(sandboxPath, content)
+
+    const client: CloudflareSandboxClient = {
+      async createSandbox() { return "sandboxa2" },
+      async destroySandbox() {},
+      async destroyTunnel() {},
+      async running() { return true },
+      async exec(_id, input) {
+        if (input.argv[0] === "test") {
+          testArgv.push(input.argv)
+          return nodeProcessRunner.run({ argv: ["/bin/sh", "-c", 'test "$@"', "test", ...input.argv.slice(1)] })
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+      async putFile() {},
+      async getFile() { return content },
+      async hydrate() {},
+      async tunnel(_id, port, name) { return { id: "tunnel_1", port, url: `https://${name}.example.test` } },
+    }
+    const provider = new CloudflareProvider({ worktree: root, client, deferActivation: true })
+    const info = {
+      id: "wrk_cf_copy",
+      type: "cloudflare",
+      name: "workspace",
+      branch: "opencode/cloudflare-copy",
+      directory: root,
+      projectID: "prj_1",
+      extra: { baseSha: "0123456789012345678901234567890123456789", sessionId: "ses_cf_copy", generation: 1 },
+    }
+
+    await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
+    const handle = provider.createIsolatedHandle(info)
+    try {
+      await handle.copyFileOut(sandboxPath, hostPath)
+      expect(await readFile(hostPath)).toEqual(Buffer.from(content))
+    } finally {
+      await handle.close()
+    }
+
+    expect(testArgv).toEqual([
+      ["test", "-f", sandboxPath],
+      ["test", "-L", sandboxPath],
+    ])
+  })
+
   it("hydrates a private checkout, starts OpenCode, and syncs captures", async () => {
     const root = await temporaryDirectory()
     const baseSha = "0123456789012345678901234567890123456789"
@@ -6289,6 +6544,9 @@ async function setupRecoveryFixture(options: {
   syncError?: SandboxError
   workspaceRemoveFailures?: number
   destroyFailures?: number
+  provider?: string
+  workspaceDirectory?: string
+  workspaceExtra?: unknown
   onAdopt?: () => Promise<void>
   workspaceObservation?: "matching" | "foreign" | "unavailable"
   routeError?: SandboxError
@@ -6300,7 +6558,7 @@ async function setupRecoveryFixture(options: {
   const store = new FileStateStore(await temporaryDirectory())
   const record: SandboxRecord = {
     ...makeRecord(),
-    provider: "fake",
+    provider: options.provider ?? "fake",
     providerState: { resourceId: "resource-1" },
     state: options.state ?? "orphaned",
   }
@@ -6398,9 +6656,10 @@ async function setupRecoveryFixture(options: {
       },
       ...(options.workspaceObservation === "unavailable" ? {} : {
         async inspect() {
-          return options.workspaceObservation === "foreign"
-            ? matchingWorkspace(record, { directory: "/foreign/project" })
-            : matchingWorkspace(record)
+          return matchingWorkspace(record, {
+            directory: options.workspaceDirectory ?? (options.workspaceObservation === "foreign" ? "/foreign/project" : record.directory),
+            ...(options.workspaceExtra !== undefined ? { extra: options.workspaceExtra } : {}),
+          })
         },
       }),
     },
