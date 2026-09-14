@@ -103,7 +103,7 @@ bunx skills add mattpocock/skills \
     --skill codebase-design \
     --skill diagnosing-bugs \
     --skill domain-modeling \
-    --skill grll-me-with-docs \
+    --skill grill-with-docs \
     --skill implement \
     --skill improve-codebase-architecture \
     --skill prototype \
