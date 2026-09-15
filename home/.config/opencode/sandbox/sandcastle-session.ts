@@ -115,6 +115,11 @@ export async function createSandcastleSession(input: SandcastleSessionInput): Pr
       worktree: sessionWorktree,
       worktreePath: sessionWorktree.worktreePath,
       sandbox: sessionSandbox,
+      get remoteWorktreePath() {
+        const metadata = adapter.recoveryMetadata?.()
+        const remoteWorktreePath = metadata?.remoteWorktreePath
+        return typeof remoteWorktreePath === "string" ? remoteWorktreePath : undefined
+      },
       get target() {
         if (!target) throw new SandboxError("tunnel", "sandbox target is unavailable", "TARGET_UNAVAILABLE")
         return target

@@ -8,8 +8,8 @@ import { assertExperimentalWorkspacesEnabled, loadConfig, parseConfig, withApiEn
 import { ControlChannel } from "./control-channel"
 import { SshExeControl, type ExeControl } from "./exe-control"
 import { LifecycleController, type InfrastructureOperations } from "./lifecycle"
-import { shortHash } from "./naming"
-import { createExedevSandcastleAdapter, ExedevProvider, ensureExeDevHostKey } from "./exedev-provider"
+import { isSafeSandboxPath, shortHash } from "./naming"
+import { createExedevSandcastleAdapter, ExedevProvider, ensureExeDevHostKey, remoteWorkspaceDirectory } from "./exedev-provider"
 import { createSbxSandcastleAdapter, SbxProvider } from "./sbx-provider"
 import { createCloudflareSandcastleAdapter, REMOTE_CHECKOUT_DIRECTORY } from "./cloudflare-provider"
 import { redactError } from "./redaction"
@@ -758,7 +758,13 @@ function createSandcastleWorkspaceAdapter(options: SandcastleWorkspaceOptions, c
     configure(info) {
       return {
         ...info,
-        directory: options.type === "cloudflare" ? REMOTE_CHECKOUT_DIRECTORY : info.directory,
+        directory: options.type === "cloudflare"
+          ? REMOTE_CHECKOUT_DIRECTORY
+          : options.type === "sbx"
+            ? sbxRemoteWorktreePath(info.extra)
+            : options.type === "exedev"
+              ? exedevRemoteWorktreePath(info)
+              : info.directory,
         extra: nonSecretExtra(info.extra),
       }
     },
@@ -770,6 +776,26 @@ function createSandcastleWorkspaceAdapter(options: SandcastleWorkspaceOptions, c
       return target
     },
   }
+}
+
+function sbxRemoteWorktreePath(value: unknown): string {
+  const extra = isRecord(value) ? value : {}
+  const providerState = isRecord(extra.providerState) ? extra.providerState : extra
+  const path = providerState.remoteWorktreePath ?? extra.remoteWorktreePath
+  if (!isSafeSandboxPath(path)) {
+    throw new SandboxError("validate", "SBX remote worktree path is invalid", "WORKSPACE_DIRECTORY")
+  }
+  return path
+}
+
+function exedevRemoteWorktreePath(info: WorkspaceInfo): string {
+  const extra = isRecord(info.extra) ? info.extra : {}
+  const providerState = isRecord(extra.providerState) ? extra.providerState : extra
+  const path = providerState.remoteWorktreePath ?? extra.remoteWorktreePath
+  if (!isSafeSandboxPath(path) || path !== remoteWorkspaceDirectory(info.id)) {
+    throw new SandboxError("validate", "exe.dev remote worktree path is invalid", "WORKSPACE_DIRECTORY")
+  }
+  return path
 }
 
 function createWorkspaceAdapter(provider: WorkspaceProviderBase): WorkspaceAdapterLike {

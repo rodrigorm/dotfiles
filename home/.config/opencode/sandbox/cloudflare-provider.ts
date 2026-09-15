@@ -15,7 +15,7 @@ import {
   type CloudflareSandboxClient,
   type CloudflareTunnelInfo,
 } from "./cloudflare-bridge"
-import { basicAuthHeader } from "./remote-runtime"
+import { assertAliasPath, basicAuthHeader, worktreeAliasCommand } from "./remote-runtime"
 import { nodeProcessRunner, sanitizeEnvironment } from "./process"
 import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { redactError, redactText } from "./redaction"
@@ -693,7 +693,7 @@ export class CloudflareProvider implements WorkspaceProviderBase {
     if (!activation.authContent) throw new SandboxError("bootstrap", "OpenCode auth content is unavailable", "AUTH_UNAVAILABLE")
     await this.run(
       activation.sandboxId,
-      { argv: ["sh", "-lc", worktreeAliasCommand(this.worktree, this.checkoutDirectory())], cwd: this.checkoutDirectory() },
+      { argv: ["sh", "-lc", worktreeAliasCommand(this.worktree, this.checkoutDirectory(), "Cloudflare")], cwd: this.checkoutDirectory() },
       "bootstrap",
     )
     await this.run(activation.sandboxId, { argv: ["mkdir", "-p", "--", runtime] }, "bootstrap")
@@ -1060,7 +1060,10 @@ export function createCloudflareSandcastleAdapter(options: CloudflareSandcastleA
     target: () => provider.target(info),
     inspect: (signal?: AbortSignal) => provider.diagnose(info, signal),
     diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
-    recoveryMetadata: () => provider.runtimeMetadata(input.workspaceId)?.providerState ?? {},
+    recoveryMetadata: () => ({
+      ...(provider.runtimeMetadata(input.workspaceId)?.providerState ?? {}),
+      remoteWorktreePath: REMOTE_CHECKOUT_DIRECTORY,
+    }),
     close: () => provider.close(info),
   }
 }
@@ -1186,14 +1189,6 @@ function assertRemotePath(value: string, label: string): void {
   }
 }
 
-function assertAliasPath(value: string, label: string): void {
-  assertRemotePath(value, label)
-  const parts = value.split("/").slice(1)
-  if (value === "/" || parts.some((part) => part.length === 0 || part === "." || part === "..")) {
-    throw new SandboxError("validate", `${label} path is unsafe`, "PATH_INVALID")
-  }
-}
-
 function isControlRequestPath(root: string, value: string): boolean {
   if (!value.startsWith(`${root}/`)) return false
   const name = value.slice(root.length + 1)
@@ -1208,34 +1203,6 @@ function sameSecret(left: string, right: string): boolean {
 
 function tunnelNameFor(workspaceId: string): string {
   return `oc-${shortHash(workspaceId)}`
-}
-
-function worktreeAliasCommand(worktree: string, checkoutDirectory: string): string {
-  assertAliasPath(worktree, "host worktree alias")
-  assertAliasPath(checkoutDirectory, "remote checkout")
-  const quotedWorktree = shellQuote(worktree)
-  const quotedCheckout = shellQuote(checkoutDirectory)
-  const quotedParent = shellQuote(posix.dirname(worktree))
-  return `set -eu
-alias_path=${quotedWorktree}
-checkout_path=${quotedCheckout}
-if [ "$alias_path" = "$checkout_path" ]; then
-    exit 0
-fi
-if [ -L "$alias_path" ]; then
-    existing_target=$(readlink -- "$alias_path")
-    if [ "$existing_target" != "$checkout_path" ]; then
-        printf '%s\\n' 'Cloudflare worktree alias conflicts with an existing remote path' >&2
-        exit 1
-    fi
-elif [ -e "$alias_path" ]; then
-    printf '%s\\n' 'Cloudflare worktree alias conflicts with an existing remote path' >&2
-    exit 1
-else
-    mkdir -p -- ${quotedParent}
-    ln -s -- "$checkout_path" "$alias_path"
-fi
-`
 }
 
 function serverCommand(

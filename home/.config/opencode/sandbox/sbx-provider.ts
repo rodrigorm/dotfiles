@@ -8,11 +8,12 @@ import { dirname, isAbsolute, join, posix } from "node:path"
 
 import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 
-import { assertRelativePath, assertSafeBranch, assertSha, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
+import { assertRelativePath, assertSafeBranch, assertSha, isSafeSandboxPath, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { assertAbsolutePath, basicAuthHeader, buildRemoteFrame, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
 import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment, trackedProcessObservation, unknownProcessObservation } from "./process"
 import { redactError, redactText } from "./redaction"
 import { readLimitedBody } from "./workspace-http"
+import { captureWorkingTree, syncBackWorkingTree as syncBackLocalWorkingTree } from "./working-tree"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
   isRecord,
@@ -48,6 +49,9 @@ const DEFAULT_OPENCODE_VERSION = "1.18.23"
 const MAX_OUTPUT_BYTES = 256 * 1024
 const MAX_FILE_OUTPUT_BYTES = 64 * 1024 * 1024
 const OWNERSHIP_FILE = "/tmp/opencode-sandbox-owner"
+const SANDBOX_RUNTIME_DIRECTORY = "/run/sandbox"
+const SANDBOX_SOURCE_DIRECTORY = "/run/sandbox/source"
+const SANDBOX_TMP_DIRECTORY = "/tmp"
 const INSPECTION_TIMEOUT_MS = 5_000
 const START_SERVER = String.raw`import json, os, shutil, signal, subprocess, sys, time
 
@@ -244,6 +248,7 @@ interface Activation {
   process?: ProcessHandle
   authContent?: string
   failure?: string
+  initialSwapPending: boolean
 }
 
 interface EnsuredSandbox {
@@ -364,7 +369,7 @@ export class SbxProvider implements WorkspaceProviderBase {
       const cloneRoot = await this.cloneDirectory(sandbox)
       assertAbsolutePath(cloneRoot, "sandbox checkout")
       await this.ensureOpenCodeVersion(sandbox)
-      const directory = this.deferActivation ? join(cloneRoot, ".opencode-worktree") : cloneRoot
+      const directory = cloneRoot
       assertSandboxPath(directory, "sandbox checkout")
       if (this.deferActivation) {
         await this.runSbx(["exec", sandbox, "mkdir", "-p", "--", directory], "provision")
@@ -373,7 +378,7 @@ export class SbxProvider implements WorkspaceProviderBase {
       }
 
       const password = randomBytes(32).toString("base64url")
-      activation = { ...owner, sandbox, directory, branch, baseSha, hostPort: ensured.hostPort, password }
+      activation = { ...owner, sandbox, directory, branch, baseSha, hostPort: ensured.hostPort, password, initialSwapPending: this.deferActivation }
       this.active.set(info.id, activation)
       if (this.controlTokenFor && this.localControlSocket) {
         activation.paths = makeRuntimePaths(metadata.sessionId, metadata.generation)
@@ -575,7 +580,7 @@ export class SbxProvider implements WorkspaceProviderBase {
     let directory: string
     try {
       const cloneRoot = await this.cloneDirectory(input.resource.resourceId)
-      directory = this.deferActivation ? join(cloneRoot, ".opencode-worktree") : cloneRoot
+      directory = cloneRoot
       assertSandboxPath(directory, "sandbox checkout")
       const branchResult = await this.runSbxRaw(
         ["exec", input.resource.resourceId, "git", "-C", directory, "symbolic-ref", "--short", "HEAD"],
@@ -618,6 +623,7 @@ export class SbxProvider implements WorkspaceProviderBase {
       baseSha: input.owner.baseSha,
       hostPort,
       password: randomBytes(32).toString("base64url"),
+      initialSwapPending: false,
     }
     try {
       activation.paths = makeRuntimePaths(input.owner.sessionId, input.owner.generation)
@@ -824,11 +830,21 @@ export class SbxProvider implements WorkspaceProviderBase {
   createIsolatedHandle(info: WorkspaceInfo): IsolatedSandboxHandle {
     const activation = this.active.get(info.id)
     if (!activation) throw new SandboxError("provision", "sandbox runtime is not active", "RUNTIME_UNAVAILABLE")
+    assertSandboxCloneDirectory(activation.directory)
+    const initialSwap = `rm -rf "${activation.directory}" && mv "${activation.directory}_clone" "${activation.directory}"`
 
     let closing: Promise<void> | undefined
     return {
       worktreePath: activation.directory,
-      exec: (command, options) => this.execute(activation, command, options),
+      exec: async (command, options) => {
+        if (activation.initialSwapPending && options === undefined && command === initialSwap) {
+          await this.assertOwned(activation.sandbox, activation)
+          const result = await this.execute(activation, initialSandboxSwapCommand(activation.directory))
+          if (result.exitCode === 0) activation.initialSwapPending = false
+          return result
+        }
+        return this.execute(activation, command, options)
+      },
       copyIn: (hostPath, sandboxPath) => this.copyIn(activation, hostPath, sandboxPath),
       copyFileOut: (sandboxPath, hostPath) => this.copyFileOut(activation, sandboxPath, hostPath),
       close: () => {
@@ -891,7 +907,22 @@ export class SbxProvider implements WorkspaceProviderBase {
       return { hostPort, created: true }
     }
 
-    await this.assertOwned(sandbox, owner)
+    try {
+      await this.assertOwned(sandbox, owner)
+    } catch (error) {
+      const ownershipError = error instanceof SandboxError
+        ? error
+        : new SandboxError("validate", redactError(error), "SBX_OWNERSHIP_UNVERIFIED")
+      const createCause = redactText(create.stderr || create.stdout || "could not create sandbox").slice(0, 2048)
+      throw new SandboxError(ownershipError.stage, `${ownershipError.message}; sbx create exit code ${create.exitCode}: ${createCause}`, ownershipError.code, {
+        ...ownershipError.details,
+        create: {
+          exitCode: create.exitCode,
+          stdout: redactError(create.stdout),
+          stderr: redactError(create.stderr),
+        },
+      })
+    }
     const started = await this.runSbxRaw(["exec", sandbox, "true"], "provision")
     if (started.exitCode !== 0) {
       throw new SandboxError("provision", redactText(create.stderr || started.stderr || "could not create sandbox"), "SBX_CREATE")
@@ -940,8 +971,13 @@ export class SbxProvider implements WorkspaceProviderBase {
   private async cloneDirectory(sandbox: string): Promise<string> {
     const result = await this.runSbx(["exec", sandbox, "git", "rev-parse", "--show-toplevel"], "checkout")
     const directory = result.stdout.trim()
-    if (!directory || directory === "/run/sandbox/source" || directory.includes("\n")) {
+    if (!directory || directory === SANDBOX_SOURCE_DIRECTORY || directory.includes("\n")) {
       throw new SandboxError("checkout", "sandbox clone directory is unavailable", "SBX_CLONE_DIRECTORY")
+    }
+    assertSandboxCloneDirectory(directory)
+    const writable = await this.runSbxRaw(["exec", sandbox, "test", "-w", directory], "checkout")
+    if (writable.exitCode !== 0) {
+      throw new SandboxError("checkout", "sandbox clone directory is read-only", "SBX_CLONE_READONLY")
     }
     return directory
   }
@@ -1335,6 +1371,7 @@ export interface SbxSandcastleAdapterOptions extends SbxProviderOptions {
 export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions): OpenCodeSandboxAdapter {
   const { input, authContent, provider: suppliedProvider, ...providerOptions } = options
   const provider = suppliedProvider ?? new SbxProvider({ ...providerOptions, deferActivation: true, authContent })
+  let baseline: WorkingTreeCapture | undefined
   const info: WorkspaceInfo = {
     id: input.workspaceId,
     type: "sbx",
@@ -1364,6 +1401,26 @@ export function createSbxSandcastleAdapter(options: SbxSandcastleAdapterOptions)
     applyCapture: async ({ capture }) => {
       await provider.syncIn(input.workspaceId, capture)
       await provider.activate(input.workspaceId)
+      baseline = capture
+    },
+    syncBackWorkingTree: async ({ sandbox, worktreePath }) => {
+      if (!baseline) throw new SandboxError("sync", "SBX working tree baseline is unavailable", "SYNC_BASELINE_UNAVAILABLE")
+      let remoteTreeResult: Awaited<ReturnType<typeof sandbox.exec>>
+      try {
+        remoteTreeResult = await sandbox.exec("git rev-parse HEAD^{tree}")
+      } catch (error) {
+        if (error instanceof SandboxError) throw error
+        throw new SandboxError("sync", redactError(error), "REMOTE_TREE")
+      }
+      if (remoteTreeResult.exitCode !== 0) {
+        throw new SandboxError("sync", redactText(remoteTreeResult.stderr || "could not read the SBX Git tree"), "REMOTE_TREE")
+      }
+      const remoteTree = remoteTreeResult.stdout.trim()
+      if (!/^[a-f0-9]{40}$/i.test(remoteTree)) {
+        throw new SandboxError("sync", "SBX returned an invalid Git tree", "REMOTE_TREE")
+      }
+      await syncBackLocalWorkingTree(input.context, baseline, { worktreePath, remoteTree })
+      baseline = await captureWorkingTree(input.context)
     },
     target: () => provider.target(info),
     inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
@@ -1439,6 +1496,7 @@ function metadataFor(activation: Activation): Record<string, unknown> {
     generation: activation.generation,
     workspaceId: activation.workspaceId,
     projectId: activation.projectId,
+    remoteWorktreePath: activation.directory,
     sandbox: activation.sandbox,
     hostPort: activation.hostPort,
     branch: activation.branch,
@@ -1778,9 +1836,41 @@ function buildSbxSupervisorArgv(input: SbxSupervisorArgvInput): string[] {
 }
 
 function assertSandboxPath(path: string, label: string): void {
-  if (!/^\/[A-Za-z0-9._/-]+$/.test(path) || path.includes("..")) {
+  if (!isSafeSandboxPath(path)) {
     throw new SandboxError("validate", `${label} is unsafe`, "PATH_INVALID")
   }
+}
+
+function initialSandboxSwapCommand(directory: string): string {
+  assertSandboxCloneDirectory(directory)
+  const root = `"${directory}"`
+  const clone = `"${directory}_clone"`
+  return [
+    "set -e",
+    `test -d ${root}`,
+    `test -d ${clone}`,
+    `for entry in ${root}/* ${root}/.[!.]* ${root}/..?*; do if [ -e "$entry" ] || [ -L "$entry" ]; then rm -rf "$entry"; fi; done`,
+    `for entry in ${clone}/* ${clone}/.[!.]* ${clone}/..?*; do if [ -e "$entry" ] || [ -L "$entry" ]; then mv "$entry" ${root}/; fi; done`,
+    `rmdir ${clone}`,
+  ].join("; ")
+}
+
+function assertSandboxCloneDirectory(path: string): void {
+  const normalizedPath = posix.normalize(path)
+  if (
+    normalizedPath === "/" ||
+    !isSafeSandboxPath(path) ||
+    [SANDBOX_RUNTIME_DIRECTORY, SANDBOX_SOURCE_DIRECTORY, SANDBOX_TMP_DIRECTORY, OWNERSHIP_FILE]
+      .some((protectedPath) => pathsOverlap(path, protectedPath))
+  ) {
+    throw new SandboxError("checkout", "sandbox clone directory is unsafe", "SBX_CLONE_DIRECTORY")
+  }
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  const normalizedLeft = posix.normalize(left)
+  const normalizedRight = posix.normalize(right)
+  return normalizedLeft === normalizedRight || normalizedLeft.startsWith(`${normalizedRight}/`) || normalizedRight.startsWith(`${normalizedLeft}/`)
 }
 
 function assertPort(port: number): void {

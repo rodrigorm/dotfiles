@@ -1,11 +1,13 @@
 import { createHash, randomBytes } from "node:crypto"
 import { createServer } from "node:net"
+import { posix } from "node:path"
 
 import { SandboxError } from "./types"
 import { assertSafeSshDestination, quoteRemoteCommandPart } from "./naming"
 
 export const DEFAULT_SSH_BIN = "/usr/bin/ssh"
 export const MAX_REMOTE_FRAME_BYTES = 128 * 1024
+export const MAX_UNIX_SOCKET_PATH_BYTES = 104
 
 export interface SupervisorArgvInput {
   sshBin: string
@@ -24,7 +26,7 @@ export function buildSupervisorArgv(input: SupervisorArgvInput): string[] {
   if (input.sshUser !== undefined && !/^[A-Za-z0-9._-]{1,64}$/.test(input.sshUser)) {
     throw new SandboxError("validate", "SSH user is unsafe", "SSH_USER_INVALID")
   }
-  assertAbsolutePath(input.localControlSocket, "local control socket")
+  assertUnixSocketPath(input.localControlSocket, "local control socket")
   assertAbsolutePath(input.remoteControlSocket, "remote control socket")
   assertAbsolutePath(input.remoteLauncherPath, "remote launcher")
   assertPort(input.remotePort)
@@ -32,7 +34,8 @@ export function buildSupervisorArgv(input: SupervisorArgvInput): string[] {
 
   return [
     input.sshBin,
-    ...fixedSshOptions(input.knownHostsFile),
+    // Clear the config instead of using ClearAllForwardings, which also drops CLI -L/-R.
+    ...fixedSshOptions(input.knownHostsFile, false),
     "-o",
     "ExitOnForwardFailure=yes",
     "-o",
@@ -143,16 +146,61 @@ export function basicAuthHeader(password: string, username = "opencode"): string
 }
 
 export function assertAbsolutePath(path: string, label: string): void {
-  if (!path.startsWith("/") || path.includes("\0") || path.includes("\n") || path.includes("\r")) {
+  if (typeof path !== "string" || !path.startsWith("/") || path.includes("\0") || path.includes("\n") || path.includes("\r")) {
     throw new SandboxError("validate", `${label} path is unsafe`, "PATH_INVALID")
   }
+}
+
+export function assertUnixSocketPath(path: string, label: string): void {
+  assertAbsolutePath(path, label)
+  const bytes = Buffer.byteLength(path)
+  if (bytes >= MAX_UNIX_SOCKET_PATH_BYTES) {
+    throw new SandboxError("validate", `${label} path is too long for Unix/OpenSSH (${bytes} bytes; limit ${MAX_UNIX_SOCKET_PATH_BYTES - 1})`, "SOCKET_PATH_TOO_LONG")
+  }
+}
+
+export function assertAliasPath(value: string, label: string): void {
+  assertAbsolutePath(value, label)
+  const parts = value.split("/").slice(1)
+  if (value === "/" || parts.some((part) => part.length === 0 || part === "." || part === "..")) {
+    throw new SandboxError("validate", `${label} path is unsafe`, "PATH_INVALID")
+  }
+}
+
+export function worktreeAliasCommand(worktree: string, checkoutDirectory: string, provider = "worktree"): string {
+  assertAliasPath(worktree, "host worktree alias")
+  assertAliasPath(checkoutDirectory, "remote checkout")
+  const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`
+  const quotedWorktree = quote(worktree)
+  const quotedCheckout = quote(checkoutDirectory)
+  const quotedParent = quote(posix.dirname(worktree))
+  return `set -eu
+alias_path=${quotedWorktree}
+checkout_path=${quotedCheckout}
+if [ "$alias_path" = "$checkout_path" ]; then
+    exit 0
+fi
+if [ -L "$alias_path" ]; then
+    existing_target=$(readlink -- "$alias_path")
+    if [ "$existing_target" != "$checkout_path" ]; then
+        printf '%s\\n' '${provider} worktree alias conflicts with an existing remote path' >&2
+        exit 1
+    fi
+elif [ -e "$alias_path" ]; then
+    printf '%s\\n' '${provider} worktree alias conflicts with an existing remote path' >&2
+    exit 1
+else
+    mkdir -p -- ${quotedParent}
+    ln -s -- "$checkout_path" "$alias_path"
+fi
+`
 }
 
 function assertPort(port: number): void {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new SandboxError("validate", "port is invalid", "PORT_INVALID")
 }
 
-export function fixedSshOptions(knownHostsFile: string): string[] {
+export function fixedSshOptions(knownHostsFile: string, clearAllForwardings = true): string[] {
   return [
     "-F",
     "/dev/null",
@@ -184,8 +232,7 @@ export function fixedSshOptions(knownHostsFile: string): string[] {
     "PermitLocalCommand=no",
     "-o",
     "UpdateHostkeys=no",
-    "-o",
-    "ClearAllForwardings=yes",
+    ...(clearAllForwardings ? ["-o", "ClearAllForwardings=yes"] : []),
   ]
 }
 

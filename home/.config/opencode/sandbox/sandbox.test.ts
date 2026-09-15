@@ -1,25 +1,25 @@
 import { afterEach, describe, expect, it } from "bun:test"
 import { Database } from "bun:sqlite"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, readdir, rm, truncate, utimes, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, truncate, utimes, writeFile } from "node:fs/promises"
 import { createConnection, createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { createWorktree, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
+import { createWorktree, type IsolatedSandboxHandle, type Sandbox } from "@ai-hero/sandcastle"
 
 import { DEFAULT_CONFIG, parseConfig } from "./config"
 import { ControlChannel, createCapability, parseControlRequest } from "./control-channel"
 import { buildExeDevSshArgv, DEFAULT_EXEDEV_COMMAND_TIMEOUT_MS, SshExeControl } from "./exe-control"
 import { FileStateStore } from "./state-store"
-import { buildRemoteCommandArgv, buildSupervisorArgv } from "./remote-runtime"
+import { buildRemoteCommandArgv, buildSupervisorArgv, MAX_UNIX_SOCKET_PATH_BYTES } from "./remote-runtime"
 import { parseCliArgs, requestControl, requestControlMailbox, runCli } from "./cli"
 import { identityMatches, makeVmPlan, shortHash } from "./naming"
 import { redactText } from "./redaction"
 import { LifecycleController } from "./lifecycle"
 import { createSandboxPlugin, readSessionEvents, resolveAuthContent, type WorkspaceAdapterLike } from "./plugin-runtime"
 import { nodeProcessRunner, nodeProcessSupervisor } from "./process"
-import { createExedevSandcastleAdapter, ExedevProvider, remoteWorkspaceDirectory } from "./exedev-provider"
+import { createExedevSandcastleAdapter, ensureExeDevVmHostKey, ExedevProvider, REMOTE_WRITE_FILE, remoteWorkspaceDirectory } from "./exedev-provider"
 import { createSbxSandcastleAdapter, SbxProvider } from "./sbx-provider"
 import { CloudflareBridgeClient, type CloudflareSandboxClient } from "./cloudflare-bridge"
 import { CloudflareProvider, createCloudflareSandcastleAdapter } from "./cloudflare-provider"
@@ -322,6 +322,9 @@ describe("SSH argv", () => {
     expect(argv).toContain("-L")
     expect(argv).toContain("127.0.0.1:4100:127.0.0.1:4096")
     expect(argv).toContain("StreamLocalBindUnlink=yes")
+    expect(argv[argv.indexOf("-F") + 1]).toBe("/dev/null")
+    expect(argv).toEqual(expect.arrayContaining(["-l", "user", "StrictHostKeyChecking=yes", "ForwardAgent=no"]))
+    expect(argv).not.toContain("ClearAllForwardings=yes")
     expect(argv).not.toContain("control-token")
   })
 
@@ -336,6 +339,125 @@ describe("SSH argv", () => {
     )
 
     expect(argv.at(-1)).toBe("'value; touch /tmp/untrusted'")
+  })
+
+  it("rejects a local Unix socket at the OpenSSH path limit", () => {
+    const localControlSocket = `/${"x".repeat(MAX_UNIX_SOCKET_PATH_BYTES - 1)}`
+
+    expect(() => buildSupervisorArgv({
+      sshBin: "/usr/bin/ssh",
+      knownHostsFile: "/tmp/known_hosts",
+      destination: "vm.exe.xyz",
+      remotePort: 4096,
+      localPort: 4100,
+      localControlSocket,
+      remoteControlSocket: "/tmp/oe-r/c.sock",
+      remoteLauncherPath: "/tmp/oe-r/launcher",
+    })).toThrow(/socket.*too long/i)
+  })
+})
+
+describe("exe.dev VM host keys", () => {
+  const official = "SHA256:JJOP/lwiBGOMilfONPWZCXUrfK154cnJFXcqlsi6lPo"
+  const vmHost = "oc-ccd6b03545.exe.xyz"
+  const scanned = `${vmHost} ssh-rsa AAAATESTKEY\n`
+  const identity = { name: "oc-test", sshDest: vmHost, tags: [], comment: "test" }
+
+  it("registers the exact VM hostname while preserving existing entries and mode", async () => {
+    const root = await temporaryDirectory()
+    const knownHostsFile = join(root, "state", "known_hosts")
+    await mkdir(join(root, "state"))
+    const existing = "other.example ssh-rsa AAAAOTHER\n"
+    await writeFile(knownHostsFile, existing, { mode: 0o600 })
+    const calls: string[][] = []
+    const runner: ProcessRunner = {
+      async run(input) {
+        calls.push(input.argv)
+        if (input.argv[0] === "/usr/bin/ssh-keyscan") return { exitCode: 0, signal: null, stdout: scanned, stderr: "" }
+        if (input.argv[0] === "/usr/bin/ssh-keygen" && input.argv[1] === "-F") {
+          const path = input.argv[input.argv.indexOf("-f") + 1]
+          return path?.endsWith(".tmp")
+            ? { exitCode: 0, signal: null, stdout: scanned, stderr: "" }
+            : { exitCode: 1, signal: null, stdout: "", stderr: "" }
+        }
+        if (input.argv[0] === "/usr/bin/ssh-keygen" && input.argv[1] === "-lf") {
+          return { exitCode: 0, signal: null, stdout: `256 ${official} ${vmHost} (RSA)\n`, stderr: "" }
+        }
+        throw new Error(`unexpected command: ${input.argv.join(" ")}`)
+      },
+    }
+
+    await ensureExeDevVmHostKey(knownHostsFile, identity, runner)
+
+    expect(await readFile(knownHostsFile, "utf8")).toBe(`${existing}${scanned}`)
+    expect((await stat(knownHostsFile)).mode & 0o777).toBe(0o600)
+    expect(calls).toContainEqual(["/usr/bin/ssh-keyscan", "-T", "5", "-t", "rsa", vmHost])
+    expect(await readFile(knownHostsFile, "utf8")).not.toContain("*.exe.xyz")
+  })
+
+  it("does not scan an unknown destination outside exe.xyz", async () => {
+    const root = await temporaryDirectory()
+    const knownHostsFile = join(root, "known_hosts")
+    await writeFile(knownHostsFile, "other.example ssh-rsa AAAAOTHER\n", { mode: 0o600 })
+    const calls: string[][] = []
+    const runner: ProcessRunner = {
+      async run(input) {
+        calls.push(input.argv)
+        return { exitCode: 1, signal: null, stdout: "", stderr: "" }
+      },
+    }
+
+    await expect(ensureExeDevVmHostKey(knownHostsFile, { ...identity, sshDest: "other.example" }, runner)).rejects.toMatchObject({
+      code: "VM_HOST_KEY_UNKNOWN",
+    })
+    expect(calls.some((argv) => argv[0] === "/usr/bin/ssh-keyscan")).toBe(false)
+  })
+
+  it("rejects a wildcard scan entry even with the official fingerprint", async () => {
+    const root = await temporaryDirectory()
+    const knownHostsFile = join(root, "known_hosts")
+    const existing = "other.example ssh-rsa AAAAOTHER\n"
+    await writeFile(knownHostsFile, existing, { mode: 0o600 })
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv[0] === "/usr/bin/ssh-keyscan") return { exitCode: 0, signal: null, stdout: "*.exe.xyz ssh-rsa AAAATESTKEY\n", stderr: "" }
+        if (input.argv[0] === "/usr/bin/ssh-keygen" && input.argv[1] === "-F") return { exitCode: 1, signal: null, stdout: "", stderr: "" }
+        throw new Error(`unexpected command: ${input.argv.join(" ")}`)
+      },
+    }
+
+    await expect(ensureExeDevVmHostKey(knownHostsFile, identity, runner)).rejects.toMatchObject({
+      code: "VM_HOST_KEY_SCAN",
+    })
+    expect(await readFile(knownHostsFile, "utf8")).toBe(existing)
+  })
+
+  it("rejects a divergent fingerprint before writing the scan", async () => {
+    const root = await temporaryDirectory()
+    const knownHostsFile = join(root, "known_hosts")
+    const existing = "other.example ssh-rsa AAAAOTHER\n"
+    await writeFile(knownHostsFile, existing, { mode: 0o600 })
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv[0] === "/usr/bin/ssh-keyscan") return { exitCode: 0, signal: null, stdout: scanned, stderr: "" }
+        if (input.argv[0] === "/usr/bin/ssh-keygen" && input.argv[1] === "-F") {
+          const path = input.argv[input.argv.indexOf("-f") + 1]
+          return path?.endsWith(".tmp")
+            ? { exitCode: 0, signal: null, stdout: scanned, stderr: "" }
+            : { exitCode: 1, signal: null, stdout: "", stderr: "" }
+        }
+        if (input.argv[0] === "/usr/bin/ssh-keygen" && input.argv[1] === "-lf") {
+          return { exitCode: 0, signal: null, stdout: `256 ${official} ${vmHost} (RSA)\n256 SHA256:divergent ${vmHost} (RSA)\n`, stderr: "" }
+        }
+        throw new Error(`unexpected command: ${input.argv.join(" ")}`)
+      },
+    }
+
+    await expect(ensureExeDevVmHostKey(knownHostsFile, identity, runner)).rejects.toMatchObject({
+      code: "HOST_KEY_MISMATCH",
+    })
+    expect(await readFile(knownHostsFile, "utf8")).toBe(existing)
+    expect((await stat(knownHostsFile)).mode & 0o777).toBe(0o600)
   })
 })
 
@@ -1485,6 +1607,23 @@ describe("lifecycle controller", () => {
     expect(fixture.calls.slice(-3)).toEqual(["workspace:remove", "inspect:resource-1", "destroy"])
   })
 
+  it("blocks an attached stop without known runtime health", async () => {
+    const fixture = await setupRecoveryFixture({
+      observations: [
+        { resource: "present", ownership: "verified", health: "healthy" },
+        { resource: "present", ownership: "verified", health: "unknown" },
+      ],
+    })
+
+    await expect(fixture.controller.handle({ operation: "recover", force: false, capability: fixture.capability })).resolves.toMatchObject({ state: "remote" })
+    await expect(fixture.controller.handle({ operation: "stop", force: false, capability: fixture.capability })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "STOP_EVIDENCE" },
+    })
+    expect(await fixture.store.get(fixture.record.sessionId)).toMatchObject({ state: "remote" })
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "warp:remote", "sync:start", "sync:connected", "replay", "inspect:resource-1"])
+  })
+
   it("denies recover to a remote capability with a stable V2 error", async () => {
     const fixture = await setupRecoveryFixture()
 
@@ -1562,6 +1701,62 @@ describe("lifecycle controller", () => {
       operation: { kind: "stop", phase: "detached" },
     })
     expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "sync", "warp:local", "close", "workspace:remove"])
+  })
+
+  it("stops an SBX runtime when the registry and host directories differ", async () => {
+    const remoteWorktreePath = "/workspace/project/.opencode-worktree"
+    const fixture = await setupRecoveryFixture({
+      provider: "sbx",
+      state: "remote",
+      providerState: { remoteWorktreePath },
+      workspaceDirectory: remoteWorktreePath,
+    })
+    const pending = {
+      ...fixture.record,
+      state: "stop_pending" as const,
+      desiredLocation: "local" as const,
+      phase: "detaching" as const,
+      operation: { kind: "stop" as const, phase: "adopting" },
+    }
+    await fixture.store.write(pending)
+
+    await fixture.controller.onSessionIdle(pending.sessionId)
+
+    expect(pending.directory).not.toBe(remoteWorktreePath)
+    expect(await fixture.store.get(pending.sessionId)).toMatchObject({
+      state: "detached",
+      operation: { kind: "stop", phase: "detached" },
+    })
+    expect(fixture.workspaceRemovals).toEqual([{ workspaceId: pending.workspaceId, directory: pending.directory }])
+    expect(fixture.calls).toEqual(["inspect:resource-1", "adopt", "sync", "warp:local", "close", "workspace:remove"])
+  })
+
+  it("rejects SBX workspace matches without a valid remote worktree path", async () => {
+    for (const providerState of [{}, { remoteWorktreePath: "/workspace/../project" }]) {
+      const fixture = await setupRecoveryFixture({
+        provider: "sbx",
+        state: "remote",
+        providerState,
+        workspaceDirectory: "/tmp/project",
+      })
+      const pending = {
+        ...fixture.record,
+        state: "stop_pending" as const,
+        desiredLocation: "local" as const,
+        phase: "detaching" as const,
+        operation: { kind: "stop" as const, phase: "adopting" },
+      }
+      await fixture.store.write(pending)
+
+      await fixture.controller.onSessionIdle(pending.sessionId)
+
+      expect(await fixture.store.get(pending.sessionId)).toMatchObject({
+        state: "error",
+        lastError: { code: "STOP_CONFLICT" },
+      })
+      expect(fixture.calls).toEqual(["inspect:resource-1"])
+      expect(fixture.workspaceRemovals).toEqual([])
+    }
   })
 
   it("rejects stop when the workspace ownership tuple diverges", async () => {
@@ -3265,10 +3460,103 @@ describe("plugin runtime", () => {
       },
     )
     if (!hooks || !adapter) throw new Error("plugin did not initialize")
+    const registeredAdapter = adapter
     cleanups.push(hooks.dispose)
 
-    expect(adapter.name).toBe("Docker Sandbox")
+    expect(registeredAdapter.name).toBe("Docker Sandbox")
     expect(registeredType).toBe("sbx")
+
+    const workspace = await registeredAdapter.configure({
+      id: "wrk_sbx_registry",
+      type: "sbx",
+      name: "workspace",
+      branch: "opencode/sbx-registry",
+      directory: root,
+      projectID: "prj_1",
+      extra: {
+        owner: "opencode-sandbox",
+        sessionId: "ses_sbx_registry",
+        generation: 2,
+        workspaceId: "wrk_sbx_registry",
+        projectId: "prj_1",
+        provider: "sbx",
+        remoteWorktreePath: "/workspace/project/.opencode-worktree",
+      },
+    })
+    expect(workspace.directory).toBe("/workspace/project/.opencode-worktree")
+    expect(workspace.extra).toEqual(expect.objectContaining({
+      owner: "opencode-sandbox",
+      sessionId: "ses_sbx_registry",
+      generation: 2,
+      workspaceId: "wrk_sbx_registry",
+      projectId: "prj_1",
+      provider: "sbx",
+      remoteWorktreePath: "/workspace/project/.opencode-worktree",
+    }))
+    expect(() => registeredAdapter.configure({
+      ...workspace,
+      extra: { ...workspace.extra as Record<string, unknown>, remoteWorktreePath: undefined },
+    })).toThrow("SBX remote worktree path is invalid")
+    expect(() => registeredAdapter.configure({
+      ...workspace,
+      extra: { ...workspace.extra as Record<string, unknown>, remoteWorktreePath: "/workspace/../project" },
+    })).toThrow("SBX remote worktree path is invalid")
+  })
+
+  it("registers the exe.dev checkout path without replacing ownership metadata", async () => {
+    const root = await temporaryDirectory()
+    let adapter: WorkspaceAdapterLike | undefined
+    const hooks = await createSandboxPlugin(
+      {
+        project: { id: "prj_1" },
+        directory: root,
+        worktree: root,
+        serverUrl: new URL("http://127.0.0.1:4096"),
+        experimental_workspace: { register: (_type, value) => { adapter = value } },
+      },
+      {
+        config: { provider: "exedev" },
+        env: { HOME: root, XDG_RUNTIME_DIR: root, OPENCODE_EXPERIMENTAL_WORKSPACES: "1" },
+      },
+    )
+    if (!hooks || !adapter) throw new Error("plugin did not initialize")
+    cleanups.push(hooks.dispose)
+
+    const remoteDirectory = "/tmp/oe-control"
+    const remoteWorktreePath = remoteWorkspaceDirectory("wrk_exedev_registry")
+    const workspace = await adapter.configure({
+      id: "wrk_exedev_registry",
+      type: "exedev",
+      name: "oc-exedev-registry",
+      branch: "opencode/exedev-registry",
+      directory: root,
+      projectID: "prj_1",
+      extra: {
+        owner: "opencode-sandbox",
+        sessionId: "ses_exedev_registry",
+        generation: 2,
+        workspaceId: "wrk_exedev_registry",
+        projectId: "prj_1",
+        provider: "exedev",
+        providerState: { provider: "exedev", remoteDirectory, remoteWorktreePath },
+      },
+    })
+
+    expect(workspace.directory).toBe(remoteWorktreePath)
+    expect(workspace.directory).not.toBe(remoteDirectory)
+    expect(workspace.extra).toEqual(expect.objectContaining({
+      owner: "opencode-sandbox",
+      sessionId: "ses_exedev_registry",
+      generation: 2,
+      workspaceId: "wrk_exedev_registry",
+      projectId: "prj_1",
+      provider: "exedev",
+      providerState: { provider: "exedev", remoteDirectory, remoteWorktreePath },
+    }))
+    expect(() => adapter!.configure({
+      ...workspace,
+      extra: { ...workspace.extra as Record<string, unknown>, providerState: { remoteDirectory } },
+    })).toThrow("exe.dev remote worktree path is invalid")
   })
 
   it("selects the Cloudflare provider from configuration without starting it", async () => {
@@ -3423,6 +3711,53 @@ describe("plugin runtime", () => {
 })
 
 describe("exe.dev provisioner", () => {
+  it("rejects an oversized local control socket before VM creation", async () => {
+    const root = await temporaryDirectory()
+    const localControlSocket = `/${"x".repeat(MAX_UNIX_SOCKET_PATH_BYTES - 1)}`
+    let created = false
+
+    expect(() => new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() {
+          created = true
+          throw new Error("must not create")
+        },
+      } as unknown as ExeControl,
+      worktree: root,
+      localControlSocket,
+    })).toThrow(/socket.*too long/i)
+    expect(created).toBe(false)
+  })
+
+  it("writes below a literal root and rejects an encoded root", async () => {
+    const root = await realpath(await temporaryDirectory())
+    const relative = Buffer.from("nested.txt").toString("base64url")
+    const runWriter = (rootArgument: string, content: string) => nodeProcessRunner.run({
+      argv: ["python3", "-c", REMOTE_WRITE_FILE, rootArgument, relative],
+      cwd: root,
+      stdin: content,
+    })
+
+    await expect(runWriter(root, "literal root\n")).resolves.toMatchObject({ exitCode: 0 })
+    expect(await readFile(join(root, "nested.txt"), "utf8")).toBe("literal root\n")
+
+    const encodedRoot = Buffer.from(root).toString("base64url")
+    const rejected = await runWriter(encodedRoot, "encoded root\n")
+    expect(rejected.exitCode).not.toBe(0)
+    expect(rejected.stderr).toContain("runtime directory must be absolute")
+    await expect(readFile(join(root, encodedRoot, "nested.txt"))).rejects.toThrow()
+  })
+
+  it("rejects an unsafe host worktree alias before provisioning", () => {
+    expect(() => new ExedevProvider({
+      config: parseConfig({}, { HOME: "/tmp" }),
+      control: {} as ExeControl,
+      worktree: "/tmp/../project",
+      localControlSocket: "/tmp/control.sock",
+    })).toThrow(/host worktree alias path is unsafe/)
+  })
+
   it("reports verified, absent, and ambiguous live VM states", async () => {
     const root = await temporaryDirectory()
     const identity = {
@@ -3460,6 +3795,82 @@ describe("exe.dev provisioner", () => {
     await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "conflict", health: "unknown" })
     inventory = []
     await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "absent", ownership: "unknown", health: "unknown" })
+  })
+
+  it("does not use VM status as authenticated OpenCode health", async () => {
+    const root = await temporaryDirectory()
+    const identity = {
+      name: "oc-0123456789",
+      sshDest: "owned.exe.xyz",
+      tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_health:wrk_health:1")}`],
+      comment: "opencode-test",
+    }
+    const info = {
+      id: "wrk_health",
+      type: "exedev",
+      name: identity.name,
+      branch: "opencode/sandbox-health",
+      directory: remoteWorkspaceDirectory("wrk_health"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_health", generation: 1, vmIdentity: identity },
+    }
+    let authorization = ""
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async list() { return [{ identity, status: "running" }] }
+      } as unknown as ExeControl,
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+      fetcher: (async (_input, init) => {
+        authorization = new Headers(init?.headers).get("authorization") ?? ""
+        return new Response(JSON.stringify({ healthy: true }), { status: 503 })
+      }) as typeof fetch,
+    })
+    ;(provider as unknown as { active: Map<string, unknown> }).active.set(info.id, {
+      process: { alive: true },
+      localPort: 4100,
+      password: "private",
+    })
+
+    await expect(provider.inspect(info)).resolves.toMatchObject({ resource: "present", ownership: "verified", health: "healthy" })
+    await expect(provider.diagnose(info)).resolves.toMatchObject({ resource: "present", ownership: "verified", health: "unknown" })
+    expect(authorization).toMatch(/^Basic /)
+  })
+
+  it("uses authenticated health for exe.dev Sandcastle inspection", async () => {
+    const root = await temporaryDirectory()
+    const calls: string[] = []
+    const provider = {
+      name: "exe.dev",
+      async inspect() {
+        calls.push("inspect")
+        return { resourceId: "vm-1", resource: "present" as const, ownership: "verified" as const, health: "healthy" as const, evidence: ["VM status"] }
+      },
+      async diagnose() {
+        calls.push("diagnose")
+        return { resourceId: "vm-1", resource: "present" as const, ownership: "verified" as const, health: "unknown" as const, evidence: ["authenticated health unavailable"] }
+      },
+    } as unknown as ExedevProvider
+    const adapter = createExedevSandcastleAdapter({
+      provider,
+      config: parseConfig({}, { HOME: root }),
+      control: {} as ExeControl,
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+      input: {
+        sessionId: "ses_adapter_health",
+        projectId: "prj_1",
+        workspaceId: "wrk_adapter_health",
+        generation: 1,
+        branch: "opencode/sandbox-health",
+        baseSha: "0123456789012345678901234567890123456789",
+        context: { sessionId: "ses_adapter_health", projectId: "prj_1", directory: root, worktree: root },
+      },
+    })
+
+    await expect(adapter.inspect?.()).resolves.toMatchObject({ resource: "present", ownership: "verified", health: "unknown" })
+    expect(calls).toEqual(["diagnose"])
   })
 
   it("fails closed for malformed ExeDev workspace and inventory data", async () => {
@@ -3718,7 +4129,7 @@ describe("exe.dev provisioner", () => {
         async waitForSync() { calls.push("sync:connected") },
         async replaySession() { calls.push("replay") },
         async remove() { calls.push("workspace:remove") },
-        async inspect() { return matchingWorkspace(record) },
+         async inspect() { return matchingWorkspace(record) },
       },
     })
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
@@ -3844,6 +4255,8 @@ describe("exe.dev provisioner", () => {
     let removedVm = false
     let removeCalls = 0
     let supervisorInput: { argv: string[]; stdin?: string | Uint8Array } | undefined
+    let bootstrapInput = ""
+    let launcherInput = ""
     let terminated = false
     let finishProcess: ((result: { exitCode: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }) => void) | undefined
     const process: ProcessHandle = {
@@ -3859,6 +4272,8 @@ describe("exe.dev provisioner", () => {
     const runner: ProcessRunner = {
       async run(input) {
         commands.push(input.argv)
+        if (typeof input.stdin === "string" && input.stdin.startsWith("set -eu\ncommand -v git")) bootstrapInput = input.stdin
+        if (typeof input.stdin === "string" && input.stdin.includes('print("remote launcher:')) launcherInput = input.stdin
         if (failRemote && input.argv[0]?.endsWith("/ssh") && input.argv.includes("mkdir")) {
           return { exitCode: 1, signal: null, stdout: "", stderr: "mkdir failed" }
         }
@@ -3939,6 +4354,29 @@ describe("exe.dev provisioner", () => {
 
     await provisioner.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
 
+    expect(bootstrapInput).toContain('export BUN_INSTALL="$HOME/.bun"')
+    expect(bootstrapInput).toContain('curl -fsSL https://bun.sh/install | bash -s -- "bun-v1.3.14"')
+    expect(bootstrapInput).not.toContain("npm")
+    expect(bootstrapInput).not.toMatch(/\bnode(?:js)?\b/)
+    expect(bootstrapInput).toContain('opencode="$BUN_INSTALL/bin/opencode"')
+    expect(bootstrapInput).toContain('package="$BUN_INSTALL/install/global/node_modules/opencode-ai"')
+    expect(bootstrapInput).toContain('--ignore-scripts')
+    expect(bootstrapInput).toContain('"$bun" "$package/postinstall.mjs"')
+    expect(bootstrapInput).toContain('OpenCode version mismatch: expected %s, got %s')
+    expect(launcherInput).toContain('shutil.which("opencode", path=bun_directory)')
+    expect(launcherInput).not.toContain('shutil.which("bun", path=bun_directory)')
+    expect(launcherInput).toContain('os.execvpe(command, [command, "serve"')
+    expect(launcherInput).not.toContain("os.execve(bun")
+    expect(launcherInput).toContain("refusing to run OpenCode as root")
+    expect(launcherInput).toContain("os.lstat")
+    expect(launcherInput).toContain('socket_path != os.path.join(runtime, "c.sock")')
+    expect(launcherInput).toContain('frame["directory"] != expected_directory')
+    expect(launcherInput).toContain("read_control_socket(0, 0)")
+    expect(launcherInput).toContain('"/usr/bin/sudo", "-n", "--", "/usr/bin/chown"')
+    expect(launcherInput).toContain('f"{uid}:{gid}"')
+    expect(launcherInput).toContain("read_control_socket(uid, gid)")
+    expect(launcherInput).toContain("stat.S_ISLNK")
+    expect(launcherInput).toContain("stat.S_IMODE")
     expect(commands.some((argv) => argv.includes("clone"))).toBe(true)
     expect(supervisorInput?.argv).toContain("127.0.0.1:4100:127.0.0.1:4096")
     expect(supervisorInput?.argv.join(" ")).not.toContain("control-token")
@@ -4035,7 +4473,7 @@ describe("exe.dev provisioner", () => {
       branch: "opencode/sandbox-failed",
       directory: remoteWorkspaceDirectory("wrk_failed"),
       projectID: "prj_1",
-      extra: {},
+      extra: { tags: ["opencode-sandbox"], comment: "opencode-test" },
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_COMMAND" })
     expect(removed).toBe(true)
   })
@@ -4088,10 +4526,141 @@ describe("exe.dev provisioner", () => {
       branch: "opencode/sandbox-verify",
       directory: remoteWorkspaceDirectory("wrk_verify"),
       projectID: "prj_1",
-      extra: {},
+      extra: { tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:wrk_verify:wrk_verify:1")}`], comment: "opencode-test" },
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
     expect(listCalls).toBe(2)
     expect(removed).toEqual(vm.identity)
+  })
+
+  it("normalizes an incomplete create receipt from the confirmed inventory snapshot", async () => {
+    const root = await temporaryDirectory()
+    const baseSha = "0123456789012345678901234567890123456789"
+    const ownerTag = `opencode-owner-${shortHash("prj_1:ses_incomplete:wrk_incomplete:1")}`
+    const created: VmInfo = {
+      identity: {
+        name: "oc-0123456789",
+        sshDest: "vm.exe.xyz",
+        tags: [],
+        comment: "new-comment",
+        region: "new-region",
+      },
+      status: "running",
+    }
+    const observed: VmInfo = {
+      ...created,
+      identity: {
+        ...created.identity,
+        id: "opaque-provider-id",
+        tags: ["opencode-sandbox", ownerTag],
+        comment: "opencode-test",
+        region: "iad",
+      },
+    }
+    let removeCalls = 0
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv[0] === "git" && input.argv.includes("rev-parse")) {
+          return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        }
+        if (input.argv.includes("test") && input.argv.includes("-L")) {
+          return { exitCode: 1, signal: null, stdout: "", stderr: "" }
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    }
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { return created },
+        async copy() { throw new Error("must not copy") },
+        async list() { return [observed] },
+        async remove() { removeCalls++ },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+      runner,
+      ensureHostKey: async () => {},
+      ensureVmHostKey: async () => {},
+      reservePort: async () => 4100,
+      controlTokenFor: async () => "token",
+      deferActivation: true,
+    })
+
+    const info = {
+      id: "wrk_incomplete",
+      type: "exedev",
+      name: created.identity.name,
+      branch: "opencode/sandbox-incomplete",
+      directory: remoteWorkspaceDirectory("wrk_incomplete"),
+      projectID: "prj_1",
+      extra: { sessionId: "ses_incomplete", generation: 1, baseSha, tags: ["opencode-sandbox"], comment: "opencode-test" },
+    }
+
+    await expect(provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })).resolves.toBeUndefined()
+    expect(info.extra).toMatchObject({ vmName: observed.identity.name, vmIdentity: observed.identity })
+    expect(removeCalls).toBe(0)
+  })
+
+  it("rejects a newly-created VM when its owner tag or receipt ID diverges", async () => {
+    const root = await temporaryDirectory()
+    const baseSha = "0123456789012345678901234567890123456789"
+    const ownerTag = `opencode-owner-${shortHash("prj_1:ses_divergent:wrk_divergent:1")}`
+    let variant: "owner" | "id" = "owner"
+    const receipt: VmInfo = {
+      identity: { name: "oc-0123456789", sshDest: "vm.exe.xyz", id: "provider-id", tags: [], comment: "new-comment", region: "new-region" },
+      status: "running",
+    }
+    const provider = new ExedevProvider({
+      config: parseConfig({}, { HOME: root }),
+      control: {
+        async create() { return receipt },
+        async copy() { throw new Error("must not copy") },
+        async list() {
+          return [{
+            identity: {
+              ...receipt.identity,
+              id: variant === "id" ? "foreign-id" : "provider-id",
+              tags: variant === "owner" ? ["opencode-sandbox"] : ["opencode-sandbox", ownerTag],
+              comment: "opencode-test",
+              region: "iad",
+            },
+            status: "running",
+          }]
+        },
+        async remove() { throw new Error("must not remove") },
+        async tag() {},
+      },
+      worktree: root,
+      localControlSocket: join(root, "control.sock"),
+      runner: {
+        async run(input) {
+          if (input.argv[0] === "git" && input.argv.includes("remote")) {
+            return { exitCode: 0, signal: null, stdout: "https://github.com/owner/repo.git\n", stderr: "" }
+          }
+          if (input.argv[0] === "git" && input.argv.includes("rev-parse")) {
+            return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+          }
+          return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        },
+      },
+      ensureHostKey: async () => {},
+      ensureVmHostKey: async () => {},
+      reservePort: async () => 4100,
+    })
+
+    for (const current of ["owner", "id"] as const) {
+      variant = current
+      await expect(provider.prepare({
+        id: "wrk_divergent",
+        type: "exedev",
+        name: receipt.identity.name,
+        branch: "opencode/sandbox-divergent",
+        directory: remoteWorkspaceDirectory("wrk_divergent"),
+        projectID: "prj_1",
+        extra: { sessionId: "ses_divergent", generation: 1, baseSha, tags: ["opencode-sandbox"], comment: "opencode-test" },
+      }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "EXEDEV_OWNERSHIP_UNVERIFIED" })
+    }
   })
 
   for (const failure of ["tag", "comment"] as const) {
@@ -4159,7 +4728,7 @@ describe("exe.dev provisioner", () => {
     })
   }
 
-  it("exposes Exe.dev as an isolated Sandcastle provider with streaming exec", async () => {
+  it("exposes Exe.dev as an isolated Sandcastle provider with streaming exec and failure evidence", async () => {
     const root = await temporaryDirectory()
     const repository = await temporaryDirectory()
     await runGit(repository, ["init", "-q"])
@@ -4168,14 +4737,25 @@ describe("exe.dev provisioner", () => {
     await writeFile(join(repository, "tracked.txt"), "base\n")
     await runGit(repository, ["add", "."])
     await runGit(repository, ["commit", "-q", "-m", "initial"])
+    await runGit(repository, ["remote", "add", "origin", repository])
+    const branch = "opencode/sandbox-adapter"
+    const projectId = "project-host"
+    const authContent = '{"apiKey":"activation-auth-secret"}'
     const head = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })
     const baseSha = head.stdout.trim()
+    const checkoutDirectory = remoteWorkspaceDirectory("wrk_adapter")
+    const identityPath = `${checkoutDirectory}/.git/opencode`
     const vm: VmInfo = {
-      identity: { name: `oc-${shortHash("wrk_adapter")}`, sshDest: "vm.exe.xyz", tags: ["opencode-sandbox", `opencode-owner-${shortHash("prj_1:ses_adapter:wrk_adapter:1")}`], comment: "opencode-test" },
+      identity: { name: `oc-${shortHash("wrk_adapter")}`, sshDest: "vm.exe.xyz", tags: ["opencode-sandbox", `opencode-owner-${shortHash(`${projectId}:ses_adapter:wrk_adapter:1`)}`], comment: "opencode-test" },
       status: "running",
     }
     let removed = 0
     let terminated = 0
+    let provisionedVm = vm
+    const calls: string[][] = []
+    const startup: string[] = []
+    const lifecycle: string[] = []
+    let checkoutMode = 0o700
     let supervisorInput: { argv: string[]; stdin?: string | Uint8Array } | undefined
     let finishProcess!: (result: { exitCode: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }) => void
     const process: ProcessHandle = {
@@ -4188,15 +4768,32 @@ describe("exe.dev provisioner", () => {
     }
     const runner: ProcessRunner = {
       async run(input) {
+        calls.push(input.argv)
+        if (input.argv.includes("mkdir") && input.argv.includes(checkoutDirectory)) lifecycle.push("mkdir-checkout")
+        if (input.argv.some((value) => value.includes("mktemp -d -t sandcastle-"))) lifecycle.push("sandcastle-mktemp")
+        if (input.argv.includes(identityPath)) {
+          startup.push("project-identity")
+          expect(input.stdin).toBe(projectId)
+        }
+        const command = input.argv.at(-1) ?? ""
+        if (command.includes(`rm -rf "${checkoutDirectory}" && mv "${checkoutDirectory}_clone" "${checkoutDirectory}"`)) {
+          checkoutMode = 0o755
+          startup.push("sandcastle-swap")
+        }
+        if (input.argv.some((value) => value.includes("os.fchmod")) && input.argv.includes(checkoutDirectory)) {
+          expect(checkoutMode).toBe(0o755)
+          checkoutMode = 0o700
+          startup.push("checkout-private")
+        }
         if (input.argv[0] === "git" && input.argv.includes("remote")) {
-          return { exitCode: 0, signal: null, stdout: "https://github.com/owner/repo.git\n", stderr: "" }
+          return { exitCode: 0, signal: null, stdout: `file://${repository}\n`, stderr: "" }
         }
         if (input.argv[0] === "git" && input.argv.includes("rev-parse")) {
           return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
         }
         if (input.argv[0]?.endsWith("/ssh")) {
           const command = input.argv.at(-1) ?? ""
-          if (input.argv.includes("test") && input.argv.includes("-d")) return { exitCode: 1, signal: null, stdout: "", stderr: "" }
+          if (input.argv.includes("test") && (input.argv.includes("-d") || input.argv.includes("-L"))) return { exitCode: 1, signal: null, stdout: "", stderr: "" }
           if (input.argv.includes("rev-parse") || command.includes("rev-parse")) return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
           if (command.includes("printf")) {
             input.onLine?.("first")
@@ -4210,53 +4807,97 @@ describe("exe.dev provisioner", () => {
     const adapter = createExedevSandcastleAdapter({
       input: {
         sessionId: "ses_adapter",
-        projectId: "prj_1",
+        projectId,
         workspaceId: "wrk_adapter",
         generation: 1,
-        branch: "opencode/sandbox-adapter",
+        branch,
         baseSha,
-        context: { sessionId: "ses_adapter", projectId: "prj_1", directory: repository, worktree: repository },
+        context: { sessionId: "ses_adapter", projectId, directory: repository, worktree: repository },
       },
       config: parseConfig({}, { HOME: root }),
       control: {
-        async create() { return vm },
-        async copy() { return vm },
-        async list() { return [vm] },
+        async create(input) {
+          provisionedVm = { ...vm, identity: { ...vm.identity, tags: [...input.tags], comment: input.comment } }
+          return provisionedVm
+        },
+        async copy() { return provisionedVm },
+        async list() { return [provisionedVm] },
         async remove() { removed++ },
         async tag() {},
       },
       worktree: repository,
       localControlSocket: join(root, "control.sock"),
       runner,
-      supervisor: { async start(input) { supervisorInput = input; return process } },
+      supervisor: { async start(input) { expect(checkoutMode).toBe(0o700); startup.push("server-start"); supervisorInput = input; return process } },
       reservePort: async () => 4100,
       ensureHostKey: async () => {},
       ensureVmHostKey: async () => {},
       controlTokenFor: async () => "remote-token",
-      authContent: "{}",
+      authContent,
       fetcher: (async () => new Response(JSON.stringify({ healthy: true, version: "1.18.23" }), { status: 200 })) as unknown as typeof fetch,
     })
     const worktree = await createWorktree({
       cwd: repository,
-      branchStrategy: { type: "branch", branch: "opencode/sandbox-adapter", baseBranch: baseSha },
+      branchStrategy: { type: "branch", branch, baseBranch: baseSha },
     })
 
     let sandbox
     try {
       sandbox = await worktree.createSandbox({ sandbox: adapter.provider })
+      expect(lifecycle).toEqual(["mkdir-checkout", "sandcastle-mktemp"])
+      const metadata = adapter.recoveryMetadata?.() ?? {}
+      expect(projectId).not.toBe(baseSha)
+      expect(metadata).toMatchObject({ provider: "exedev", projectId, sessionId: "ses_adapter", workspaceId: "wrk_adapter", generation: 1, branch, baseSha })
+      expect(metadata.remoteWorktreePath).toBe(remoteWorkspaceDirectory("wrk_adapter"))
+      expect(metadata.remoteDirectory).toMatch(/^\/tmp\/oe-/)
+      expect(metadata.remoteWorktreePath).not.toBe(metadata.remoteDirectory)
+      expect(calls.some((argv) => argv[0] === "git" && argv.includes("remote") && argv.includes("get-url"))).toBe(false)
+      expect(calls.some((argv) => argv.includes("clone") && argv.includes("--no-checkout"))).toBe(false)
       expect(supervisorInput).toBeUndefined()
       await adapter.applyCapture({ sandbox, capture: { baseSha, patch: "", untracked: [] } })
+      expect(startup).toEqual(["sandcastle-swap", "checkout-private", "project-identity", "server-start"])
       await expect(adapter.target()).resolves.toMatchObject({ type: "remote", url: "http://127.0.0.1:4100" })
       expect(supervisorInput?.argv).toContain("-R")
       expect(supervisorInput?.argv.some((value) => value.endsWith(`:${join(root, "control.sock")}`))).toBe(true)
-      expect(JSON.parse(String(supervisorInput?.stdin))).toMatchObject({ authContent: "{}", controlToken: "remote-token" })
+      expect(JSON.parse(String(supervisorInput?.stdin))).toMatchObject({ authContent, controlToken: "remote-token" })
       const lines: string[] = []
       await expect(sandbox.exec("printf 'first\\nsecond\\n'", { onLine: (line) => lines.push(line) })).resolves.toMatchObject({
         exitCode: 0,
         stdout: "first\nsecond\n",
       })
       expect(lines).toEqual(["first", "second"])
+
+      const frame = JSON.parse(String(supervisorInput?.stdin)) as { serverPassword: string; controlToken: string }
+      const stdout = `supervisor stdout password=${frame.serverPassword} controlToken=${frame.controlToken} auth=${authContent} ${"o".repeat(4_000)}`
+      const stderr = `supervisor stderr password=${frame.serverPassword} controlToken=${frame.controlToken} auth=${authContent} ${"e".repeat(4_000)}`
+      finishProcess({ exitCode: 17, signal: null, stdout, stderr })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      let failure: unknown
+      try {
+        await sandbox.exec("true")
+      } catch (error) {
+        failure = error
+      }
+      if (!(failure instanceof SandboxError)) throw new Error("expected a supervisor failure")
+      expect(failure.message).toContain("SSH supervisor exited")
+      expect(failure.message).toContain("exit code 17")
+      expect(failure.message).toContain("signal null")
+      expect(failure.message).toContain("supervisor stdout")
+      expect(failure.message).toContain("supervisor stderr")
+      expect(failure.message).toContain("[REDACTED]")
+      for (const secret of [frame.serverPassword, frame.controlToken, authContent]) {
+        expect(failure.message).not.toContain(secret)
+      }
+      expect(failure.message.length).toBeLessThan(5_000)
+
       expect(sandbox.worktreePath).toBe(worktree.worktreePath)
+      const aliasCommand = calls.find((argv) => argv.includes("sudo") && argv.includes("-n") && argv.at(-1)?.includes("ln -s --"))
+      expect(aliasCommand).toEqual(expect.arrayContaining(["sudo", "-n", "--", "sh", "-lc"]))
+      expect(aliasCommand?.at(-1)).toContain(`alias_path=`)
+      expect(aliasCommand?.at(-1)).toContain(repository)
+      expect(aliasCommand?.at(-1)).toContain(remoteWorkspaceDirectory("wrk_adapter"))
+      expect(supervisorInput?.argv).not.toContain("sudo")
     } finally {
       await sandbox?.close()
       await sandbox?.close()
@@ -4266,9 +4907,172 @@ describe("exe.dev provisioner", () => {
     expect(terminated).toBe(1)
     expect(removed).toBe(1)
   })
+
+  it("syncs exe.dev adapter output through the safe host delta", async () => {
+    const repository = await temporaryDirectory()
+    await runGit(repository, ["init", "-q"])
+    await runGit(repository, ["config", "user.email", "test@example.invalid"])
+    await runGit(repository, ["config", "user.name", "Test"])
+    await writeFile(join(repository, "tracked.txt"), "base\n")
+    await runGit(repository, ["add", "."])
+    await runGit(repository, ["commit", "-q", "-m", "initial"])
+    const context = { sessionId: "ses_exedev_sync", projectId: "prj_1", directory: repository, worktree: repository }
+    const capture = await captureWorkingTree(context)
+    const branch = "opencode/exedev-sync"
+    const worktree = await createWorktree({
+      cwd: repository,
+      branchStrategy: { type: "branch", branch, baseBranch: capture.baseSha },
+    })
+    const provider = {
+      name: "exe.dev",
+      async syncIn() {},
+      async activate() {},
+      async target() { return { type: "remote" as const, url: "http://127.0.0.1:4100" } },
+      async close() {},
+    } as unknown as ExedevProvider
+    const adapter = createExedevSandcastleAdapter({
+      provider,
+      config: parseConfig({}, { HOME: repository }),
+      control: {} as ExeControl,
+      localControlSocket: join(repository, "control.sock"),
+      worktree: repository,
+      input: {
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        workspaceId: "wrk_exedev_sync",
+        generation: 1,
+        branch,
+        baseSha: capture.baseSha,
+        context,
+      },
+    })
+    let remoteTree = ""
+    const sandbox = {
+      async exec(command: string) {
+        expect(command).toBe("git rev-parse HEAD^{tree}")
+        return { exitCode: 0, stdout: `${remoteTree}\n`, stderr: "" }
+      },
+    } as unknown as Sandbox
+    const syncBack = adapter.syncBackWorkingTree
+    if (!syncBack) throw new Error("exe.dev adapter did not expose sync-back")
+    const readTree = async () => {
+      const result = await nodeProcessRunner.run({
+        argv: ["git", "-C", worktree.worktreePath, "rev-parse", "HEAD^{tree}"],
+        cwd: worktree.worktreePath,
+      })
+      if (result.exitCode !== 0) throw new Error(result.stderr || "could not read remote tree")
+      return result.stdout.trim()
+    }
+
+    try {
+      await adapter.applyCapture({ sandbox, capture })
+      await writeFile(join(worktree.worktreePath, "remote.txt"), "first\n")
+      await runGit(worktree.worktreePath, ["add", "."])
+      await runGit(worktree.worktreePath, ["commit", "-q", "-m", "remote-first"])
+      remoteTree = await readTree()
+      const head = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })
+      const index = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "ls-files", "--stage"], cwd: repository })
+
+      await syncBack({ sandbox, worktreePath: worktree.worktreePath })
+
+      expect(await readFile(join(repository, "remote.txt"), "utf8")).toBe("first\n")
+      expect((await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })).stdout.trim()).toBe(head.stdout.trim())
+      expect((await nodeProcessRunner.run({ argv: ["git", "-C", repository, "ls-files", "--stage"], cwd: repository })).stdout).toBe(index.stdout)
+
+      await writeFile(join(worktree.worktreePath, "remote.txt"), "second\n")
+      await runGit(worktree.worktreePath, ["add", "."])
+      await runGit(worktree.worktreePath, ["commit", "-q", "-m", "remote-second"])
+      remoteTree = await readTree()
+      await syncBack({ sandbox, worktreePath: worktree.worktreePath })
+
+      expect(await readFile(join(repository, "remote.txt"), "utf8")).toBe("second\n")
+    } finally {
+      await worktree.close()
+    }
+  })
 })
 
 describe("Docker Sandbox provider", () => {
+  it("syncs SBX adapter output through the safe host delta", async () => {
+    const repository = await temporaryDirectory()
+    await runGit(repository, ["init", "-q"])
+    await runGit(repository, ["config", "user.email", "test@example.invalid"])
+    await runGit(repository, ["config", "user.name", "Test"])
+    await writeFile(join(repository, "tracked.txt"), "base\n")
+    await runGit(repository, ["add", "."])
+    await runGit(repository, ["commit", "-q", "-m", "initial"])
+    const context = { sessionId: "ses_sbx_sync", projectId: "prj_1", directory: repository, worktree: repository }
+    const capture = await captureWorkingTree(context)
+    const branch = "opencode/sbx-sync"
+    const worktree = await createWorktree({
+      cwd: repository,
+      branchStrategy: { type: "branch", branch, baseBranch: capture.baseSha },
+    })
+    const provider = {
+      name: "Docker Sandbox",
+      async syncIn() {},
+      async activate() {},
+      async target() { return { type: "remote" as const, url: "http://127.0.0.1:4100" } },
+      async close() {},
+    } as unknown as SbxProvider
+    const adapter = createSbxSandcastleAdapter({
+      provider,
+      worktree: repository,
+      input: {
+        sessionId: context.sessionId,
+        projectId: context.projectId,
+        workspaceId: "wrk_sbx_sync",
+        generation: 1,
+        branch,
+        baseSha: capture.baseSha,
+        context,
+      },
+    })
+    let remoteTree = ""
+    const sandbox = {
+      async exec(command: string) {
+        expect(command).toBe("git rev-parse HEAD^{tree}")
+        return { exitCode: 0, stdout: `${remoteTree}\n`, stderr: "" }
+      },
+    } as unknown as Sandbox
+    const syncBack = adapter.syncBackWorkingTree
+    if (!syncBack) throw new Error("SBX adapter did not expose sync-back")
+    const readTree = async () => {
+      const result = await nodeProcessRunner.run({
+        argv: ["git", "-C", worktree.worktreePath, "rev-parse", "HEAD^{tree}"],
+        cwd: worktree.worktreePath,
+      })
+      if (result.exitCode !== 0) throw new Error(result.stderr || "could not read remote tree")
+      return result.stdout.trim()
+    }
+
+    try {
+      await adapter.applyCapture({ sandbox, capture })
+      await writeFile(join(worktree.worktreePath, "remote.txt"), "first\n")
+      await runGit(worktree.worktreePath, ["add", "."])
+      await runGit(worktree.worktreePath, ["commit", "-q", "-m", "remote-first"])
+      remoteTree = await readTree()
+      const head = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })
+      const index = await nodeProcessRunner.run({ argv: ["git", "-C", repository, "ls-files", "--stage"], cwd: repository })
+
+      await syncBack({ sandbox, worktreePath: worktree.worktreePath })
+
+      expect(await readFile(join(repository, "remote.txt"), "utf8")).toBe("first\n")
+      expect((await nodeProcessRunner.run({ argv: ["git", "-C", repository, "rev-parse", "HEAD"], cwd: repository })).stdout.trim()).toBe(head.stdout.trim())
+      expect((await nodeProcessRunner.run({ argv: ["git", "-C", repository, "ls-files", "--stage"], cwd: repository })).stdout).toBe(index.stdout)
+
+      await writeFile(join(worktree.worktreePath, "remote.txt"), "second\n")
+      await runGit(worktree.worktreePath, ["add", "."])
+      await runGit(worktree.worktreePath, ["commit", "-q", "-m", "remote-second"])
+      remoteTree = await readTree()
+      await syncBack({ sandbox, worktreePath: worktree.worktreePath })
+
+      expect(await readFile(join(repository, "remote.txt"), "utf8")).toBe("second\n")
+    } finally {
+      await worktree.close()
+    }
+  })
+
   it("adapts an isolated sandbox to Sandcastle with authenticated remote stop", async () => {
     const root = await temporaryDirectory()
     const repository = await temporaryDirectory()
@@ -4297,7 +5101,7 @@ describe("Docker Sandbox provider", () => {
     const baseSha = head.stdout.trim()
     const branch = "opencode/sbx-adapter"
     const clone = "/workspace/project"
-    const sandboxWorktree = join(clone, ".opencode-worktree")
+    const sandboxWorktree = clone
     const calls: string[] = []
     const inputs: Array<{ argv: string[]; stdin?: string | Uint8Array }> = []
     let supervisorInput: { argv: string[]; stdin?: string | Uint8Array; timeoutMs?: number } | undefined
@@ -4382,11 +5186,16 @@ describe("Docker Sandbox provider", () => {
     try {
       await channel.start()
       sandbox = await worktree.createSandbox({ sandbox: adapter.provider })
+      expect(sandbox.worktreePath).toBe(worktree.worktreePath)
+      expect(sandbox.worktreePath).not.toBe(sandboxWorktree)
+      expect(adapter.recoveryMetadata?.()).toMatchObject({ remoteWorktreePath: sandboxWorktree })
       const managedAuth = inputs.find(({ argv }) => argv.includes("secret") && argv.includes("set"))
       expect(managedAuth?.stdin).toBe("test-access\n")
       expect(calls.some((call) => call.includes("npm install --global opencode-ai@1.18.25"))).toBe(true)
-      const swapCommand = inputs.map(({ argv }) => argv.at(-1)).find((command) => command?.includes(`rm -rf "${sandboxWorktree}" && mv "${sandboxWorktree}_clone" "${sandboxWorktree}"`))
+      const swapCommand = inputs.map(({ argv }) => argv.at(-1)).find((command) => command?.includes(`for entry in "${sandboxWorktree}"/*`))
       expect(swapCommand).toContain(`cd -- ${sandboxWorktree} &&`)
+      expect(swapCommand).toContain(`"${sandboxWorktree}_clone"`)
+      expect(swapCommand).not.toContain(`rm -rf "${sandboxWorktree}" && mv "${sandboxWorktree}_clone" "${sandboxWorktree}"`)
       expect(supervisorInput).toBeUndefined()
       await adapter.applyCapture({ sandbox, capture })
       expect(calls.some((call) => call.includes("remote set-url origin https://github.com/owner/repo.git"))).toBe(true)
@@ -4461,6 +5270,76 @@ describe("Docker Sandbox provider", () => {
 
     expect(fixture.calls.filter((call) => call.includes(" stop "))).toHaveLength(1)
     expect(fixture.calls.filter((call) => call.includes(" rm --force "))).toHaveLength(1)
+  })
+
+  it("swaps the initial SBX clone in place and preserves it on failure", async () => {
+    const sandboxRoot = await temporaryDirectory()
+    const worktreePath = join(sandboxRoot, "project")
+    const clonePath = `${worktreePath}_clone`
+    const externalPath = join(sandboxRoot, "external.txt")
+    const baseSha = "0123456789012345678901234567890123456789"
+    const branch = "opencode/sbx-swap"
+    await mkdir(worktreePath)
+    await mkdir(clonePath)
+    await writeFile(join(worktreePath, "stale.txt"), "stale\n")
+    await writeFile(join(clonePath, "prepared.txt"), "prepared\n")
+    await writeFile(externalPath, "keep\n")
+
+    const ownership = fakeSbxOwnership()
+    const runner: ProcessRunner = {
+      async run(input) {
+        if (input.argv[0] !== "sbx") return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+        if (input.argv.includes("--show-toplevel")) return { exitCode: 0, signal: null, stdout: `${worktreePath}\n`, stderr: "" }
+        if (input.argv.includes("opencode") && input.argv.includes("--version")) return { exitCode: 0, signal: null, stdout: "1.18.23\n", stderr: "" }
+        if (input.argv.includes("symbolic-ref")) return { exitCode: 0, signal: null, stdout: `${branch}\n`, stderr: "" }
+        if (input.argv.some((value) => value.includes("rev-parse"))) return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        if (input.argv[3] === "sh" && input.argv[4] === "-lc") {
+          return nodeProcessRunner.run({ argv: ["/bin/sh", "-lc", input.argv[5] ?? ""], cwd: worktreePath, onLine: input.onLine })
+        }
+        return { exitCode: 0, signal: null, stdout: "", stderr: "" }
+      },
+    }
+    const provider = new SbxProvider({
+      ...ownership,
+      worktree: sandboxRoot,
+      deferActivation: true,
+      runner,
+      reservePort: async () => 4101,
+      fetcher: (async () => new Response(JSON.stringify({ healthy: true }), { status: 200 })) as unknown as typeof fetch,
+    })
+    const info = {
+      id: "wrk_sbx_swap",
+      type: "sbx",
+      name: "workspace",
+      branch,
+      directory: sandboxRoot,
+      projectID: "prj_1",
+      extra: { baseSha, sessionId: "ses_sbx_swap", generation: 1 },
+    }
+    await provider.prepare(info, { OPENCODE_AUTH_CONTENT: "{}" })
+    const handle = provider.createIsolatedHandle(info)
+    const swap = `rm -rf "${worktreePath}" && mv "${clonePath}" "${worktreePath}"`
+    const inode = (await stat(worktreePath)).ino
+
+    try {
+      await chmod(worktreePath, 0o500)
+      const failedSwap = await handle.exec(swap)
+      expect(failedSwap.exitCode).not.toBe(0)
+      expect((await stat(clonePath)).isDirectory()).toBe(true)
+
+      await chmod(worktreePath, 0o700)
+      await expect(handle.exec(swap)).resolves.toMatchObject({ exitCode: 0 })
+      expect((await stat(worktreePath)).ino).toBe(inode)
+      expect(await readFile(join(worktreePath, "prepared.txt"), "utf8")).toBe("prepared\n")
+      await expect(stat(join(worktreePath, "stale.txt"))).rejects.toThrow()
+      expect(await readFile(externalPath, "utf8")).toBe("keep\n")
+      await expect(stat(clonePath)).rejects.toThrow()
+
+      await expect(handle.exec("printf normal")).resolves.toMatchObject({ exitCode: 0, stdout: "normal" })
+    } finally {
+      await chmod(worktreePath, 0o700)
+      await handle.close()
+    }
   })
 
   it("uses a private clone, streams the capture, and exports an isolated branch", async () => {
@@ -4571,6 +5450,63 @@ describe("Docker Sandbox provider", () => {
     }, { OPENCODE_AUTH_CONTENT: "{}" })).rejects.toMatchObject({ code: "REMOTE_SHA_MISMATCH" })
   })
 
+  it("rejects unsafe SBX clone roots before checking out", async () => {
+    const directories = [
+      "/",
+      "//",
+      "/.",
+      "/run",
+      "/run/sandbox",
+      "/run/sandbox/source",
+      "/run/sandbox/source/child",
+      "/tmp",
+      "/tmp/oe-runtime",
+      "/tmp/opencode-sandbox-owner",
+    ]
+
+    for (const directory of directories) {
+      const calls: string[][] = []
+      const provider = new SbxProvider({
+        worktree: "/tmp/project",
+        runner: {
+          async run(input) {
+            calls.push(input.argv)
+            return { exitCode: 0, signal: null, stdout: `${directory}\n`, stderr: "" }
+          },
+        },
+      })
+      const cloneDirectory = (provider as unknown as { cloneDirectory(sandbox: string): Promise<string> }).cloneDirectory.bind(provider)
+
+      await expect(cloneDirectory("oc-sbx-test")).rejects.toMatchObject({
+        code: "SBX_CLONE_DIRECTORY",
+      })
+      expect(calls).toHaveLength(1)
+    }
+  })
+
+  it("uses the writable SBX clone root and rejects readonly clones", async () => {
+    const clone = "/workspace/project"
+    let writable = true
+    const calls: string[][] = []
+    const provider = new SbxProvider({
+      worktree: "/tmp/project",
+      runner: {
+        async run(input) {
+          calls.push(input.argv)
+          if (input.argv.includes("--show-toplevel")) return { exitCode: 0, signal: null, stdout: `${clone}\n`, stderr: "" }
+          return { exitCode: writable ? 0 : 1, signal: null, stdout: "", stderr: "" }
+        },
+      },
+    })
+    const cloneDirectory = (provider as unknown as { cloneDirectory(sandbox: string): Promise<string> }).cloneDirectory.bind(provider)
+
+    await expect(cloneDirectory("oc-sbx-test")).resolves.toBe(clone)
+    writable = false
+    await expect(cloneDirectory("oc-sbx-test")).rejects.toMatchObject({ code: "SBX_CLONE_READONLY" })
+    expect(calls.filter((argv) => argv.includes("--show-toplevel"))).toHaveLength(2)
+    expect(calls.filter((argv) => argv.includes("test"))).toHaveLength(2)
+  })
+
   it("does not inspect, reuse, or destroy an unowned SBX name", async () => {
     const baseSha = "0123456789012345678901234567890123456789"
     const commands: string[][] = []
@@ -4608,6 +5544,63 @@ describe("Docker Sandbox provider", () => {
       ...info,
       extra: { providerState: { ...info.extra, workspaceId: info.id, projectId: info.projectID, sandbox } },
     })).rejects.toMatchObject({ code: "SBX_OWNERSHIP_UNVERIFIED" })
+    expect(commands).toHaveLength(1)
+  })
+
+  it("preserves bounded create failure evidence when ownership verification fails", async () => {
+    const baseSha = "0123456789012345678901234567890123456789"
+    const createStdout = `create stdout token=stdout-secret ${"o".repeat(8_000)}`
+    const createStderr = `create stderr Authorization: Bearer stderr-secret ${"e".repeat(8_000)}`
+    const commands: string[][] = []
+    const provider = new SbxProvider({
+      ...fakeSbxOwnership(),
+      worktree: await temporaryDirectory(),
+      reservePort: async () => 4101,
+      runner: {
+        async run(input) {
+          commands.push(input.argv)
+          if (input.argv[0] === "sbx" && input.argv[1] === "create") {
+            return { exitCode: 17, signal: null, stdout: createStdout, stderr: createStderr }
+          }
+          return { exitCode: 0, signal: null, stdout: `${baseSha}\n`, stderr: "" }
+        },
+      },
+    })
+
+    let failure: unknown
+    try {
+      await provider.prepare({
+        id: "wrk_sbx_create_failure",
+        type: "sbx",
+        name: "workspace",
+        branch: "opencode/sbx-create-failure",
+        directory: "/tmp/project",
+        projectID: "prj_1",
+        extra: { baseSha, sessionId: "ses_create_failure", generation: 1 },
+      }, { OPENCODE_AUTH_CONTENT: "{}" })
+    } catch (error) {
+      failure = error
+    }
+
+    if (!(failure instanceof SandboxError)) throw new Error("expected a SandboxError")
+    expect(failure.code).toBe("SBX_OWNERSHIP_UNVERIFIED")
+    expect(failure.message).toContain("sbx create exit code 17")
+    expect(failure.message).toContain("create stderr")
+    expect(failure.message).toContain("[REDACTED]")
+    expect(failure.message).not.toContain("stderr-secret")
+    expect(failure.message.length).toBeLessThanOrEqual("SBX resource ownership could not be verified; sbx create exit code 17: ".length + 2_048)
+    const create = failure.details?.create
+    if (!create || typeof create !== "object") throw new Error("create failure evidence is unavailable")
+    const createEvidence = create as { exitCode: unknown; stdout: unknown; stderr: unknown }
+    expect(createEvidence.exitCode).toBe(17)
+    expect(String(createEvidence.stdout)).toContain("create stdout")
+    expect(String(createEvidence.stderr)).toContain("create stderr")
+    expect(JSON.stringify(create)).not.toContain("stdout-secret")
+    expect(JSON.stringify(create)).not.toContain("stderr-secret")
+    expect(String(createEvidence.stdout)).toContain("token=[REDACTED]")
+    expect(String(createEvidence.stderr)).toContain("[REDACTED]")
+    expect(String(createEvidence.stdout).length).toBeLessThan(createStdout.length)
+    expect(String(createEvidence.stderr).length).toBeLessThan(createStderr.length)
     expect(commands).toHaveLength(1)
   })
 
@@ -4687,10 +5680,11 @@ describe("Docker Sandbox provider", () => {
         generation: fixture.owner.generation,
         workspaceId: fixture.owner.workspaceId,
         projectId: fixture.owner.projectId,
-        sandbox: fixture.sandbox,
-        hostPort: fixture.hostPort,
-        branch: fixture.owner.branch,
-        baseSha: fixture.owner.baseSha,
+         sandbox: fixture.sandbox,
+         hostPort: fixture.hostPort,
+         remoteWorktreePath: fixture.remoteDirectory,
+         branch: fixture.owner.branch,
+         baseSha: fixture.owner.baseSha,
       },
       generation: fixture.owner.generation,
       directory: fixture.owner.directory,
@@ -4711,7 +5705,7 @@ describe("Docker Sandbox provider", () => {
         async waitForSync() { calls.push("sync:connected") },
         async replaySession() { calls.push("replay") },
         async remove() { calls.push("workspace:remove") },
-        async inspect() { return matchingWorkspace(record) },
+        async inspect() { return matchingWorkspace(record, { directory: fixture.remoteDirectory }) },
       },
     })
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
@@ -4764,10 +5758,11 @@ describe("Docker Sandbox provider", () => {
         generation: fixture.owner.generation,
         workspaceId: fixture.owner.workspaceId,
         projectId: fixture.owner.projectId,
-        sandbox: fixture.sandbox,
-        hostPort: fixture.hostPort,
-        branch: fixture.owner.branch,
-        baseSha: fixture.owner.baseSha,
+         sandbox: fixture.sandbox,
+         hostPort: fixture.hostPort,
+         remoteWorktreePath: fixture.remoteDirectory,
+         branch: fixture.owner.branch,
+         baseSha: fixture.owner.baseSha,
       },
       vmName: undefined,
       vmIdentity: undefined,
@@ -4780,7 +5775,7 @@ describe("Docker Sandbox provider", () => {
     const store = new FileStateStore(await temporaryDirectory())
     await store.write(record)
     const events: string[] = []
-    const controller = createOrphanDeletionController(store, record, fixture.driver, events)
+    const controller = createOrphanDeletionController(store, record, fixture.driver, events, fixture.remoteDirectory)
     const capability = createCapability({ sessionId: record.sessionId, generation: record.generation, role: "host" })
 
     await expect(controller.handle({ operation: "delete", force: false, capability })).resolves.toMatchObject({
@@ -6132,6 +7127,7 @@ describe("Cloudflare Sandbox provider", () => {
     let sandbox
     try {
       sandbox = await worktree.createSandbox({ sandbox: adapter.provider })
+      expect(adapter.recoveryMetadata?.()).toMatchObject({ remoteWorktreePath: "/workspace/.opencode-worktree" })
       expect(calls).not.toContain("tunnel:sandboxa2:4096:oc-wrk-cf-sandcastle")
       await adapter.applyCapture({ sandbox, capture: { baseSha, patch: "", untracked: [] } })
       expect(calls.some((call) => call.startsWith("tunnel:sandboxa2:4096:oc-"))).toBe(true)
@@ -6480,6 +7476,7 @@ function createOrphanDeletionController(
   record: SandboxRecord,
   driver: RuntimeDriver,
   events: string[],
+  workspaceDirectory = record.directory,
 ): LifecycleController {
   return new LifecycleController({
     store,
@@ -6497,7 +7494,7 @@ function createOrphanDeletionController(
         events.push("workspace:remove")
       },
       async inspect() {
-        return matchingWorkspace(record)
+        return matchingWorkspace(record, { directory: workspaceDirectory })
       },
     },
   })
@@ -6534,6 +7531,7 @@ interface RecoveryFixture {
   store: FileStateStore
   record: SandboxRecord
   calls: string[]
+  workspaceRemovals: Array<{ workspaceId: string; directory: string }>
 }
 
 async function setupRecoveryFixture(options: {
@@ -6545,6 +7543,7 @@ async function setupRecoveryFixture(options: {
   workspaceRemoveFailures?: number
   destroyFailures?: number
   provider?: string
+  providerState?: Record<string, unknown>
   workspaceDirectory?: string
   workspaceExtra?: unknown
   onAdopt?: () => Promise<void>
@@ -6559,11 +7558,12 @@ async function setupRecoveryFixture(options: {
   const record: SandboxRecord = {
     ...makeRecord(),
     provider: options.provider ?? "fake",
-    providerState: { resourceId: "resource-1" },
+    providerState: { resourceId: "resource-1", ...options.providerState },
     state: options.state ?? "orphaned",
   }
   await store.write(record)
   const calls: string[] = []
+  const workspaceRemovals: Array<{ workspaceId: string; directory: string }> = []
   const observation: ProviderResourceObservation = {
     resourceId: "resource-1",
     resource: options.observation?.resource ?? "present",
@@ -6647,8 +7647,9 @@ async function setupRecoveryFixture(options: {
       async replaySession() {
         calls.push("replay")
       },
-      async remove() {
+      async remove(input) {
         calls.push("workspace:remove")
+        workspaceRemovals.push(input)
         if ((options.workspaceRemoveFailures ?? 0) > 0) {
           options.workspaceRemoveFailures!--
           throw new Error("fake workspace removal failed")
@@ -6671,6 +7672,7 @@ async function setupRecoveryFixture(options: {
     store,
     record,
     calls,
+    workspaceRemovals,
   }
 }
 
@@ -6816,6 +7818,7 @@ async function createExedevRuntimeFixture(options: {
     branch: owner.branch,
     baseSha: owner.baseSha,
     remoteDirectory: "/tmp/oe-0123456789ab",
+    remoteWorktreePath: remoteWorkspaceDirectory(owner.workspaceId),
     vmName: identity.name,
     vmIdentity: identity,
   }
@@ -6940,7 +7943,7 @@ async function createSbxRuntimeFixture(options: { marker?: unknown; status?: str
     : options.marker ?? { ...owner }
   const sandbox = "oc-sbx-restart"
   const hostPort = 4101
-  const remoteDirectory = "/workspace/project/.opencode-worktree"
+  const remoteDirectory = "/workspace/project"
   const remoteState = {
     head: options.head ?? owner.baseSha,
     lineage: options.lineage ?? true,

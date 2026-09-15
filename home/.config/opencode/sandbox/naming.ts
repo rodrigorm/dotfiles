@@ -105,6 +105,10 @@ export function assertRelativePath(value: string): void {
   }
 }
 
+export function isSafeSandboxPath(value: unknown): value is string {
+  return typeof value === "string" && /^\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes("..")
+}
+
 function assertId(value: string, field: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
     throw new SandboxError("validate", `${field} is unsafe`, "IDENTIFIER_INVALID")

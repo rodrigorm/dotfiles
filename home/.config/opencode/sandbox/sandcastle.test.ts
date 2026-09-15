@@ -32,6 +32,7 @@ describe("Sandcastle sync barrier", () => {
     const repository = await createRepository()
     const baseSha = await runGit(repository, ["rev-parse", "HEAD"])
     const calls: string[] = []
+    const remoteWorktreePath = "/remote/sandbox/worktree"
     const fake = createFakeProvider({
       onCommand(command) {
         if (command.trim() === "true") calls.push("barrier")
@@ -43,6 +44,7 @@ describe("Sandcastle sync barrier", () => {
           provider: fake.provider,
           async applyCapture() {},
           target: () => ({ type: "remote", url: "https://fake.example.test" }),
+          recoveryMetadata: () => ({ remoteWorktreePath }),
           async syncBackWorkingTree() {
             calls.push("sync-back")
           },
@@ -56,6 +58,10 @@ describe("Sandcastle sync barrier", () => {
     })
 
     try {
+      expect(session.sandbox.worktreePath).toBe(session.worktreePath)
+      expect(session.sandbox.worktreePath).not.toBe(remoteWorktreePath)
+      expect(session.remoteWorktreePath).toBe(remoteWorktreePath)
+      expect(session.recoveryMetadata).toEqual({ remoteWorktreePath })
       await session.applyCapture({ baseSha, patch: "", untracked: [] })
       await session.sync()
     } finally {

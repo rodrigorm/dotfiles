@@ -1,6 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process"
 import { chmod, mkdtemp, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { createServer } from "node:net"
+import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 
@@ -17,10 +18,44 @@ const REPORT_FILE = "cloudflare-e2e-report.json"
 const MAX_HTTP_BODY_BYTES = 512 * 1024
 const MAX_PROCESS_OUTPUT_BYTES = 128 * 1024
 
-export const FIXED_EDIT_COMMAND = `uname -s | grep -Fx Linux && pwd -P | grep -Fx /workspace/.opencode-worktree && test -f host-e2e-untracked.txt && printf '%s\\n' '${REMOTE_EDIT_MARKER}' >> host-e2e-untracked.txt && grep -F -- '${REMOTE_EDIT_MARKER}' host-e2e-untracked.txt && printf '%s\\n' '${REMOTE_README_MARKER}' >> README.md && grep -F -- '${REMOTE_README_MARKER}' README.md && test ! -e remote-e2e-created.txt && printf '%s\\n' '${REMOTE_CREATED_CONTENT}' > remote-e2e-created.txt && grep -Fx -- '${REMOTE_CREATED_CONTENT}' remote-e2e-created.txt && printf 'remote-uname=' && uname -s && printf 'remote-cwd=' && pwd -P`
+export type Json = Record<string, unknown>
+export type Environment = Record<string, string | undefined>
+export type E2EProvider = "cloudflare" | "sbx" | "exedev"
+export const DEFAULT_E2E_PROVIDER: E2EProvider = "cloudflare"
 
-type Json = Record<string, unknown>
-type Environment = Record<string, string | undefined>
+export function selectE2EProvider(env: Environment = process.env): E2EProvider {
+  const provider = env.SANDBOX_E2E_PROVIDER ?? DEFAULT_E2E_PROVIDER
+  if (provider !== "cloudflare" && provider !== "sbx" && provider !== "exedev") {
+    throw new Error("SANDBOX_E2E_PROVIDER must be cloudflare, sbx, or exedev")
+  }
+  return provider
+}
+
+export function buildE2EConfig(
+  provider: E2EProvider,
+  sourceConfig: Json,
+  environmentConfig: Json,
+  env: Environment,
+): Json {
+  const input = { ...sourceConfig, ...environmentConfig }
+  if (provider === "sbx" || provider === "exedev") {
+    const { apiUrl: _apiUrl, apiKey: _apiKey, ...withoutCloudflareCredentials } = input
+    return { ...withoutCloudflareCredentials, provider }
+  }
+
+  const apiUrl = env.SANDBOX_API_URL ?? environmentConfig.apiUrl ?? sourceConfig.apiUrl
+  const apiKey = env.SANDBOX_API_KEY ?? environmentConfig.apiKey ?? sourceConfig.apiKey
+  if (typeof apiUrl !== "string" || apiUrl.length === 0) throw new Error("Cloudflare bridge URL is unavailable")
+  if (typeof apiKey !== "string" || apiKey.length === 0) throw new Error("Cloudflare bridge key is unavailable")
+  return { ...input, provider, apiUrl, apiKey }
+}
+
+export function buildFixedEditCommand(remoteWorktreePath: string): string {
+  assertRemoteWorktreePath(remoteWorktreePath)
+  const quotedPath = shellQuote(remoteWorktreePath)
+  return `uname -s | grep -Fx Linux && pwd -P | grep -Fx -- ${quotedPath} && test -f host-e2e-untracked.txt && printf '%s\\n' '${REMOTE_EDIT_MARKER}' >> host-e2e-untracked.txt && grep -F -- '${REMOTE_EDIT_MARKER}' host-e2e-untracked.txt && printf '%s\\n' '${REMOTE_README_MARKER}' >> README.md && grep -F -- '${REMOTE_README_MARKER}' README.md && test ! -e remote-e2e-created.txt && printf '%s\\n' '${REMOTE_CREATED_CONTENT}' > remote-e2e-created.txt && grep -Fx -- '${REMOTE_CREATED_CONTENT}' remote-e2e-created.txt && printf 'remote-uname=' && uname -s && printf 'remote-cwd=' && pwd -P`
+}
+
 type PhaseStatus = "PASS" | "FAIL"
 
 type Phase = {
@@ -60,6 +95,16 @@ function isRecord(value: unknown): value is Json {
 function requiredString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${label} is unavailable`)
   return value
+}
+
+function assertRemoteWorktreePath(value: string): void {
+  if (!/^\/[A-Za-z0-9._/-]+$/.test(value) || value === "/" || value.includes("..")) {
+    throw new Error("remote worktree path is invalid")
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`
 }
 
 function concreteId(value: unknown, label: string): string {
@@ -228,6 +273,25 @@ function recordSummary(value: unknown, secrets: readonly string[]): Json | null 
   }
 }
 
+function metadataRemoteWorktreePath(value: unknown, provider: E2EProvider): string | undefined {
+  if (!isRecord(value)) return undefined
+  if (value.provider !== undefined && value.provider !== provider) return undefined
+  const state = isRecord(value.providerState) ? value.providerState : value
+  if (state.provider !== undefined && state.provider !== provider) return undefined
+  const path = state.remoteWorktreePath
+  if (path === undefined) return undefined
+  if (typeof path !== "string") throw new Error("remote worktree metadata is invalid")
+  assertRemoteWorktreePath(path)
+  return path
+}
+
+function remoteWorktreePathFromMetadata(record: unknown, workspace: unknown, provider: E2EProvider): string | undefined {
+  const recordPath = metadataRemoteWorktreePath(record, provider)
+  if (recordPath) return recordPath
+  const workspaceExtra = isRecord(workspace) ? workspace.extra : undefined
+  return metadataRemoteWorktreePath(workspaceExtra, provider)
+}
+
 async function waitForLocation(input: {
   hostUrl: string
   worktree: string
@@ -235,6 +299,7 @@ async function waitForLocation(input: {
   sessionId: string
   workspaceId: string
   projectId: string
+  provider: E2EProvider
   remote: boolean
   signal: AbortSignal
   secrets: readonly string[]
@@ -259,6 +324,7 @@ async function waitForLocation(input: {
       const sync = syncEntries.find((item) => isRecord(item) && item.workspaceID === input.workspaceId)
       const operation = isRecord(record?.operation) ? record.operation : undefined
       const lastError = isRecord(record?.lastError) ? record.lastError : undefined
+      const remoteWorktreePath = input.remote ? remoteWorktreePathFromMetadata(record, workspace, input.provider) : undefined
       const lifecycle = input.remote
         ? record?.desiredLocation === "remote" && record.phase === "idle" && operation?.kind === "start" && operation.phase === "remote" && !lastError
         : record?.desiredLocation === "local" && record.phase === "idle" && operation?.kind === "stop" && operation.phase === "detached" && operation.providerDestroyed === true && !lastError
@@ -267,11 +333,13 @@ async function waitForLocation(input: {
         session: { workspaceId: sessionWorkspaceId },
         workspace: workspace ? safeJson(workspace, input.secrets) : null,
         sync: sync ? safeJson(sync, input.secrets) : null,
+        remoteWorktreePath: remoteWorktreePath ?? null,
       }
       if (lastError) throw new Error(`lifecycle failed: ${bounded(lastError.message, 2_048, input.secrets)}`)
       if (input.remote) {
         if (lifecycle && sessionWorkspaceId === input.workspaceId && isRecord(workspace) && workspace.projectID === input.projectId && isRecord(sync) && sync.status === "connected") {
-          return { ...last, protocol: { warp: true, replay: true } }
+          if (!remoteWorktreePath) throw new Error("remote worktree metadata is unavailable")
+          return { ...last, remoteWorktreePath, protocol: { warp: true, replay: true } }
         }
       } else if (lifecycle && sessionWorkspaceId === null && !workspace && !sync) {
         return { ...last, protocol: { warpBack: true, syncBack: true } }
@@ -340,19 +408,6 @@ async function stopHost(pid: number, port: number, signal: AbortSignal, secrets:
   }
   if (signal.aborted) throw new Error("host cleanup deadline exceeded")
   throw new Error(`host PID ${pid} did not exit after SIGKILL`)
-}
-
-async function removeWorktree(worktree: string, signal: AbortSignal, secrets: readonly string[]): Promise<Json> {
-  if (!(await exists(worktree))) return { attempted: true, alreadyAbsent: true, path: worktree }
-  const result = await nodeProcessRunner.run({
-    argv: ["git", "worktree", "remove", "--force", worktree],
-    cwd: REPOSITORY_ROOT,
-    signal,
-    maxOutputBytes: 32 * 1024,
-  })
-  if (result.exitCode !== 0) throw new Error(`git worktree cleanup failed: ${bounded(result.stderr || result.stdout, 2_048, secrets)}`)
-  if (await exists(worktree)) throw new Error("git worktree cleanup returned success but the worktree still exists")
-  return { attempted: true, removed: true, path: worktree }
 }
 
 async function runPhase<T>(
@@ -439,11 +494,100 @@ async function writePrivate(path: string, content: string | Uint8Array): Promise
   await chmod(path, 0o600)
 }
 
+export async function createE2ERuntimeDirectory(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "oe-e2e-"))
+  await chmod(directory, 0o700)
+  return directory
+}
+
+export async function cleanupE2ERuntimeDirectory(
+  path: string,
+  hostStopped: boolean,
+  signal?: AbortSignal,
+  secrets: readonly string[] = [],
+): Promise<Json> {
+  if (!hostStopped) return { attempted: false, preserved: true, path, reason: "host is still running" }
+  if (signal?.aborted) throw new Error("runtime directory cleanup deadline exceeded")
+  if (!(await exists(path))) return { attempted: true, alreadyAbsent: true, path }
+  await rm(path, { recursive: true, force: true })
+  if (signal?.aborted) throw new Error("runtime directory cleanup deadline exceeded")
+  if (await exists(path)) throw new Error(`runtime directory cleanup left the path in place: ${bounded(path, 2_048, secrets)}`)
+  return { attempted: true, removed: true, path }
+}
+
+export async function prepareE2EClone(
+  source: string,
+  destination: string,
+  signal?: AbortSignal,
+  secrets: readonly string[] = [],
+): Promise<{ source: string; destination: string; revision: string }> {
+  const captured = await nodeProcessRunner.run({
+    argv: ["git", "rev-parse", "HEAD"],
+    cwd: source,
+    signal,
+    maxOutputBytes: 4_096,
+  })
+  if (captured.exitCode !== 0) throw new Error(`git revision capture failed: ${bounded(captured.stderr || captured.stdout, 2_048, secrets)}`)
+  const revision = captured.stdout.trim()
+  if (!/^[a-f0-9]{40}$/i.test(revision)) throw new Error(`git returned an invalid captured revision: ${bounded(revision, 128, secrets)}`)
+
+  const cloned = await nodeProcessRunner.run({
+    argv: ["git", "clone", "--no-local", "--no-hardlinks", "--no-checkout", source, destination],
+    cwd: source,
+    signal,
+    maxOutputBytes: 32 * 1024,
+  })
+  if (cloned.exitCode !== 0) throw new Error(`git clone failed: ${bounded(cloned.stderr || cloned.stdout, 2_048, secrets)}`)
+
+  const checkedOut = await nodeProcessRunner.run({
+    argv: ["git", "checkout", "--detach", revision],
+    cwd: destination,
+    signal,
+    maxOutputBytes: 32 * 1024,
+  })
+  if (checkedOut.exitCode !== 0) throw new Error(`git checkout of captured revision failed: ${bounded(checkedOut.stderr || checkedOut.stdout, 2_048, secrets)}`)
+
+  const verified = await nodeProcessRunner.run({
+    argv: ["git", "rev-parse", "HEAD"],
+    cwd: destination,
+    signal,
+    maxOutputBytes: 4_096,
+  })
+  if (verified.exitCode !== 0 || verified.stdout.trim() !== revision) {
+    throw new Error(`fixture clone is not checked out at the captured revision: ${bounded(verified.stdout || verified.stderr, 128, secrets)}`)
+  }
+
+  const gitDirectory = join(destination, ".git")
+  const gitDirectoryStats = await stat(gitDirectory)
+  if (!gitDirectoryStats.isDirectory()) throw new Error("fixture clone did not create an independent Git directory")
+  if (await exists(join(gitDirectory, "objects", "info", "alternates"))) {
+    throw new Error("fixture clone uses an external Git object store")
+  }
+
+  return { source, destination, revision }
+}
+
+export async function cleanupE2EClone(
+  path: string,
+  createdByTest: boolean,
+  signal?: AbortSignal,
+  secrets: readonly string[] = [],
+): Promise<Json> {
+  if (!createdByTest) return { attempted: false, preserved: true, path, reason: "clone was not created by this test" }
+  if (signal?.aborted) throw new Error("clone cleanup deadline exceeded")
+  if (!(await exists(path))) return { attempted: true, alreadyAbsent: true, path }
+  await rm(path, { recursive: true, force: true })
+  if (signal?.aborted) throw new Error("clone cleanup deadline exceeded")
+  if (await exists(path)) throw new Error(`clone cleanup left the path in place: ${bounded(path, 2_048, secrets)}`)
+  return { attempted: true, removed: true, path }
+}
+
 export async function runLocalHostFixture(): Promise<void> {
+  const provider = selectE2EProvider(process.env)
   const runDirectory = process.env.SANDBOX_E2E_RUN_DIRECTORY ?? process.cwd()
   const worktree = join(runDirectory, "repo")
   const stateDirectory = join(runDirectory, "state")
-  const runtimeDirectory = join(runDirectory, "runtime")
+  const runtimeDirectory = process.env.SANDBOX_E2E_RUNTIME_DIRECTORY ?? await createE2ERuntimeDirectory()
   const dataDirectory = join(runDirectory, "data")
   const sourceConfigPath = join(REPOSITORY_ROOT, ".opencode", "sandbox.json")
   const xdgConfigHome = join(REPOSITORY_ROOT, "home", ".config")
@@ -451,6 +595,7 @@ export async function runLocalHostFixture(): Promise<void> {
   const hostInfoPath = join(runDirectory, "host.json")
   const originalReadmePath = join(runDirectory, "README.md.original")
   const manifestPath = join(runDirectory, "manifest.json")
+  const knownHostsFile = join(runDirectory, "known_hosts")
   const runId = runDirectory.split("/").at(-1) ?? "unknown"
   const marker = `<!-- opencode-cloudflare-e2e:${runId} -->`
   const initialUntrackedContent = `host-e2e-untracked:${runId}\n`
@@ -462,40 +607,44 @@ export async function runLocalHostFixture(): Promise<void> {
 
   await mkdir(stateDirectory, { recursive: true, mode: 0o700 })
   await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 })
+  await chmod(runtimeDirectory, 0o700)
   await mkdir(dataDirectory, { recursive: true, mode: 0o700 })
 
   const sourceConfigValue: unknown = JSON.parse(await readFile(sourceConfigPath, "utf8"))
   fixtureAssert(isRecord(sourceConfigValue), "source sandbox config is invalid")
   const environmentConfigValue: unknown = process.env.SANDBOX_CONFIG ? JSON.parse(process.env.SANDBOX_CONFIG) : {}
   const environmentConfig = isRecord(environmentConfigValue) ? environmentConfigValue : {}
-  const apiUrlValue = process.env.SANDBOX_API_URL ?? environmentConfig.apiUrl ?? sourceConfigValue.apiUrl
-  const apiKeyValue = process.env.SANDBOX_API_KEY ?? environmentConfig.apiKey ?? sourceConfigValue.apiKey
-  fixtureAssert(typeof apiUrlValue === "string" && apiUrlValue.length > 0, "Cloudflare bridge URL is unavailable")
-  fixtureAssert(typeof apiKeyValue === "string" && apiKeyValue.length > 0, "Cloudflare bridge key is unavailable")
-
-  const credentialsPath = join(runDirectory, "credentials.json")
-  await writePrivate(credentialsPath, `${JSON.stringify({ apiUrl: apiUrlValue, apiKey: apiKeyValue })}\n`)
-
-  const effectiveConfig = {
-    ...sourceConfigValue,
-    ...environmentConfig,
-    provider: "cloudflare",
-    apiUrl: apiUrlValue,
-    apiKey: apiKeyValue,
+  const effectiveConfig: Json & { provider: E2EProvider; stateDirectory: string; openCodeVersion: string } = {
+    ...buildE2EConfig(provider, sourceConfigValue, environmentConfig, process.env),
+    provider,
     stateDirectory,
     openCodeVersion: "1.18.25",
+  }
+  const apiKeyValue = provider === "cloudflare"
+    ? requiredString(effectiveConfig["apiKey"], "Cloudflare bridge key")
+    : undefined
+  const credentialsPath = provider === "cloudflare" ? join(runDirectory, "credentials.json") : undefined
+  if (provider === "cloudflare") {
+    await writePrivate(credentialsPath!, `${JSON.stringify({ apiUrl: effectiveConfig["apiUrl"], apiKey: apiKeyValue })}\n`)
   }
   const childEnvironment: Environment = {
     ...process.env,
     PATH: `${join(REPOSITORY_ROOT, "home", "bin")}:${process.env.PATH ?? ""}`,
     TMPDIR: runtimeDirectory,
+    XDG_RUNTIME_DIR: runtimeDirectory,
     XDG_CONFIG_HOME: xdgConfigHome,
     XDG_DATA_HOME: dataDirectory,
     OPENCODE_AUTH_CONTENT: "{}",
     OPENCODE_EXPERIMENTAL_WORKSPACES: "1",
-    SANDBOX_PROVIDER: "cloudflare",
+    SANDBOX_PROVIDER: provider,
     SANDBOX_CONFIG: JSON.stringify(effectiveConfig),
   }
+  if (provider !== "cloudflare") {
+    delete childEnvironment.SANDBOX_API_URL
+    delete childEnvironment.SANDBOX_API_KEY
+  }
+  if (provider === "exedev") childEnvironment.SANDBOX_KNOWN_HOSTS_FILE = knownHostsFile
+  else delete childEnvironment.SANDBOX_KNOWN_HOSTS_FILE
   delete childEnvironment.OPENCODE_CONFIG_DIR
   fixtureAssert(childEnvironment.OPENCODE_AUTH_CONTENT === "{}", "OpenCode auth content was not fixed to {} before host startup")
 
@@ -551,7 +700,7 @@ export async function runLocalHostFixture(): Promise<void> {
   const experimentalValue = await fixtureRequest(url, `/experimental/workspace?directory=${directory}`)
   fixtureAssert(Array.isArray(experimentalValue), "experimental workspace endpoint is unavailable")
 
-  const sessionTitle = `local Cloudflare E2E fixture ${runId}`
+  const sessionTitle = `local ${provider} E2E fixture ${runId}`
   const sessionsValue = await fixtureRequest(url, `/session?directory=${directory}`)
   const sessions = Array.isArray(sessionsValue) ? sessionsValue : []
   const existingSession = sessions.find((value): value is Json => isRecord(value) && value.title === sessionTitle)
@@ -594,6 +743,7 @@ export async function runLocalHostFixture(): Promise<void> {
   const manifest = {
     schemaVersion: 1,
     phase: "local-host-ready",
+    provider,
     runDirectory,
     repositoryRoot: REPOSITORY_ROOT,
     worktree,
@@ -609,13 +759,13 @@ export async function runLocalHostFixture(): Promise<void> {
     xdgConfigHome,
     pluginEntry: join(xdgConfigHome, "opencode", "plugin", "sandbox.ts"),
     config: {
-      provider: effectiveConfig.provider,
+      provider: effectiveConfig["provider"],
       remoteOpenCodeVersion: effectiveConfig.openCodeVersion,
       configEndpoint: true,
       experimentalWorkspaceEndpoint: { status: 200, count: experimentalValue.length },
     },
-    credentialsFile: credentialsPath,
-    credentialsPrivate: true,
+    ...(credentialsPath ? { credentialsFile: credentialsPath, credentialsPrivate: true } : {}),
+    ...(provider === "exedev" ? { knownHostsFile, knownHostsPrivate: true } : {}),
     pluginProof: {
       controlCommand: "sandboxctl status",
       controlProbeViaSessionShell: true,
@@ -654,7 +804,7 @@ export async function runLocalHostFixture(): Promise<void> {
       llmCall: false,
     },
   }
-  fixtureAssert(!JSON.stringify(manifest).includes(apiKeyValue), "credential leaked into manifest")
+  if (apiKeyValue) fixtureAssert(!JSON.stringify(manifest).includes(apiKeyValue), "credential leaked into manifest")
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 })
   await chmod(manifestPath, 0o600)
   process.stdout.write(`${JSON.stringify({ runDirectory, pid: hostPid, url, sessionID: sessionId, version: health.version })}\n`)
@@ -671,7 +821,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
   const stderr = options.stderr ?? ((text: string) => process.stderr.write(text))
   if (argv.length > 0) {
     if (argv.length === 1 && argv[0] === "--help") {
-      stdout(`Usage: bun home/.config/opencode/sandbox/cloudflare-e2e.ts\n\nRuns the real Cloudflare sandbox lifecycle without an LLM.\nSet SANDBOX_E2E_OUTPUT for a JSON copy.\n`)
+      stdout(`Usage: bun home/.config/opencode/sandbox/cloudflare-e2e.ts\n\nRuns the real Cloudflare, SBX, or exe.dev sandbox lifecycle without an LLM.\nSet SANDBOX_E2E_PROVIDER=sbx or exedev to select a provider; Cloudflare is the default.\nSet SANDBOX_E2E_OUTPUT for a JSON copy.\n`)
       return 0
     }
     stderr(`unknown argument: ${argv[0]}\n`)
@@ -679,6 +829,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
   }
 
   const env = options.env ?? process.env
+  let provider: E2EProvider = DEFAULT_E2E_PROVIDER
   const startedAt = new Date().toISOString()
   const runId = `cloudflare-e2e-${Date.now().toString(36)}`
   const report: Report = {
@@ -698,17 +849,21 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
   }
   const secrets = [env.SANDBOX_API_KEY ?? "", env.CLOUDFLARE_API_TOKEN ?? "", env.OPENCODE_AUTH_CONTENT ?? "{}"]
   let runDirectory: string | undefined
+  let runtimeDirectory: string | undefined
   let worktree: string | undefined
   let fixtureCopy: string | undefined
+  let cloneCreated = false
   let hostUrl: string | undefined
   let hostPid: number | undefined
   let hostPort: number | undefined
   let hostAttempted = false
+  let hostStopped = false
   let stateDirectory: string | undefined
   let sessionId: string | undefined
   let fixtureSessionId: string | undefined
   let workspaceId: string | undefined
   let projectId: string | undefined
+  let remoteWorktreePath: string | undefined
   let remoteReady = false
   let startAttempted = false
   let stopAttempted = false
@@ -743,12 +898,14 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
     const response = sandboxResponse(value)
     const shell = safeShell(value, command, secrets)
     if (!response || response.ok !== true || response.operation !== "stop") throw new Error(`sandboxctl stop did not return a successful v2 response: ${bounded(JSON.stringify(shell), 4_096, secrets)}`)
-    const local = await waitForLocation({ hostUrl, worktree, stateDirectory, sessionId, workspaceId, projectId, remote: false, signal, secrets })
+    const local = await waitForLocation({ hostUrl, worktree, stateDirectory, sessionId, workspaceId, projectId, provider, remote: false, signal, secrets })
     stopCompleted = true
     return { shell, local }
   }
 
   try {
+    provider = selectE2EProvider(env)
+    report.resources = { ...report.resources, provider }
     const budgets = {
       prepare: timeout(env, "SANDBOX_E2E_PREPARE_TIMEOUT_MS", 30_000),
       host: timeout(env, "SANDBOX_E2E_HOST_TIMEOUT_MS", 120_000),
@@ -762,9 +919,10 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
     report.budgets = { ...budgets }
 
     runDirectory = await mkdtemp(join(REPOSITORY_ROOT, ".cloudflare-e2e-"))
+    runtimeDirectory = await createE2ERuntimeDirectory()
     worktree = join(runDirectory, "repo")
     fixtureCopy = join(runDirectory, "local-host-fixture.mjs")
-    report.resources = { ...report.resources, runDirectory, worktree, fixtureCopy }
+    report.resources = { ...report.resources, runDirectory, runtimeDirectory, worktree, fixtureCopy }
     await persist()
 
     await phase("prepare-worktree", budgets.prepare, async (signal) => {
@@ -778,19 +936,20 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
       ].join("\n")
       await writeFile(fixtureCopy!, fixtureShim, { mode: 0o700 })
       await chmod(fixtureCopy!, 0o700)
-      const result = await nodeProcessRunner.run({
-        argv: ["git", "worktree", "add", "--detach", worktree!, "HEAD"],
-        cwd: REPOSITORY_ROOT,
-        signal,
-        maxOutputBytes: 32 * 1024,
-      })
-      if (result.exitCode !== 0) throw new Error(`git worktree creation failed: ${bounded(result.stderr || result.stdout, 2_048, secrets)}`)
-      return { sourceFixture: FIXTURE_SOURCE, copiedFixture: fixtureCopy, worktree, detached: true }
+      const clone = await prepareE2EClone(REPOSITORY_ROOT, worktree!, signal, secrets)
+      cloneCreated = true
+      report.resources = { ...report.resources, capturedRevision: clone.revision }
+      return { sourceFixture: FIXTURE_SOURCE, copiedFixture: fixtureCopy, worktree, clone }
     })
 
     await phase("host-session", budgets.host, async (signal) => {
       hostAttempted = true
-      const fixtureEnvironment: Environment = { ...env, OPENCODE_AUTH_CONTENT: "{}", SANDBOX_E2E_RUN_DIRECTORY: runDirectory }
+      const fixtureEnvironment: Environment = {
+        ...env,
+        OPENCODE_AUTH_CONTENT: "{}",
+        SANDBOX_E2E_RUN_DIRECTORY: runDirectory,
+        SANDBOX_E2E_RUNTIME_DIRECTORY: runtimeDirectory,
+      }
       const result = await nodeProcessRunner.run({
         argv: [process.execPath, fixtureCopy!],
         cwd: runDirectory!,
@@ -825,11 +984,13 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
       if (parsedHostUrl.protocol !== "http:" || parsedHostUrl.hostname !== "127.0.0.1" || !parsedHostUrl.port) throw new Error("fixture did not start an owned loopback host")
       hostPort = Number(parsedHostUrl.port)
       stateDirectory = requiredString(manifest.stateDirectory, "fixture state directory")
+      const fixtureRuntimeDirectory = requiredString(manifest.runtimeDirectory, "fixture runtime directory")
+      if (fixtureRuntimeDirectory !== runtimeDirectory) throw new Error("fixture did not use the registered runtime directory")
       worktree = requiredString(manifest.worktree, "fixture worktree")
       fixtureSessionId = concreteId(manifest.sessionID, "fixture session ID")
       const expectedPlugin = join(REPOSITORY_ROOT, "home", ".config", "opencode", "plugin", "sandbox.ts")
       if (manifest.pluginEntry !== expectedPlugin) throw new Error("fixture did not load the current sandbox plugin")
-      if (!isRecord(manifest.config) || manifest.config.provider !== "cloudflare") throw new Error("fixture host is not configured for Cloudflare")
+      if (!isRecord(manifest.config) || manifest.config.provider !== provider) throw new Error(`fixture host is not configured for ${provider}`)
       if (!isRecord(manifest.checks) || manifest.checks.authContent !== "{}" || manifest.checks.llmCall !== false || manifest.checks.cloudflareAllocation !== false) throw new Error("fixture host performed an unrequested operation")
       const health = await request(hostUrl, "/global/health", {}, signal, secrets)
       if (!isRecord(health) || health.healthy !== true) throw new Error("fixture host health is not healthy")
@@ -853,7 +1014,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
       const created = await request(hostUrl, `/session?directory=${directory}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: `cloudflare e2e ${runId}` }),
+      body: JSON.stringify({ title: `${provider} e2e ${runId}` }),
       }, signal, secrets)
       if (!isRecord(created)) throw new Error("HTTP session creation returned no session")
       sessionId = concreteId(created.id, "created session ID")
@@ -875,7 +1036,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
       const shell = safeShell(value, command, secrets)
       if (!response || response.ok !== true || response.operation !== "start") throw new Error(`sandboxctl start did not return a successful v2 response: ${bounded(JSON.stringify(shell), 4_096, secrets)}`)
       const session = isRecord(response.session) ? response.session : {}
-      if (session.provider !== "cloudflare") throw new Error(`sandboxctl start selected an unexpected provider: ${String(session.provider)}`)
+      if (session.provider !== provider) throw new Error(`sandboxctl start selected an unexpected provider: ${String(session.provider)}`)
       if (concreteId(session.sessionId, "start response session ID") !== sessionId) throw new Error("start response session ID does not match the created session")
       workspaceId = concreteId(session.workspaceId, "start response workspace ID")
       projectId = concreteId(session.projectId, "start response project ID")
@@ -885,15 +1046,16 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
 
     await phase("warp-replay", budgets.warpReplay, async (signal) => {
       if (!hostUrl || !worktree || !stateDirectory || !sessionId || !workspaceId || !projectId) throw new Error("Warp/replay prerequisites are unavailable")
-      const result = await waitForLocation({ hostUrl, worktree, stateDirectory, sessionId, workspaceId, projectId, remote: true, signal, secrets })
+      const result = await waitForLocation({ hostUrl, worktree, stateDirectory, sessionId, workspaceId, projectId, provider, remote: true, signal, secrets })
+      remoteWorktreePath = requiredString(result.remoteWorktreePath, "remote worktree path")
       remoteReady = true
-      report.resources = { ...report.resources, remote: result }
+      report.resources = { ...report.resources, remoteWorktreePath, remote: result }
       return result
     })
 
     await phase("fixed-edit", budgets.edit, async (signal) => {
       if (!hostUrl || !worktree || !sessionId) throw new Error("fixed edit prerequisites are unavailable")
-      const command = FIXED_EDIT_COMMAND
+      const command = buildFixedEditCommand(requiredString(remoteWorktreePath, "remote worktree path"))
       const value = await sessionShell(hostUrl, worktree, sessionId, command, signal, secrets)
       const shell = safeShell(value, command, secrets)
       const shellText = typeof shell.text === "string" ? shell.text : ""
@@ -902,7 +1064,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
       const remoteCwd = /^remote-cwd=([^\r\n]+)$/m.exec(shellText)?.[1]
       if (
         remoteUname !== "Linux" ||
-        remoteCwd !== "/workspace/.opencode-worktree" ||
+        remoteCwd !== remoteWorktreePath ||
         !shellLines.includes(REMOTE_EDIT_MARKER) ||
         !shellLines.includes(REMOTE_README_MARKER) ||
         !shellLines.includes(REMOTE_CREATED_CONTENT)
@@ -988,6 +1150,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
         if (hostPid !== undefined && hostPort !== undefined && !remoteMayBeActive) {
           try {
             cleanup.host = await stopHost(hostPid, hostPort, signal, secrets)
+            hostStopped = true
           } catch (error) {
             cleanup.host = { attempted: true, pid: hostPid, error: safeError(error, secrets) }
             errors.push({ resource: "host", error: safeError(error, secrets) })
@@ -1000,18 +1163,33 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
           errors.push({ resource: "host", error: "owned host PID was not observed" })
         } else {
           cleanup.host = { attempted: false, reason: "host was not started" }
+          hostStopped = true
         }
 
-        const safeToRemoveWorktree = !remoteReady && !startAttempted || testSucceeded
-        if (safeToRemoveWorktree && worktree) {
+        if (runtimeDirectory) {
           try {
-            cleanup.worktree = await removeWorktree(worktree, signal, secrets)
+            cleanup.runtimeDirectory = await cleanupE2ERuntimeDirectory(runtimeDirectory, hostStopped, signal, secrets)
+          } catch (error) {
+            cleanup.runtimeDirectory = { attempted: true, path: runtimeDirectory, error: safeError(error, secrets) }
+            errors.push({ resource: "runtime directory", error: safeError(error, secrets) })
+          }
+        }
+
+        const safeToRemoveClone = testSucceeded && cloneCreated
+        if (safeToRemoveClone && worktree) {
+          try {
+            cleanup.worktree = await cleanupE2EClone(worktree, cloneCreated, signal, secrets)
           } catch (error) {
             cleanup.worktree = { attempted: true, path: worktree, error: safeError(error, secrets) }
-            errors.push({ resource: "worktree", error: safeError(error, secrets) })
+            errors.push({ resource: "clone", error: safeError(error, secrets) })
           }
         } else {
-          cleanup.worktree = { attempted: false, preserved: true, path: worktree ?? null, reason: "failure may contain unpreserved runtime evidence" }
+          cleanup.worktree = {
+            attempted: false,
+            preserved: true,
+            path: worktree ?? null,
+            reason: testSucceeded ? "clone was not created" : "failure evidence preserved",
+          }
         }
 
         cleanup.ok = errors.length === 0
@@ -1019,7 +1197,7 @@ export async function main(argv = process.argv.slice(2), options: MainOptions = 
         report.cleanup = cleanup
         if (errors.length > 0) throw new Error(`cleanup failed: ${bounded(JSON.stringify(errors), 4_096, secrets)}`)
 
-        if (testSucceeded && safeToRemoveWorktree) {
+        if (testSucceeded && safeToRemoveClone) {
           await persist()
           await rm(runDirectory!, { recursive: true, force: true })
           report.cleanup.runDirectoryRemoved = true

@@ -1,5 +1,5 @@
 import { createCapability } from "./control-channel"
-import { shortHash } from "./naming"
+import { isSafeSandboxPath, shortHash } from "./naming"
 import { remoteWorkspaceDirectory } from "./exedev-provider"
 import { REMOTE_CHECKOUT_DIRECTORY } from "./cloudflare-provider"
 import { redactError, redactText } from "./redaction"
@@ -1356,12 +1356,14 @@ export class LifecycleController {
           id: workspaceId,
           branch,
           extra: {
+            ...session.recoveryMetadata,
             owner: "opencode-sandbox",
             sessionId: capability.sessionId,
             generation,
+            workspaceId,
+            projectId: context.projectId,
             baseSha: capture.baseSha,
             provider: this.providerType,
-            ...session.recoveryMetadata,
           },
         })
         if (
@@ -4241,12 +4243,23 @@ function workspaceMatchesExactly(record: SandboxRecord, info: WorkspaceInfo): bo
 }
 
 function workspaceDirectoryMatches(record: SandboxRecord, info: WorkspaceInfo): boolean {
+  if (record.provider === "sbx") {
+    const remoteDirectory = sbxRemoteWorktreePath(record.providerState)
+    return remoteDirectory !== undefined && info.directory === remoteDirectory
+  }
   const remoteDirectory = record.provider === "exedev"
     ? remoteWorkspaceDirectory(record.workspaceId)
     : record.provider === "cloudflare"
       ? REMOTE_CHECKOUT_DIRECTORY
       : undefined
   return info.directory === record.directory || (remoteDirectory !== undefined && info.directory === remoteDirectory)
+}
+
+function sbxRemoteWorktreePath(value: unknown): string | undefined {
+  const providerState = isRecord(value) ? value : {}
+  const state = isRecord(providerState.providerState) ? providerState.providerState : providerState
+  const path = state.remoteWorktreePath ?? providerState.remoteWorktreePath
+  return isSafeSandboxPath(path) ? path : undefined
 }
 
 function classifySituation(record: SandboxRecord, observations: SandboxObservation[]): SandboxResultV2["classification"] {

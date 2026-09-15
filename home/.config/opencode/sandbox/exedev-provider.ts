@@ -7,13 +7,14 @@ import { fileURLToPath } from "node:url"
 import { createIsolatedSandboxProvider, type IsolatedSandboxHandle } from "@ai-hero/sandcastle"
 
 import type { ExeControl } from "./exe-control"
-import { buildRemoteCommandArgv, buildSupervisorArgv, DEFAULT_SSH_BIN, makeRuntimePaths, reserveLocalPort, type RuntimePaths } from "./remote-runtime"
+import { assertAliasPath, assertUnixSocketPath, buildRemoteCommandArgv, buildSupervisorArgv, DEFAULT_SSH_BIN, makeRuntimePaths, reserveLocalPort, worktreeAliasCommand, type RuntimePaths } from "./remote-runtime"
 import { basicAuthHeader, buildRemoteFrame, generateRemoteCredentials } from "./remote-runtime"
 import { assertPrivateFile, ensurePrivateDirectory } from "./secure-fs"
 import { nodeProcessRunner, nodeProcessSupervisor, sanitizeEnvironment, trackedProcessObservation, unknownProcessObservation } from "./process"
 import { assertRelativePath, assertSafeBranch, assertSafeComment, assertSafeSshDestination, assertSafeTag, assertSafeVmName, assertSha, identityMatches, makeVmPlan, quoteRemoteCommandPart, sha256, shortHash } from "./naming"
 import { redactError, redactText } from "./redaction"
 import { readLimitedBody } from "./workspace-http"
+import { captureWorkingTree, syncBackWorkingTree as syncBackLocalWorkingTree } from "./working-tree"
 import type { OpenCodeSandboxAdapter, SandcastleAdapterInput } from "./sandcastle-session"
 import {
   copyVmIdentity,
@@ -51,9 +52,13 @@ const INSPECTION_TIMEOUT_MS = 5_000
 const INVENTORY_TIMEOUT_MS = 10_000
 const SSH_KEYGEN_BIN = "/usr/bin/ssh-keygen"
 const SSH_KEYSCAN_BIN = "/usr/bin/ssh-keyscan"
-const REMOTE_WRITE_FILE = String.raw`#!/usr/bin/env python3
+const EXEDEV_VM_HOST_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.exe\.xyz$/
+const MAX_PROCESS_FAILURE_OUTPUT_CHARS = 2_000
+export const REMOTE_WRITE_FILE = String.raw`#!/usr/bin/env python3
 import base64, os, sys
 
+if not os.path.isabs(sys.argv[1]):
+    raise SystemExit("runtime directory must be absolute")
 root = os.path.realpath(sys.argv[1])
 if root != os.path.abspath(sys.argv[1]):
     raise SystemExit("runtime directory is a symlink")
@@ -105,8 +110,31 @@ fd = os.open(path, flags, 0o600)
 with os.fdopen(fd, "wb") as output:
     output.write(sys.stdin.buffer.read())
 `
+const REMOTE_VALIDATE_CHECKOUT = String.raw`import os, stat, sys
+
+path = sys.argv[1]
+if (
+    not path.startswith("/")
+    or path != os.path.abspath(path)
+    or path != os.path.realpath(path)
+    or "\x00" in path
+    or "\n" in path
+    or "\r" in path
+):
+    raise SystemExit("unsafe checkout path")
+if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+    raise SystemExit("checkout validation is unsupported")
+fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_gid != os.getgid():
+        raise SystemExit("checkout ownership is unsafe")
+    os.fchmod(fd, 0o700)
+finally:
+    os.close(fd)
+`
 const REMOTE_LAUNCHER = String.raw`#!/usr/bin/env python3
-import json, os, shutil, socket, stat, sys
+import hashlib, json, os, re, shutil, stat, subprocess, sys
 
 def fail(message):
     print("remote launcher: " + message, file=sys.stderr)
@@ -127,31 +155,108 @@ if not isinstance(frame["remotePort"], int) or not 1 <= frame["remotePort"] <= 6
     fail("invalid remote port")
 if any(not isinstance(frame[key], str) or not frame[key].startswith("/") or "\x00" in frame[key] or "\n" in frame[key] or "\r" in frame[key] for key in ("directory", "remoteControlSocket", "remoteLauncherPath")):
     fail("invalid runtime path")
+if not isinstance(frame["workspaceId"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", frame["workspaceId"]):
+    fail("invalid workspace ID")
 try:
     json.loads(frame["authContent"])
 except Exception:
     fail("invalid auth content")
+
+if os.geteuid() == 0:
+    fail("refusing to run OpenCode as root")
+
+uid = os.getuid()
+gid = os.getgid()
+runtime = os.path.dirname(frame["remoteLauncherPath"])
+socket_path = frame["remoteControlSocket"]
+expected_directory = "/tmp/oc-" + hashlib.sha256(frame["workspaceId"].encode("ascii")).hexdigest()[:10] + "/project"
+if (
+    not re.fullmatch(r"/tmp/oe-[a-f0-9]{12}", runtime)
+    or runtime != os.path.abspath(runtime)
+    or runtime != os.path.realpath(runtime)
+    or frame["remoteLauncherPath"] != os.path.join(runtime, "launcher")
+    or frame["remoteLauncherPath"] != os.path.realpath(frame["remoteLauncherPath"])
+    or socket_path != os.path.join(runtime, "c.sock")
+    or socket_path != os.path.abspath(socket_path)
+    or socket_path != os.path.realpath(socket_path)
+    or frame["directory"] != expected_directory
+    or frame["directory"] != os.path.abspath(frame["directory"])
+    or frame["directory"] != os.path.realpath(frame["directory"])
+):
+    fail("runtime path is unsafe")
+
+try:
+    runtime_info = os.lstat(runtime)
+    launcher_info = os.lstat(frame["remoteLauncherPath"])
+    checkout_info = os.lstat(frame["directory"])
+except Exception:
+    fail("remote runtime is unavailable")
+if (
+    stat.S_ISLNK(runtime_info.st_mode)
+    or not stat.S_ISDIR(runtime_info.st_mode)
+    or runtime_info.st_uid != uid
+    or runtime_info.st_gid != gid
+    or stat.S_IMODE(runtime_info.st_mode) != 0o700
+):
+    fail("remote runtime is not private")
+if (
+    stat.S_ISLNK(launcher_info.st_mode)
+    or not stat.S_ISREG(launcher_info.st_mode)
+    or launcher_info.st_uid != uid
+    or launcher_info.st_gid != gid
+    or stat.S_IMODE(launcher_info.st_mode) != 0o700
+):
+    fail("remote launcher is not private")
+if (
+    stat.S_ISLNK(checkout_info.st_mode)
+    or not stat.S_ISDIR(checkout_info.st_mode)
+    or checkout_info.st_uid != uid
+    or checkout_info.st_gid != gid
+    or stat.S_IMODE(checkout_info.st_mode) != 0o700
+):
+    fail("remote checkout is not private")
+
+def read_control_socket(expected_uid, expected_gid):
+    try:
+        socket_info = os.lstat(socket_path)
+    except OSError:
+        fail("remote control socket is unavailable")
+    if stat.S_ISLNK(socket_info.st_mode) or not stat.S_ISSOCK(socket_info.st_mode):
+        fail("remote control path is not a socket")
+    if socket_info.st_uid != expected_uid or socket_info.st_gid != expected_gid or stat.S_IMODE(socket_info.st_mode) != 0o600:
+        fail("remote control socket ownership or permissions are unsafe")
+    return socket_info
+
+read_control_socket(0, 0)
+try:
+    subprocess.run(
+        ["/usr/bin/sudo", "-n", "--", "/usr/bin/chown", "--no-dereference", "--", f"{uid}:{gid}", socket_path],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+except (OSError, subprocess.SubprocessError):
+    fail("could not transfer remote control socket ownership")
+read_control_socket(uid, gid)
+
 try:
     os.chdir(frame["directory"])
-except Exception:
-    fail("remote checkout is unavailable")
-try:
-    socket_info = os.stat(frame["remoteControlSocket"])
-    if not stat.S_ISSOCK(socket_info.st_mode) or socket_info.st_uid != os.getuid() or socket_info.st_mode & 0o077:
-        fail("remote control path is not a socket")
 except OSError:
-    fail("remote control socket is unavailable")
+    fail("remote checkout is unavailable")
 
-runtime = os.path.dirname(frame["remoteLauncherPath"])
-bun = shutil.which("bun")
-if bun is None:
-    fail("bun is not installed")
-command = shutil.which("opencode")
+home = os.path.expanduser("~")
+if not home.startswith("/") or "\x00" in home:
+    fail("user home is unavailable")
+bun_directory = os.path.join(home, ".bun", "bin")
+command = shutil.which("opencode", path=bun_directory)
 if command is None:
     fail("opencode is not installed")
 
 environment = os.environ.copy()
-environment["PATH"] = os.path.join(runtime, "bin") + os.pathsep + os.path.dirname(bun) + os.pathsep + environment.get("PATH", "")
+environment["BUN_INSTALL"] = os.path.dirname(bun_directory)
+environment["PATH"] = os.path.join(runtime, "bin") + os.pathsep + bun_directory + os.pathsep + environment.get("PATH", "")
 environment["OPENCODE_AUTH_CONTENT"] = frame["authContent"]
 environment["OPENCODE_WORKSPACE_ID"] = frame["workspaceId"]
 environment["OPENCODE_SERVER_USERNAME"] = "opencode"
@@ -167,18 +272,43 @@ os.execvpe(command, [command, "serve", "--hostname", "127.0.0.1", "--port", str(
 const REMOTE_BOOTSTRAP = (version: string) => String.raw`set -eu
 command -v git >/dev/null
 command -v python3 >/dev/null
-
-if ! command -v bun >/dev/null; then
-    command -v npm >/dev/null || { printf '%s\n' 'bun and npm are unavailable' >&2; exit 1; }
-    npm install --global bun@${BUN_VERSION}
+if [ "$(id -u)" -eq 0 ]; then
+    printf '%s\n' 'remote bootstrap refuses to run as root' >&2
+    exit 1
 fi
 
-if ! command -v opencode >/dev/null; then
-    bun install --global opencode-ai@${version}
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+bun="$BUN_INSTALL/bin/bun"
+
+if [ ! -x "$bun" ] || [ "$("$bun" --version 2>/dev/null || true)" != "${BUN_VERSION}" ]; then
+    command -v bash >/dev/null
+    command -v curl >/dev/null
+    command -v unzip >/dev/null
+    curl -fsSL https://bun.sh/install | bash -s -- "bun-v${BUN_VERSION}"
 fi
 
-test "$(bun --version 2>/dev/null)" = "${BUN_VERSION}"
-test "$(opencode --version 2>/dev/null)" = "${version}"
+test -x "$bun"
+bun_version=$("$bun" --version 2>/dev/null || true)
+if [ "$bun_version" != "${BUN_VERSION}" ]; then
+    printf 'Bun version mismatch: expected %s, got %s\n' "${BUN_VERSION}" "$bun_version" >&2
+    exit 1
+fi
+
+opencode="$BUN_INSTALL/bin/opencode"
+package="$BUN_INSTALL/install/global/node_modules/opencode-ai"
+if [ ! -x "$opencode" ] || [ "$("$opencode" --version 2>/dev/null || true)" != "${version}" ]; then
+    "$bun" install --global --ignore-scripts "opencode-ai@${version}"
+    test -f "$package/postinstall.mjs"
+    "$bun" "$package/postinstall.mjs"
+fi
+
+test -x "$opencode"
+opencode_version=$("$opencode" --version 2>/dev/null || true)
+if [ "$opencode_version" != "${version}" ]; then
+    printf 'OpenCode version mismatch: expected %s, got %s\n' "${version}" "$opencode_version" >&2
+    exit 1
+fi
 `
 
 export interface ExedevProviderOptions {
@@ -214,6 +344,7 @@ interface WorkspaceMetadata {
   comment?: string
   vmIdentity?: VmIdentity
   remoteDirectory?: string
+  remoteWorktreePath?: string
 }
 
 interface ExedevRuntimeMetadata {
@@ -225,6 +356,7 @@ interface ExedevRuntimeMetadata {
   branch: string
   baseSha: string
   remoteDirectory: string
+  remoteWorktreePath: string
   vmName: string
   vmIdentity: VmIdentity
 }
@@ -279,6 +411,8 @@ export class ExedevProvider implements WorkspaceProviderBase {
     this.config = options.config
     this.control = options.control
     this.worktree = options.worktree
+    assertAliasPath(this.worktree, "host worktree alias")
+    assertUnixSocketPath(options.localControlSocket, "local control socket")
     this.localControlSocket = options.localControlSocket
     this.runner = options.runner ?? nodeProcessRunner
     this.supervisor = options.supervisor ?? nodeProcessSupervisor
@@ -336,7 +470,10 @@ export class ExedevProvider implements WorkspaceProviderBase {
     const directory = info.directory ?? expectedDirectory
     if (directory !== expectedDirectory) throw new SandboxError("validate", "workspace directory is not plugin-owned", "WORKSPACE_DIRECTORY")
     assertRemotePath(directory, "workspace directory")
-    const [remoteUrl, localSha] = await Promise.all([this.readRemoteUrl(), this.readHead()])
+    const [remoteUrl, localSha] = await Promise.all([
+      this.deferActivation ? Promise.resolve(undefined) : this.readRemoteUrl(),
+      this.readHead(),
+    ])
     const baseSha = metadata.baseSha ?? localSha
     if (baseSha !== localSha) throw new SandboxError("checkout", "workspace SHA changed during provisioning", "GIT_HEAD_CHANGED")
     assertSha(baseSha)
@@ -410,6 +547,19 @@ export class ExedevProvider implements WorkspaceProviderBase {
     if (activation.process) return
     if (!activation.authContent) throw new SandboxError("bootstrap", "OpenCode auth content is unavailable", "AUTH_UNAVAILABLE")
 
+    if (activation.directory !== remoteWorkspaceDirectory(activation.workspaceId)) {
+      throw new SandboxError("checkout", "workspace checkout path is not plugin-owned", "WORKSPACE_DIRECTORY")
+    }
+    await this.remote(activation.vm.identity, ["python3", "-c", REMOTE_VALIDATE_CHECKOUT, activation.directory], undefined, "checkout")
+    const identityPath = posix.join(activation.directory, ".git/opencode")
+    assertRemotePath(identityPath, "project identity path")
+    await this.remote(activation.vm.identity, ["python3", "-c", REMOTE_WRITE_PATH, identityPath], activation.projectId, "bootstrap")
+    await this.remote(
+      activation.vm.identity,
+      ["sudo", "-n", "--", "sh", "-lc", worktreeAliasCommand(this.worktree, activation.directory, "exe.dev")],
+      undefined,
+      "bootstrap",
+    )
     const frame = buildRemoteFrame({
       workspaceId: activation.workspaceId,
       directory: activation.directory,
@@ -465,7 +615,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
       assertRelativePath(file.path)
       await this.remote(
         activation.vm.identity,
-        [activation.paths.remoteWriteFilePath, encodePath(activation.directory), encodePath(file.path)],
+        [activation.paths.remoteWriteFilePath, activation.directory, encodePath(file.path)],
         file.content,
         "sync",
       )
@@ -531,12 +681,15 @@ export class ExedevProvider implements WorkspaceProviderBase {
 
   async diagnose(info: WorkspaceInfo, signal?: AbortSignal): Promise<ProviderResourceObservation> {
     const observation = await this.inspect(info)
+    if (observation.resource !== "present" || observation.ownership !== "verified") return observation
     const health = await this.activeHealth(info.id, signal)
-    if (!health) return observation
+    if (!health) return { ...observation, health: "unknown" }
+    let authenticatedHealth: ProviderResourceObservation["health"] = "unknown"
+    if (health.healthy === true) authenticatedHealth = "healthy"
+    else if (health.healthy === false) authenticatedHealth = "degraded"
     return {
       ...observation,
-      ...(health.healthy === true ? { health: "healthy" as const } : {}),
-      ...(health.healthy === false ? { health: "degraded" as const } : {}),
+      health: authenticatedHealth,
       ...(health.version ? { remoteVersion: health.version } : {}),
     }
   }
@@ -624,7 +777,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }
 
     const paths = runtimePathsForDirectory(metadata.remoteDirectory)
-    const directory = remoteWorkspaceDirectory(input.owner.workspaceId)
+    const directory = metadata.remoteWorktreePath
     let activation: Activation | undefined
     try {
       // Inventory and durable metadata are the ownership proof. SSH is read-only until both match.
@@ -978,7 +1131,11 @@ export class ExedevProvider implements WorkspaceProviderBase {
     const matches = sameName.filter((item) => identityMatches(expected, item.identity))
     const match = matches[0]
     if (matches.length !== 1 || sameName.length !== 1 || !match || !hasOwnerTag(info, metadata, match.identity)) {
-      throw exedevOwnershipError()
+      const differingFields = [...new Set(sameName.flatMap((item) => identityDifferenceFields(expected, item.identity)))]
+      const ownerTagMatches = sameName.filter((item) => hasOwnerTag(info, metadata, item.identity)).length
+      throw exedevOwnershipError(
+        `exe.dev VM ownership could not be verified; identity fields differ: ${differingFields.length > 0 ? differingFields.join(",") : "none"}; matches=${matches.length}; sameName=${sameName.length}; ownerTagMatches=${ownerTagMatches}`,
+      )
     }
     return match
   }
@@ -1144,14 +1301,44 @@ export class ExedevProvider implements WorkspaceProviderBase {
         }, onCreated))
       return { vm, created: true }
     }
-    const vm = validateVmInfo(await this.control.create({
+    const receipt = validateVmInfo(await this.control.create({
       name: info.name,
       cpu: this.config.cpu,
       memory: this.config.memory,
       tags,
       comment,
     }))
+    let confirmed: VmInfo | undefined
+    onCreated?.(async () => {
+      const vm = confirmed ?? await this.confirmCreatedVm(info, metadata, receipt, tags, comment)
+      await this.control.remove(vm.identity)
+    })
+    const vm = await this.confirmCreatedVm(info, metadata, receipt, tags, comment)
+    confirmed = vm
     return { vm, created: true }
+  }
+
+  private async confirmCreatedVm(
+    info: WorkspaceInfo,
+    metadata: WorkspaceMetadata,
+    receipt: VmInfo,
+    tags: string[],
+    comment: string,
+  ): Promise<VmInfo> {
+    if (receipt.identity.name !== info.name) throw exedevOwnershipError()
+    const inventory = validateVmInventory(await this.control.list(INSPECTION_TIMEOUT_MS))
+    const sameName = inventory.filter((item) => item.identity.name === receipt.identity.name)
+    const matches = sameName.filter((item) =>
+      item.identity.sshDest === receipt.identity.sshDest &&
+      (receipt.identity.id === undefined || item.identity.id === receipt.identity.id) &&
+      tags.every((tag) => item.identity.tags.includes(tag)) &&
+      item.identity.comment === comment &&
+      hasOwnerTag(info, metadata, item.identity),
+    )
+    if (sameName.length !== 1 || matches.length !== 1) throw exedevOwnershipError()
+    const match = matches[0]
+    if (!match) throw exedevOwnershipError()
+    return { ...match, identity: copyVmIdentity(match.identity) }
   }
 
   private async verifyActivation(activation: Activation): Promise<VmIdentity> {
@@ -1175,10 +1362,15 @@ export class ExedevProvider implements WorkspaceProviderBase {
     }, activation.vm.identity)
   }
 
-  private async bootstrap(vm: VmIdentity, paths: RuntimePaths, directory: string, remoteUrl: string, baseSha: string, branch: string): Promise<void> {
+  private async bootstrap(vm: VmIdentity, paths: RuntimePaths, directory: string, remoteUrl: string | undefined, baseSha: string, branch: string): Promise<void> {
     await this.remote(vm, ["/bin/sh", "-s"], REMOTE_BOOTSTRAP(this.config.openCodeVersion), "bootstrap")
     const assets = await this.assets()
-    await this.remote(vm, ["mkdir", "-p", "--", paths.remoteDirectory, `${paths.remoteDirectory}/bin`, `${paths.remoteDirectory}/.config/opencode/sandbox`, `${paths.remoteDirectory}/config/command`, posix.dirname(directory)], undefined, "bootstrap")
+    if (this.deferActivation) {
+      const symlink = await this.remoteResult(vm, ["test", "-L", directory], undefined, "checkout")
+      if (symlink.exitCode === 0) throw new SandboxError("checkout", "existing workspace directory is a symlink", "REMOTE_DIR_UNSAFE")
+    }
+    const checkoutDirectory = this.deferActivation ? directory : posix.dirname(directory)
+    await this.remote(vm, ["mkdir", "-p", "--", paths.remoteDirectory, `${paths.remoteDirectory}/bin`, `${paths.remoteDirectory}/.config/opencode/sandbox`, `${paths.remoteDirectory}/config/command`, checkoutDirectory], undefined, "bootstrap")
     await this.seedRemoteFile(vm, paths.remoteWriteFilePath, REMOTE_WRITE_FILE)
     await this.writeRemoteFile(vm, paths.remoteWriteFilePath, paths.remoteDirectory, paths.remoteLauncherPath, REMOTE_LAUNCHER)
     await this.writeRemoteFile(vm, paths.remoteWriteFilePath, paths.remoteDirectory, paths.remoteCliPath, assets.launcher)
@@ -1186,11 +1378,14 @@ export class ExedevProvider implements WorkspaceProviderBase {
     await this.writeRemoteFile(vm, paths.remoteWriteFilePath, paths.remoteDirectory, `${paths.remoteDirectory}/.config/opencode/sandbox/redaction.ts`, assets.redaction)
     await this.writeRemoteFile(vm, paths.remoteWriteFilePath, paths.remoteDirectory, `${paths.remoteDirectory}/.config/opencode/sandbox/types.ts`, assets.types)
     await this.writeRemoteFile(vm, paths.remoteWriteFilePath, paths.remoteDirectory, paths.remoteCommandPath, assets.command)
-    await this.remote(vm, ["chmod", "700", paths.remoteDirectory, `${paths.remoteDirectory}/bin`, `${paths.remoteDirectory}/.config`, `${paths.remoteDirectory}/.config/opencode`, `${paths.remoteDirectory}/.config/opencode/sandbox`, `${paths.remoteDirectory}/config`, `${paths.remoteDirectory}/config/command`, posix.dirname(directory)], undefined, "bootstrap")
+    await this.remote(vm, ["chmod", "700", paths.remoteDirectory, `${paths.remoteDirectory}/bin`, `${paths.remoteDirectory}/.config`, `${paths.remoteDirectory}/.config/opencode`, `${paths.remoteDirectory}/.config/opencode/sandbox`, `${paths.remoteDirectory}/config`, `${paths.remoteDirectory}/config/command`, checkoutDirectory], undefined, "bootstrap")
     await this.remote(vm, ["chmod", "700", paths.remoteLauncherPath, paths.remoteCliPath, paths.remoteWriteFilePath], undefined, "bootstrap")
     await this.remote(vm, ["chmod", "600", paths.remoteCommandPath, `${paths.remoteDirectory}/.config/opencode/sandbox/cli.ts`, `${paths.remoteDirectory}/.config/opencode/sandbox/redaction.ts`, `${paths.remoteDirectory}/.config/opencode/sandbox/types.ts`], undefined, "bootstrap")
-    await this.prepareCheckout(vm, directory, remoteUrl, baseSha, branch)
-    await this.remote(vm, ["chmod", "700", directory], undefined, "bootstrap")
+    if (!this.deferActivation) {
+      if (!remoteUrl) throw new SandboxError("git_preflight", "origin is unavailable", "REMOTE_URL_INVALID")
+      await this.prepareCheckout(vm, directory, remoteUrl, baseSha, branch)
+      await this.remote(vm, ["chmod", "700", directory], undefined, "bootstrap")
+    }
   }
 
   private async prepareCheckout(vm: VmIdentity, directory: string, remoteUrl: string, baseSha: string, branch: string): Promise<void> {
@@ -1248,12 +1443,17 @@ export class ExedevProvider implements WorkspaceProviderBase {
   private observeProcess(activation: Activation): void {
     const process = activation.process
     if (!process) return
+    const secrets = [activation.password, activation.controlToken, activation.authContent]
+      .filter((secret): secret is string => typeof secret === "string" && secret.length > 0)
+    const output = (value: string) => redactText(value, secrets).slice(0, MAX_PROCESS_FAILURE_OUTPUT_CHARS)
     void process.result
       .then((result) => {
-        if (result.exitCode !== 0 || result.signal !== null) activation.failure = "SSH supervisor exited"
+        if (result.exitCode !== 0 || result.signal !== null) {
+          activation.failure = `SSH supervisor exited (exit code ${result.exitCode}, signal ${result.signal}); stdout=${output(result.stdout)}; stderr=${output(result.stderr)}`
+        }
       })
       .catch((error) => {
-        activation.failure = redactError(error)
+        activation.failure = redactError(error, secrets)
       })
   }
 
@@ -1331,7 +1531,7 @@ export class ExedevProvider implements WorkspaceProviderBase {
     if (!relative || relative.startsWith("../") || relative === ".." || relative.startsWith("/")) {
       throw new SandboxError("validate", "remote asset path is outside its runtime", "PATH_INVALID")
     }
-    await this.remote(vm, [writer, encodePath(root), encodePath(relative)], content, "bootstrap")
+    await this.remote(vm, [writer, root, encodePath(relative)], content, "bootstrap")
   }
 
   private async remoteResult(
@@ -1386,6 +1586,7 @@ async function readHealthResponse(response: Response, signal: AbortSignal): Prom
 export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOptions): OpenCodeSandboxAdapter {
   const { input, authContent, provider: suppliedProvider, ...providerOptions } = options
   const provider = suppliedProvider ?? new ExedevProvider({ ...providerOptions, authContent, deferActivation: true })
+  let baseline: WorkingTreeCapture | undefined
   const info: WorkspaceInfo = {
     id: input.workspaceId,
     type: "exedev",
@@ -1415,6 +1616,26 @@ export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOp
     applyCapture: async ({ capture }) => {
       await provider.syncIn(input.workspaceId, capture)
       await provider.activate(input.workspaceId)
+      baseline = capture
+    },
+    syncBackWorkingTree: async ({ sandbox, worktreePath }) => {
+      if (!baseline) throw new SandboxError("sync", "exe.dev working tree baseline is unavailable", "SYNC_BASELINE_UNAVAILABLE")
+      let remoteTreeResult: Awaited<ReturnType<typeof sandbox.exec>>
+      try {
+        remoteTreeResult = await sandbox.exec("git rev-parse HEAD^{tree}")
+      } catch (error) {
+        if (error instanceof SandboxError) throw error
+        throw new SandboxError("sync", redactError(error), "REMOTE_TREE")
+      }
+      if (remoteTreeResult.exitCode !== 0) {
+        throw new SandboxError("sync", redactText(remoteTreeResult.stderr || "could not read the exe.dev Git tree"), "REMOTE_TREE")
+      }
+      const remoteTree = remoteTreeResult.stdout.trim()
+      if (!/^[a-f0-9]{40}$/i.test(remoteTree)) {
+        throw new SandboxError("sync", "exe.dev returned an invalid Git tree", "REMOTE_TREE")
+      }
+      await syncBackLocalWorkingTree(input.context, baseline, { worktreePath, remoteTree })
+      baseline = await captureWorkingTree(input.context)
     },
     target: () => provider.target(info),
     close: () => provider.close(info),
@@ -1422,12 +1643,13 @@ export function createExedevSandcastleAdapter(options: ExedevSandcastleAdapterOp
       const metadata = provider.runtimeMetadata(input.workspaceId)
       return {
         ...(metadata?.providerState ?? {}),
+        remoteWorktreePath: remoteWorkspaceDirectory(input.workspaceId),
         ...(metadata?.vmName ? { vmName: metadata.vmName } : {}),
         ...(metadata?.vmIdentity ? { vmIdentity: metadata.vmIdentity } : {}),
       }
     },
     processObservation: () => provider.processObservation(input.workspaceId),
-    inspect: (signal?: AbortSignal) => provider.inspect(info, signal),
+    inspect: (signal?: AbortSignal) => provider.diagnose(info, signal),
     diagnose: (signal?: AbortSignal) => provider.diagnose(info, signal),
   }
 }
@@ -1481,22 +1703,80 @@ export async function ensureExeDevVmHostKey(knownHostsFile: string, identity: Vm
   }
   await ensurePrivateDirectory(dirname(knownHostsFile))
 
+  let existing: string | undefined
   try {
     await assertPrivateFile(knownHostsFile)
+    existing = await readFile(knownHostsFile, "utf8")
   } catch (error) {
     if (error instanceof SandboxError && error.code === "PATH_MISSING") {
-      throw new SandboxError("discover", "VM host key is not configured", "VM_HOST_KEY_MISSING")
+      existing = undefined
+    } else {
+      throw error
     }
-    throw error
   }
 
-  const known = await runner.run({
-    argv: [SSH_KEYGEN_BIN, "-F", host, "-f", knownHostsFile],
+  if (existing !== undefined) {
+    const known = await runner.run({
+      argv: [SSH_KEYGEN_BIN, "-F", host, "-f", knownHostsFile],
+      env: sanitizeEnvironment(),
+      maxOutputBytes: 32 * 1024,
+    })
+    if (known.exitCode === 0 && known.stdout.trim().length > 0) {
+      await verifyHostKey(knownHostsFile, host, runner)
+      return
+    }
+  }
+
+  if (!EXEDEV_VM_HOST_PATTERN.test(host)) {
+    throw new SandboxError("discover", "VM host key is not configured for the exact SSH destination", "VM_HOST_KEY_UNKNOWN")
+  }
+
+  const scanned = await runner.run({
+    argv: [SSH_KEYSCAN_BIN, "-T", "5", "-t", "rsa", host],
     env: sanitizeEnvironment(),
     maxOutputBytes: 32 * 1024,
   })
-  if (known.exitCode === 0 && known.stdout.trim().length > 0) return
-  throw new SandboxError("discover", "VM host key is not configured for the exact SSH destination", "VM_HOST_KEY_UNKNOWN")
+  if (scanned.exitCode !== 0 || scanned.stdout.trim().length === 0) {
+    throw new SandboxError("discover", "could not retrieve the exe.dev VM host key", "VM_HOST_KEY_SCAN")
+  }
+  const scannedEntry = exactScannedHostKeys(scanned.stdout, host)
+
+  const temporary = `${knownHostsFile}.${randomBytes(8).toString("hex")}.tmp`
+  await writeFile(temporary, scannedEntry, { encoding: "utf8", mode: 0o600, flag: "wx" })
+  try {
+    await assertPrivateFile(temporary)
+    await verifyHostKey(temporary, host, runner)
+    if (existing === undefined) {
+      try {
+        await writeFile(knownHostsFile, scannedEntry, { encoding: "utf8", mode: 0o600, flag: "wx" })
+      } catch (error) {
+        if (!isNodeError(error, "EEXIST")) throw error
+        await assertPrivateFile(knownHostsFile)
+        await verifyHostKey(knownHostsFile, host, runner)
+        return
+      }
+    } else {
+      const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""
+      await writeFile(knownHostsFile, `${separator}${scannedEntry}`, { encoding: "utf8", flag: "a" })
+    }
+  } finally {
+    await unlink(temporary).catch(() => undefined)
+  }
+  await assertPrivateFile(knownHostsFile)
+}
+
+function exactScannedHostKeys(output: string, host: string): string {
+  const entries = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+  if (entries.length === 0 || entries.some((line) => {
+    const fields = line.split(/\s+/)
+    return fields.length < 3 || fields[0] !== host
+  })) {
+    throw new SandboxError("discover", "exe.dev VM scan returned an unexpected SSH destination", "VM_HOST_KEY_SCAN")
+  }
+  return `${entries.join("\n")}\n`
 }
 
 function readWorkspaceMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): WorkspaceMetadata {
@@ -1541,6 +1821,13 @@ function readWorkspaceMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): Works
     if (typeof remoteDirectory !== "string") throw new SandboxError("validate", "workspace runtime directory is invalid", "RUNTIME_DIRECTORY")
     assertRemotePath(remoteDirectory, "workspace runtime directory")
   }
+  const remoteWorktreePath = field("remoteWorktreePath")
+  if (remoteWorktreePath !== undefined && (
+    typeof remoteWorktreePath !== "string" ||
+    remoteWorktreePath !== remoteWorkspaceDirectory(info.id)
+  )) {
+    throw new SandboxError("validate", "workspace checkout path is not plugin-owned", "WORKSPACE_DIRECTORY")
+  }
   const comment = field("comment")
   if (comment !== undefined && typeof comment !== "string") {
     throw new SandboxError("validate", "workspace VM comment is invalid", "COMMENT_INVALID")
@@ -1554,6 +1841,7 @@ function readWorkspaceMetadata(info: WorkspaceInfo, from?: WorkspaceInfo): Works
     comment: typeof comment === "string" ? comment : undefined,
     vmIdentity,
     remoteDirectory: typeof remoteDirectory === "string" ? remoteDirectory : undefined,
+    remoteWorktreePath: typeof remoteWorktreePath === "string" ? remoteWorktreePath : undefined,
   }
 }
 
@@ -1661,7 +1949,8 @@ async function verifyHostKey(path: string, host: string, runner: ProcessRunner):
   await writeFile(temporary, entry.stdout, { encoding: "utf8", mode: 0o600, flag: "wx" })
   try {
     const result = await runner.run({ argv: [SSH_KEYGEN_BIN, "-lf", temporary, "-E", "sha256"], env: sanitizeEnvironment(), maxOutputBytes: 32 * 1024 })
-    if (result.exitCode !== 0 || !result.stdout.includes(EXEDEV_HOST_FINGERPRINT)) {
+    const fingerprints = result.stdout.match(/SHA256:[A-Za-z0-9+/=]+/g) ?? []
+    if (result.exitCode !== 0 || fingerprints.length === 0 || fingerprints.some((fingerprint) => fingerprint !== EXEDEV_HOST_FINGERPRINT)) {
       throw new SandboxError("discover", "exe.dev host key does not match the official fingerprint", "HOST_KEY_MISMATCH")
     }
   } finally {
@@ -1699,6 +1988,7 @@ function metadataForActivation(activation: Activation): ExedevRuntimeMetadata {
     branch: activation.branch,
     baseSha: activation.baseSha,
     remoteDirectory: activation.paths.remoteDirectory,
+    remoteWorktreePath: activation.directory,
     vmName: activation.vm.identity.name,
     vmIdentity: copyVmIdentity(activation.vm.identity),
   }
@@ -1716,6 +2006,10 @@ function parseExedevRuntimeMetadata(value: unknown): ExedevRuntimeMetadata {
   const branch = value.branch as string
   const baseSha = value.baseSha as string
   const remoteDirectory = value.remoteDirectory as string
+  const remoteWorktreePathValue = value.remoteWorktreePath
+  const remoteWorktreePath = remoteWorktreePathValue === undefined
+    ? remoteWorkspaceDirectory(workspaceId)
+    : remoteWorktreePathValue
   const vmName = value.vmName as string
   if (!SAFE_IDENTIFIER.test(projectId) || !SAFE_IDENTIFIER.test(sessionId) || !SAFE_IDENTIFIER.test(workspaceId)) {
     throw new SandboxError("discover", "exe.dev durable owner metadata is invalid", "EXEDEV_METADATA")
@@ -1726,6 +2020,9 @@ function parseExedevRuntimeMetadata(value: unknown): ExedevRuntimeMetadata {
   assertSafeBranch(branch)
   assertSha(baseSha)
   assertRuntimeDirectory(remoteDirectory)
+  if (typeof remoteWorktreePath !== "string" || remoteWorktreePath !== remoteWorkspaceDirectory(workspaceId)) {
+    throw new SandboxError("discover", "exe.dev durable checkout path is not plugin-owned", "EXEDEV_METADATA")
+  }
   assertSafeVmName(vmName)
   const vmIdentity = parseVmIdentity(value.vmIdentity)
   if (!vmIdentity || vmIdentity.name !== vmName) {
@@ -1740,6 +2037,7 @@ function parseExedevRuntimeMetadata(value: unknown): ExedevRuntimeMetadata {
     branch,
     baseSha,
     remoteDirectory,
+    remoteWorktreePath,
     vmName,
     vmIdentity,
   }
@@ -1828,8 +2126,19 @@ function hasOwnerTag(info: WorkspaceInfo, metadata: WorkspaceMetadata, identity:
   return identity.tags.includes(exedevOwnerTag(info, metadata))
 }
 
-function exedevOwnershipError(): SandboxError {
-  return new SandboxError("remove", "exe.dev VM ownership could not be verified", "EXEDEV_OWNERSHIP_UNVERIFIED")
+function identityDifferenceFields(expected: VmIdentity, observed: VmIdentity): string[] {
+  const differences: Array<keyof VmIdentity> = (["id", "name", "sshDest", "sshUser", "sshHost", "region", "comment"] as const)
+    .filter((field) => expected[field] !== observed[field])
+  const expectedTags = [...expected.tags].sort()
+  const observedTags = [...observed.tags].sort()
+  if (expectedTags.length !== observedTags.length || expectedTags.some((tag, index) => tag !== observedTags[index])) {
+    differences.push("tags")
+  }
+  return differences
+}
+
+function exedevOwnershipError(message = "exe.dev VM ownership could not be verified"): SandboxError {
+  return new SandboxError("remove", message, "EXEDEV_OWNERSHIP_UNVERIFIED")
 }
 
 function encodePath(value: string): string {

@@ -29,7 +29,11 @@ afterEach(async () => {
 describe("diagnostic bundle", () => {
   it("returns fixed, fresh observations and preserves version provenance", async () => {
     const store = new FileStateStore(await temporaryDirectory())
-    const record = makeRecord({ provider: "sbx", providerState: { resourceId: "sandbox-1" }, preservedWorktreePath: "/tmp/preserved-worktree" })
+    const record = makeRecord({
+      provider: "sbx",
+      providerState: { resourceId: "sandbox-1", remoteWorktreePath: "/workspace/project/.opencode-worktree" },
+      preservedWorktreePath: "/tmp/preserved-worktree",
+    })
     await store.write(record)
     const calls: string[] = []
     const provider: ProviderResourceObservation = {
@@ -541,12 +545,15 @@ function makeRecord(overrides: Partial<SandboxRecord> = {}): SandboxRecord {
 }
 
 function diagnosticWorkspace(record: SandboxRecord, calls: string[]): WorkspaceGateway {
+  const directory = typeof record.providerState.remoteWorktreePath === "string"
+    ? record.providerState.remoteWorktreePath
+    : record.directory
   const info: WorkspaceInfo = {
     id: record.workspaceId,
     type: record.provider,
     name: "workspace",
     branch: record.branch,
-    directory: record.directory,
+    directory,
     projectID: record.projectId,
     extra: { owner: "opencode-sandbox" },
   }

@@ -212,7 +212,7 @@ State files reject credential-shaped keys, use private permissions, write atomic
 | `exedev` | exe.dev VM | SSH and remote control socket | exe.dev access, SSH lobby, pinned host key | Session inspect plus project inventory; inspect matches durable VM identity and owner tag |
 | `cloudflare` | Cloudflare Sandbox | Sandbox API plus mailbox control bridge | `apiUrl` and `apiKey` in the project config, or matching `SANDBOX_API_URL` and `SANDBOX_API_KEY` environment variables | Live known-resource inspection; `diagnose` may add active health; no durable post-restart lookup, inventory, or runtime-adoption adapter. Exec stdin is staged through the bridge file PUT contract. |
 
-All three use the Sandcastle workspace path by default. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
+All three use the Sandcastle workspace path by default. For exe.dev, `remoteDirectory` is only the private control-asset directory; `remoteWorktreePath` is the provider checkout and is the path registered in the OpenCode workspace. The older direct `WorkspaceProviderBase` path remains for injected tests and compatibility. New lifecycle behavior belongs above the provider seam unless the behavior is truly provider-specific.
 
 The five-method `RuntimeDriver` seam is exercised by the fake adapter and the default SBX and exe.dev Sandcastle adapters. Both real drivers are fail-closed: duplicate resources, unknown or stopped status, timeouts, conflicts, and checkout mismatches remain unsupported or unknown without provider mutation. Cloudflare needs a bridge resource lookup returning durable owner metadata plus a runtime driver before it can support recovery or post-restart deletion; the current bridge only checks `running(sandboxId)`, while `CloudflareProvider` keeps ownership in a process-local map. Its live inspection is read-only and never receives an inferred destructive action.
 
@@ -281,7 +281,7 @@ The failure was startup convergence, not missing ingress configuration. On 2026-
 
 The command exits nonzero for a failed stage, missing required configuration, or failed cleanup. Logs and telemetry are diagnostic and do not turn an otherwise healthy run into a pass/fail claim. A failed loopback command records `commandFailed` explicitly rather than treating missing output as a runtime result. Cleanup addresses only the provider-observed sandbox ID from this run, deletes its tunnel before the sandbox through one provider-owned close, and never probes with `running()` after deletion. If ownership is not observed, cleanup fails closed and does not guess at a resource.
 
-### Full Cloudflare E2E
+### Full sandbox E2E
 
 From the repository root, run:
 
@@ -289,9 +289,30 @@ From the repository root, run:
 bun home/.config/opencode/sandbox/cloudflare-e2e.ts
 ```
 
-This validated command runs without an LLM or subagents. It uses the local `.opencode/sandbox.json` configuration, with the same `SANDBOX_CONFIG`, `SANDBOX_API_URL`, and `SANDBOX_API_KEY` overrides, and selects Cloudflare for the run. It creates an isolated local host/session and worktree, invokes `sandboxctl start`, waits for the OpenCode Warp and replay to establish the remote session, applies fixed remote edits, invokes `sandboxctl stop`, verifies sync-back and the return to the local session, then performs bounded cleanup of the sandbox, host, and worktree. Failures preserve the `.cloudflare-e2e-*` evidence directory because it can contain private credentials and artifacts.
+This validated command runs without an LLM or subagents. It uses the local `.opencode/sandbox.json` configuration and accepts `SANDBOX_E2E_PROVIDER=cloudflare|sbx|exedev`; Cloudflare is the default. It preserves the same `SANDBOX_CONFIG`, `SANDBOX_API_URL`, and `SANDBOX_API_KEY` overrides for Cloudflare, while the SBX and exe.dev paths neither require nor copy Cloudflare bridge credentials. The exe.dev path forces `SANDBOX_KNOWN_HOSTS_FILE` into the private evidence directory and reuses the existing host-key setup. It creates an isolated local host/session and independent disposable Git clone, invokes `sandboxctl start`, waits for the OpenCode Warp and replay to establish the remote session, applies fixed remote edits, invokes `sandboxctl stop`, verifies sync-back and the return to the local session, then performs bounded cleanup of the sandbox, host, and clone. The expected remote worktree path comes from the runtime metadata persisted in the lifecycle record, and the fixed command only compares `pwd -P` against that value. `resources.runtimeDirectory` names a separate private short XDG runtime directory and is removed only after the owned host exits. Failures preserve the `.cloudflare-e2e-*` evidence directory because it can contain private credentials and artifacts.
 
-Validation status: **PASS**, 2026-09-14. `SANDBOX_E2E_OUTPUT=/absolute/path/result.json` is optional; when set, the command writes the redacted JSON report with mode `0600`.
+For example, to run the same scenario through SBX:
+
+```bash
+SANDBOX_E2E_PROVIDER=sbx bun home/.config/opencode/sandbox/cloudflare-e2e.ts
+```
+
+For exe.dev, use the same runner without changing the user's SSH configuration:
+
+```bash
+SANDBOX_E2E_PROVIDER=exedev bun home/.config/opencode/sandbox/cloudflare-e2e.ts
+```
+
+The real provider validation is:
+
+| Provider | Command | Report and UTC interval | Result |
+|---|---|---|---|
+| `sbx` | `SANDBOX_E2E_PROVIDER=sbx bun home/.config/opencode/sandbox/cloudflare-e2e.ts` | `sbx-e2e-mountpoint.json`, 2026-09-15 00:47:05.732Z to 00:47:52.093Z | **PASS** |
+| `exedev` | `SANDBOX_E2E_PROVIDER=exedev bun home/.config/opencode/sandbox/cloudflare-e2e.ts` | `exedev-e2e-final.json`, 2026-09-15 12:42:57.970Z to 12:45:01.688Z | **PASS** |
+
+Both reports show `PASS` for every phase and verify the normal complete flow: isolated disposable checkout and host session, healthy host, `sandboxctl start`, provider-specific remote runtime, OpenCode Warp and replay, connected synchronization, the fixed Linux remote edit in the exact persisted `remoteWorktreePath`, `sandboxctl stop`, Warp back, sync back, local-session return, provider destruction, and bounded cleanup without errors. They also record `llmCall: false`, `subagents: false`, and `providerDirectCalls: false`. For SBX, the report verifies the mounted remote path; for exe.dev, it verifies the separate private `remoteDirectory` and registered checkout path.
+
+This is coverage of the normal end-to-end path without an LLM, not exhaustive recovery or failure coverage. It does not prove restart adoption, orphan recovery, stopped-resource handling, ownership conflicts, timeouts, or other failure branches. `SANDBOX_E2E_OUTPUT=/absolute/path/result.json` is optional; when set, the command writes the redacted JSON report with mode `0600`.
 
 ## Files and evidence
 
