@@ -25,9 +25,6 @@ OS X 10.8 Mountain Lion: Import Solarized Dark.terminal into Terminal.app prefer
 
 ## Development
 
-- [OpenCode sandbox architecture](docs/opencode-sandbox.md)
-- [OpenCode sandbox operations](docs/opencode-sandbox-operations.md)
-
 ## License
 
 Copyright (C) 2014 Rodrigo Moyle <rodrigorm@gmail.com>

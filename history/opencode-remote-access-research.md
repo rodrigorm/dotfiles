@@ -1,6 +1,6 @@
 # Acesso remoto a instâncias OpenCode
 
-> Historical snapshot from 2026-08-11. Its recommendations predate the session sandbox system and do not describe current behavior. See [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md) for the current architecture and the separate role of `home/bin/oc`.
+> Historical snapshot from 2026-08-11. Its recommendations predate the session sandbox system and do not describe current behavior. The sandbox system now lives in the separate opencode-sandbox repository; `home/bin/oc` keeps its separate role here.
 
 Pesquisa realizada em 11 de agosto de 2026. Foram usadas fontes primárias: documentação e código-fonte oficiais de T3 Code, OpenCode, Tailscale e Cloudflare, além dos dois scripts atuais deste repositório. O T3 Code foi auditado no commit [`35172010b131510d36d0cef54e174926e38a3013`](https://github.com/pingdotgg/t3code/tree/35172010b131510d36d0cef54e174926e38a3013) e o OpenCode no commit [`0d927ba03f36d7f87e3cdb2b6c1f34c44913a099`](https://github.com/anomalyco/opencode/tree/0d927ba03f36d7f87e3cdb2b6c1f34c44913a099).
 

@@ -1,6 +1,6 @@
 # OpenCode TUI e múltiplos workdirs na versão 1.18.17
 
-> Historical version-specific snapshot. The sandbox system now uses OpenCode experimental workspaces and may target newer OpenCode versions. See [`docs/opencode-sandbox.md`](../docs/opencode-sandbox.md) for current behavior; retain this document only as evidence about v1.18.17.
+> Historical version-specific snapshot. The sandbox system now lives in the separate opencode-sandbox repository; retain this document only as evidence about v1.18.17.
 
 Pesquisa realizada em 12 de agosto de 2026 para decidir se o argumento de diretório do wrapper `oc` pode ser removido sem limitar o uso remoto pela TUI.
 

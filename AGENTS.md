@@ -24,9 +24,6 @@ Personal dotfiles repository using **Homeshick** (git + symlinks) and **Homebrew
 ## Guidelines
 
 - [Shell Scripts](.agents/shell-scripts.md) - Bash conventions, testing, error handling
-- [OpenCode Sandbox Architecture](docs/opencode-sandbox.md) - Read before changing sandbox lifecycle, providers, workspace routing, or remote access
-- [OpenCode Sandbox Operations](docs/opencode-sandbox-operations.md) - Read when diagnosing sessions, drift, leaked resources, or cleanup
-- [OpenCode Sandbox Agent Plan](history/opencode-sandbox-agent-system-plan.md) - Read when planning sandbox recovery, inspection, or interface work
 
 ## Common Gotchas
 
