@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=T3 Code
+Comment=Keep the desktop browser automation host available for remote sessions
+Exec=t3code
+TryExec=t3code
+Terminal=false
+Icon=t3code
