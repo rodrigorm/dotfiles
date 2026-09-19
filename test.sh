@@ -52,6 +52,11 @@ test_package_installations() {
     # Test bash
     run_test "bash installation" "command -v bash && bash --version"
 
+    if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "x86_64" ]]; then
+        run_test "t3 installation" "[ -x \"$HOME/.local/bin/t3\" ] && \"$HOME/.local/bin/t3\" --version"
+        run_test "t3 PATH config" "grep -q '.local/bin' /workspaces/dotfiles/home/.bashrc.d/10-path.sh"
+    fi
+
     # Test bash-completion (Linux only)
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         run_test "bash-completion available" "true" # Temporarily skip this test

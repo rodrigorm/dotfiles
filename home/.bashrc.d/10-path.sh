@@ -3,6 +3,9 @@
 # set PATH so it includes user's private bin if it exists
 [ -d "$HOME/bin" ] && PATH="$HOME/bin:$PATH"
 
+# User-installed CLIs, including T3 Code.
+export PATH="$HOME/.local/bin:$PATH"
+
 # Add RVM to PATH for scripting
 [ -d "$HOME/.rvm/bin" ] && PATH="$HOME/.rvm/bin:$PATH"
 

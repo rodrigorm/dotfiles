@@ -15,6 +15,9 @@ if ! command -v brew >/dev/null 2>&1; then
     NONINTERACTIVE=1 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 fi
 
+# Never prompt for confirmation; fail instead of asking.
+export NONINTERACTIVE=1
+
 if command -v /opt/homebrew/bin/brew >/dev/null 2>&1; then
     export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
 elif command -v /home/linuxbrew/.linuxbrew/bin/brew >/dev/null 2>&1; then
@@ -59,6 +62,45 @@ brew install \
 # Linux uses the Homebrew CLI and daemon. Tailscale installation on macOS is manual.
 if [[ "$(uname -s)" == "Linux" ]]; then
     brew install tailscale
+fi
+
+export PATH="$HOME/.local/bin:$PATH"
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "x86_64" ]]; then
+    printf '%s\n' 'Skipping the T3 CLI: native releases do not support Intel Macs.'
+elif command -v t3 >/dev/null 2>&1; then
+    printf '%s\n' "T3 CLI already installed: $(t3 --version)"
+else
+    # install.sh discovers the version through the anonymous GitHub API,
+    # which is often rate-limited (HTTP 403); `gh` gets a higher quota.
+    t3_version="$(gh api repos/pingdotgg/t3code/releases/latest --jq '.tag_name | ltrimstr("v")' 2>/dev/null || true)"
+    if curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$t3_version" sh; then
+        printf '%s\n' "T3 CLI installed: $(t3 --version)"
+    else
+        printf '%s\n' 'T3 CLI install failed (likely GitHub API rate limit); re-run bootstrap.sh later.'
+    fi
+fi
+
+# Desktop app: Homebrew cask on macOS, AppImage on Linux (best effort).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    brew install --cask t3-code
+fi
+if [[ "$(uname -s)" == "Linux" && -x "$HOME/.local/bin/t3" ]]; then
+    case "$(uname -m)" in
+        x86_64) t3_appimage_arch="x86_64" ;;
+        aarch64 | arm64) t3_appimage_arch="arm64" ;;
+        *) t3_appimage_arch="" ;;
+    esac
+    if [[ -n "$t3_appimage_arch" ]]; then
+        t3_version="$("$HOME/.local/bin/t3" --version | awk '{print $2}')"
+        t3_version="${t3_version#v}"
+        mkdir -p "$HOME/.local/bin"
+        if curl -fsSL -o "$HOME/.local/bin/T3-Code.AppImage" \
+            "https://github.com/pingdotgg/t3code/releases/download/v${t3_version}/T3-Code-${t3_version}-${t3_appimage_arch}.AppImage"; then
+            chmod +x "$HOME/.local/bin/T3-Code.AppImage"
+        else
+            printf '%s\n' 'Could not download the T3 Code desktop AppImage; continuing without it.'
+        fi
+    fi
 fi
 
 # Setup homeshick (clone only if missing)
