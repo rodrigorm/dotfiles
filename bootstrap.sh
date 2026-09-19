@@ -62,10 +62,11 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 # Setup homeshick (clone only if missing)
-if [[ ! -d "$HOME/.homesick/repos/homeshick" ]]; then
-    git clone https://github.com/andsens/homeshick.git "$HOME/.homesick/repos/homeshick"
-else
+if [[ -d "$HOME/.homesick/repos/homeshick/.git" ]]; then
     git -C "$HOME/.homesick/repos/homeshick" pull
+else
+    rm -rf "$HOME/.homesick/repos/homeshick"
+    git clone https://github.com/andsens/homeshick.git "$HOME/.homesick/repos/homeshick"
 fi
 
 # Link dotfiles via homeshick (symlink if missing or different target)
@@ -79,10 +80,11 @@ fi
 mkdir -p "$HOME/.ssh"
 
 # Clone/update nvim config
-if [[ ! -d "$HOME/.config/nvim" ]]; then
-    git clone https://github.com/rodrigorm/nvim.git "$HOME/.config/nvim"
-else
+if [[ -d "$HOME/.config/nvim/.git" ]]; then
     git -C "$HOME/.config/nvim" pull origin main
+else
+    rm -rf "$HOME/.config/nvim"
+    git clone https://github.com/rodrigorm/nvim.git "$HOME/.config/nvim"
 fi
 
 # Agent Browser
