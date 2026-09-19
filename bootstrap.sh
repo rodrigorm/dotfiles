@@ -141,30 +141,6 @@ rm -rf "$HOME/.agents/skills/"
 bunx skills add brianlovin/claude-config --skill simplify --agent opencode --agent codex --global --yes
 bunx skills add cursor/plugins --skill unslop --agent opencode --agent codex --global --yes
 bunx skills add humanlayer/skills --skill show-me --agent opencode --agent codex --global --yes
-bunx skills add mattpocock/skills \
-    --skill ask-matt \
-    --skill code-review \
-    --skill codebase-design \
-    --skill diagnosing-bugs \
-    --skill domain-modeling \
-    --skill grill-with-docs \
-    --skill implement \
-    --skill improve-codebase-architecture \
-    --skill prototype \
-    --skill research \
-    --skill setup-matt-pocock-skills \
-    --skill tdd \
-    --skill to-spec \
-    --skill to-tickets \
-    --skill triage \
-    --skill wayfinder \
-    --skill wizard \
-    --skill implement-spec \
-    --skill retro \
-    --skill grill-me \
-    --skill grilling \
-    --skill teach \
-    --skill writing-for-agents \
-    --agent opencode --agent codex --global --yes
+bunx skills add mattpocock/skills --skill '*' --agent opencode --agent codex --global --yes
 bunx skills add vercel-labs/agent-browser --skill agent-browser --agent opencode --agent codex --global --yes
 bunx skills add vercel-labs/skills --skill find-skills --agent opencode --agent codex --global --yes
