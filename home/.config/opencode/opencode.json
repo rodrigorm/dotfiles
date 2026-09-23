@@ -3,7 +3,7 @@
   "agent": {
     "explore": {
       "temperature": 0.1,
-      "model": "openai/gpt-5.6-luna",
+      "model": "openai/gpt-6-luna",
       "variant": "max",
       "options": {},
       "permission": {}
@@ -11,8 +11,8 @@
     "general": {
       "description": "Implementation and review agent. Send a minimal task brief and latest screenshot when useful; leave technical decisions to it. Ask it to complete the assigned work, fix issues it finds, and recap briefly. Preserve required checks; avoid duplicating testing or review assigned elsewhere.",
       "temperature": 0.2,
-      "model": "openai/gpt-6-astra",
-      "variant": "low",
+      "model": "openai/gpt-6-sol",
+      "variant": "high",
       "options": {},
       "permission": {}
     }
