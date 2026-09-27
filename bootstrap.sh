@@ -43,6 +43,7 @@ brew install \
     frps \
     fzf \
     gh \
+    git-delta \
     glab \
     jq \
     lazygit \
