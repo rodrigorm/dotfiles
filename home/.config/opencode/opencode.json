@@ -11,14 +11,11 @@
     "general": {
       "description": "Implementation and review agent. Send a minimal task brief and latest screenshot when useful; leave technical decisions to it. Ask it to complete the assigned work, fix issues it finds, and recap briefly. Preserve required checks; avoid duplicating testing or review assigned elsewhere.",
       "temperature": 0.2,
-      "model": "openai/gpt-6-sol",
+      "model": "openai/gpt-6.1-sol",
       "variant": "high",
       "options": {},
       "permission": {}
     }
   },
-  "lsp": true,
-  "plugin": [
-    "@dietrichgebert/ponytail"
-  ]
+  "lsp": true
 }
