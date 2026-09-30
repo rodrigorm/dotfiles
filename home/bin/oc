@@ -15,6 +15,8 @@ CURL_BIN="${OC_CURL_BIN:-$(command -v curl 2>/dev/null || true)}"
 LSOF_BIN="${OC_LSOF_BIN:-$(command -v lsof 2>/dev/null || true)}"
 TAILSCALE_BIN=""
 PLATFORM="${OC_PLATFORM:-$(uname -s)}"
+LAUNCHCTL_BIN="${OC_LAUNCHCTL_BIN:-$(command -v launchctl 2>/dev/null || true)}"
+PLUTIL_BIN="${OC_PLUTIL_BIN:-$(command -v plutil 2>/dev/null || true)}"
 
 FORCE=false
 SERVE_STATUS_JSON=""
@@ -27,6 +29,10 @@ Usage: oc [--force]
 
 Starts or reuses a background OpenCode server on 127.0.0.1:<port> and publishes
 it at https://<machine>.<tailnet>.ts.net:<port> with Tailscale Serve.
+
+On macOS, installs a per-port launchd agent that starts at login and restarts
+OpenCode if it exits. An existing unmanaged server is reused until the next
+login; --force migrates it immediately or restarts the managed service.
 
 OpenCode starts in $HOME. The wrapper refuses to overwrite an unrelated local
 listener or Tailscale Serve configuration. --force restarts only a healthy
@@ -41,6 +47,9 @@ Environment:
   OC_CURL_BIN         curl binary path
   OC_LSOF_BIN         lsof binary path
   OC_STATE_DIR        PID and log directory (default: ~/.local/state/oc/<port>)
+  OC_LAUNCH_AGENTS_DIR LaunchAgent directory (default: ~/Library/LaunchAgents)
+  OC_LAUNCHCTL_BIN    launchctl binary path (macOS)
+  OC_PLUTIL_BIN       plutil binary path (macOS)
   OC_LISTEN_TIMEOUT   seconds to wait for OpenCode (default: 30)
   OC_STOP_TIMEOUT     seconds to wait for OpenCode to stop (default: 15)
   OC_REMOTE_TIMEOUT   seconds to wait for the Serve endpoint (default: 10)
@@ -261,6 +270,104 @@ start_opencode() {
     printf 'Started OpenCode in %s (PID %s, log %s)\n' "$HOME" "$pid" "$OPENCODE_LOG_FILE"
 }
 
+is_service_loaded() {
+    "$LAUNCHCTL_BIN" print "$SERVICE_TARGET" >/dev/null 2>&1
+}
+
+install_service() {
+    local candidate
+    local executable="$OPENCODE_BIN"
+
+    [[ "$executable" == /* ]] || executable="$PWD/$executable"
+    mkdir -p "$LAUNCH_AGENTS_DIR" "$OPENCODE_STATE_DIR"
+    candidate="$(mktemp "$LAUNCH_AGENTS_DIR/.${SERVICE_LABEL}.XXXXXX")"
+
+    # Preserve the environment needed by OpenCode after the next login. mktemp
+    # keeps the plist private, including any configured server password.
+    # shellcheck disable=SC2016
+    if ! "$JQ_BIN" -n \
+        --arg label "$SERVICE_LABEL" \
+        --arg executable "$executable" \
+        --arg port "$PORT" \
+        --arg home "$HOME" \
+        --arg log "$OPENCODE_LOG_FILE" '
+        {
+            Label: $label,
+            ProgramArguments: [$executable, "serve", "--hostname", "127.0.0.1", "--port", $port],
+            WorkingDirectory: $home,
+            EnvironmentVariables: (env | with_entries(select(.key | test(
+                "^(HOME|PATH|XDG_(DATA|CONFIG|CACHE|STATE)_HOME|OPENCODE_.*)$"
+            )))),
+            RunAtLoad: true,
+            KeepAlive: true,
+            ThrottleInterval: 5,
+            StandardOutPath: $log,
+            StandardErrorPath: $log
+        }
+        ' > "$candidate" || ! "$PLUTIL_BIN" -convert xml1 "$candidate"; then
+        rm -f "$candidate"
+        fail "could not generate OpenCode LaunchAgent"
+    fi
+
+    SERVICE_CHANGED=false
+    if [[ -f "$SERVICE_PLIST" ]] && cmp -s "$candidate" "$SERVICE_PLIST"; then
+        rm -f "$candidate"
+    else
+        mv "$candidate" "$SERVICE_PLIST"
+        SERVICE_CHANGED=true
+        printf 'Installed OpenCode LaunchAgent: %s\n' "$SERVICE_PLIST"
+    fi
+}
+
+wait_for_service() {
+    local elapsed=0
+
+    while (( elapsed < LISTEN_TIMEOUT )); do
+        if is_opencode_healthy "$LOCAL_URL"; then
+            return
+        fi
+        is_service_loaded || fail "OpenCode service is not loaded; see $OPENCODE_LOG_FILE"
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    fail "timed out waiting for OpenCode service on $LOCAL_URL; see $OPENCODE_LOG_FILE"
+}
+
+manage_macos_service() {
+    local loaded=false
+
+    is_service_loaded && loaded=true
+    install_service
+
+    if [[ "$FORCE" == true ]]; then
+        if [[ "$loaded" == true ]]; then
+            # Reload the plist too, including changes deferred by earlier runs.
+            "$LAUNCHCTL_BIN" bootout "$SERVICE_TARGET"
+            loaded=false
+        elif [[ "$OPENCODE_HEALTHY" == true ]]; then
+            stop_opencode
+        fi
+    elif [[ "$OPENCODE_HEALTHY" == true ]]; then
+        printf 'Reusing OpenCode at %s\n' "$LOCAL_URL"
+        if [[ "$loaded" == false ]]; then
+            printf 'LaunchAgent will take over at next login; use oc --force to migrate now\n'
+        elif [[ "$SERVICE_CHANGED" == true ]]; then
+            printf 'Updated service settings apply at next login or oc --force\n'
+        fi
+        return
+    fi
+
+    if [[ "$loaded" == false ]]; then
+        "$LAUNCHCTL_BIN" enable "$SERVICE_TARGET"
+        "$LAUNCHCTL_BIN" bootstrap "$SERVICE_DOMAIN" "$SERVICE_PLIST"
+    elif [[ "$FORCE" == false ]]; then
+        "$LAUNCHCTL_BIN" kickstart "$SERVICE_TARGET"
+    fi
+    wait_for_service
+    printf 'OpenCode managed by launchd at %s (log %s)\n' "$LOCAL_URL" "$OPENCODE_LOG_FILE"
+}
+
 configure_serve() {
     tailscale_cli serve --bg --yes --https="$PORT" "$LOCAL_URL"
     read_serve_status
@@ -294,9 +401,15 @@ done
 
 [[ -n "${HOME:-}" && -d "$HOME" ]] || fail 'HOME is not a valid directory'
 validate_port
+PORT="$((10#$PORT))"
 OPENCODE_STATE_DIR="${OC_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oc/$PORT}"
 OPENCODE_PID_FILE="$OPENCODE_STATE_DIR/opencode.pid"
 OPENCODE_LOG_FILE="$OPENCODE_STATE_DIR/opencode.log"
+LAUNCH_AGENTS_DIR="${OC_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+SERVICE_LABEL="com.rodrigorm.opencode.$PORT"
+SERVICE_DOMAIN="gui/$(id -u)"
+SERVICE_TARGET="$SERVICE_DOMAIN/$SERVICE_LABEL"
+SERVICE_PLIST="$LAUNCH_AGENTS_DIR/$SERVICE_LABEL.plist"
 
 TAILSCALE_BIN="$(find_tailscale)"
 require_executable opencode "$OPENCODE_BIN"
@@ -304,7 +417,12 @@ require_tailscale
 require_executable jq "$JQ_BIN"
 require_executable curl "$CURL_BIN"
 require_executable lsof "$LSOF_BIN"
-require_executable nohup "$(command -v nohup 2>/dev/null || true)"
+if [[ "$PLATFORM" == Darwin ]]; then
+    require_executable launchctl "$LAUNCHCTL_BIN"
+    require_executable plutil "$PLUTIL_BIN"
+else
+    require_executable nohup "$(command -v nohup 2>/dev/null || true)"
+fi
 
 read_tailscale_identity
 REMOTE_URL="https://${MAGIC_DNS_NAME}:${PORT}"
@@ -327,13 +445,15 @@ if [[ "$FORCE" == true ]]; then
         disable_serve
         SERVE_STATE="free"
     fi
-    if [[ "$OPENCODE_HEALTHY" == true ]]; then
+    if [[ "$PLATFORM" != Darwin && "$OPENCODE_HEALTHY" == true ]]; then
         stop_opencode
         OPENCODE_HEALTHY=false
     fi
 fi
 
-if [[ "$OPENCODE_HEALTHY" == true ]]; then
+if [[ "$PLATFORM" == Darwin ]]; then
+    manage_macos_service
+elif [[ "$OPENCODE_HEALTHY" == true ]]; then
     printf 'Reusing OpenCode at %s\n' "$LOCAL_URL"
 else
     start_opencode

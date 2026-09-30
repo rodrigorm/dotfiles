@@ -143,7 +143,80 @@ fi
 exit 1
 EOF
 
-chmod +x "$MOCK_BIN/tailscale" "$MOCK_BIN/opencode" "$MOCK_BIN/curl" "$MOCK_BIN/lsof"
+cat > "$MOCK_BIN/plutil" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1" == -convert && "$2" == xml1 ]]
+# Keep JSON so launchctl's mock can inspect the exact plist contents on Linux.
+"$MOCK_JQ_BIN" -e '.ProgramArguments and .EnvironmentVariables' "$3" >/dev/null
+EOF
+
+cat > "$MOCK_BIN/launchctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+stop_server() {
+    local pid
+    local attempts=0
+    if [[ -f "$MOCK_LISTENER_PID_FILE" ]]; then
+        pid="$(cat "$MOCK_LISTENER_PID_FILE")"
+        kill "$pid"
+        while [[ -f "$MOCK_OPENCODE_RUNNING" ]] && (( attempts < 50 )); do
+            sleep 0.1
+            attempts=$((attempts + 1))
+        done
+        [[ ! -f "$MOCK_OPENCODE_RUNNING" ]]
+    fi
+}
+
+start_server() {
+    local executable
+    local home
+    local port
+    executable="$("$MOCK_JQ_BIN" -r '.ProgramArguments[0]' "$MOCK_LOADED_PLIST")"
+    home="$("$MOCK_JQ_BIN" -r '.WorkingDirectory' "$MOCK_LOADED_PLIST")"
+    port="$("$MOCK_JQ_BIN" -r '.ProgramArguments[5]' "$MOCK_LOADED_PLIST")"
+    (
+        cd "$home"
+        nohup "$executable" serve --hostname 127.0.0.1 --port "$port" \
+            > "$MOCK_SERVICE_LOG" 2>&1 < /dev/null &
+    )
+}
+
+if [[ "$1" == print ]]; then
+    [[ -f "$MOCK_SERVICE_LOADED" ]]
+    exit
+fi
+printf '%s\n' "$*" >> "$MOCK_LAUNCHCTL_LOG"
+case "$1" in
+    enable) ;;
+    bootstrap)
+        [[ ! -f "$MOCK_SERVICE_LOADED" ]]
+        if "$MOCK_JQ_BIN" -e . "$3" >/dev/null 2>&1; then
+            cp "$3" "$MOCK_LOADED_PLIST"
+        else
+            "$MOCK_REAL_PLUTIL" -convert json -o "$MOCK_LOADED_PLIST" "$3"
+        fi
+        touch "$MOCK_SERVICE_LOADED"
+        start_server
+        ;;
+    bootout)
+        stop_server
+        rm -f "$MOCK_SERVICE_LOADED"
+        ;;
+    kickstart)
+        [[ -f "$MOCK_SERVICE_LOADED" ]]
+        if [[ "${2:-}" == -k ]]; then
+            stop_server
+        fi
+        [[ -f "$MOCK_OPENCODE_RUNNING" ]] || start_server
+        ;;
+    *) printf 'unexpected launchctl invocation: %s\n' "$*" >&2; exit 1 ;;
+esac
+EOF
+
+chmod +x "$MOCK_BIN/tailscale" "$MOCK_BIN/opencode" "$MOCK_BIN/curl" "$MOCK_BIN/lsof" \
+    "$MOCK_BIN/plutil" "$MOCK_BIN/launchctl"
 
 export PATH="$MOCK_BIN:$PATH"
 export OC_OPENCODE_BIN="$MOCK_BIN/opencode"
@@ -157,6 +230,10 @@ export OC_LISTEN_TIMEOUT=3
 export OC_STOP_TIMEOUT=3
 export OC_REMOTE_TIMEOUT=3
 export OC_PROBE_TIMEOUT=1
+export OC_PLATFORM=Linux
+export OC_LAUNCHCTL_BIN="$MOCK_BIN/launchctl"
+export OC_PLUTIL_BIN="$MOCK_BIN/plutil"
+export OC_LAUNCH_AGENTS_DIR="$TEST_TMPDIR/LaunchAgents"
 export MOCK_JQ_BIN="$OC_JQ_BIN"
 export MOCK_DNS_NAME="macmini.tailb55486.ts.net"
 export MOCK_SERVE_STATUS_FILE="$STATE_DIR/serve.json"
@@ -167,10 +244,15 @@ export MOCK_OPENCODE_DATA_HOME="$STATE_DIR/opencode.data-home"
 export MOCK_OPENCODE_STARTS="$STATE_DIR/opencode.starts"
 export MOCK_OPENCODE_RUNNING="$STATE_DIR/opencode.running"
 export MOCK_LISTENER_PID_FILE="$STATE_DIR/listener.pid"
+export MOCK_SERVICE_LOADED="$STATE_DIR/service.loaded"
+export MOCK_LOADED_PLIST="$STATE_DIR/service.plist"
+export MOCK_LAUNCHCTL_LOG="$STATE_DIR/launchctl.log"
+export MOCK_SERVICE_LOG="$STATE_DIR/service.log"
 
 reset_state() {
     stop_mock_opencode
     rm -rf "$OC_STATE_DIR"
+    rm -rf "$OC_LAUNCH_AGENTS_DIR"
     rm -f \
         "$MOCK_SERVE_STATUS_FILE" \
         "$MOCK_TAILSCALE_LOG" \
@@ -179,7 +261,11 @@ reset_state() {
         "$MOCK_OPENCODE_DATA_HOME" \
         "$MOCK_OPENCODE_STARTS" \
         "$MOCK_OPENCODE_RUNNING" \
-        "$MOCK_LISTENER_PID_FILE"
+        "$MOCK_LISTENER_PID_FILE" \
+        "$MOCK_SERVICE_LOADED" \
+        "$MOCK_LOADED_PLIST" \
+        "$MOCK_LAUNCHCTL_LOG" \
+        "$MOCK_SERVICE_LOG"
     unset MOCK_OTHER_LISTENER MOCK_TAILSCALE_STATE
 }
 
@@ -396,6 +482,167 @@ test_rejects_invalid_port() {
     assert_file_missing "$MOCK_OPENCODE_STARTS"
 }
 
+test_macos_installs_and_reuses_service() {
+    local plist="$OC_LAUNCH_AGENTS_DIR/com.rodrigorm.opencode.4096.plist"
+    local original="$STATE_DIR/original.plist"
+
+    reset_state
+    write_free_serve_status
+    OC_PLATFORM=Darwin "$OC" > "$STATE_DIR/service-start.out" 2>&1
+
+    [[ -f "$MOCK_SERVICE_LOADED" ]]
+    # shellcheck disable=SC2016
+    "$OC_JQ_BIN" -e --arg home "$HOME" --arg executable "$OC_OPENCODE_BIN" '
+        .Label == "com.rodrigorm.opencode.4096" and
+        .ProgramArguments == [$executable, "serve", "--hostname", "127.0.0.1", "--port", "4096"] and
+        .RunAtLoad == true and .KeepAlive == true and .WorkingDirectory == $home and
+        .EnvironmentVariables.HOME == $home
+    ' "$plist" >/dev/null
+    [[ ! -e "$OC_STATE_DIR/opencode.pid" ]]
+    cp "$plist" "$original"
+    : > "$MOCK_LAUNCHCTL_LOG"
+    : > "$MOCK_TAILSCALE_LOG"
+
+    OC_PLATFORM=Darwin "$OC" > "$STATE_DIR/service-reuse.out" 2>&1
+    cmp -s "$original" "$plist"
+    [[ ! -s "$MOCK_LAUNCHCTL_LOG" && ! -s "$MOCK_TAILSCALE_LOG" ]]
+    [[ "$(wc -l < "$MOCK_OPENCODE_STARTS" | tr -d ' ')" == 1 ]]
+}
+
+test_macos_force_restarts_managed_service() {
+    local old_pid
+    local new_pid
+
+    reset_state
+    write_free_serve_status
+    OC_PLATFORM=Darwin "$OC" > /dev/null 2>&1
+    old_pid="$(cat "$MOCK_LISTENER_PID_FILE")"
+    : > "$MOCK_LAUNCHCTL_LOG"
+
+    OC_PLATFORM=Darwin "$OC" --force > "$STATE_DIR/service-force.out" 2>&1
+    new_pid="$(cat "$MOCK_LISTENER_PID_FILE")"
+    [[ "$new_pid" != "$old_pid" ]]
+    wait_for_pid_to_exit "$old_pid"
+    [[ "$(wc -l < "$MOCK_OPENCODE_STARTS" | tr -d ' ')" == 2 ]]
+    grep -Fxq "bootout gui/$(id -u)/com.rodrigorm.opencode.4096" "$MOCK_LAUNCHCTL_LOG"
+    [[ "$(wc -l < "$MOCK_LAUNCHCTL_LOG" | tr -d ' ')" == 3 ]]
+}
+
+test_macos_defers_unmanaged_server_until_force() {
+    local old_pid
+
+    reset_state
+    write_free_serve_status
+    "$OC" > /dev/null 2>&1
+    old_pid="$(cat "$MOCK_LISTENER_PID_FILE")"
+
+    OC_PLATFORM=Darwin "$OC" > "$STATE_DIR/service-deferred.out" 2>&1
+    [[ -f "$OC_LAUNCH_AGENTS_DIR/com.rodrigorm.opencode.4096.plist" ]]
+    assert_file_missing "$MOCK_SERVICE_LOADED"
+    assert_file_missing "$MOCK_LAUNCHCTL_LOG"
+    kill -0 "$old_pid"
+    grep -Fq 'take over at next login' "$STATE_DIR/service-deferred.out"
+
+    OC_PLATFORM=Darwin "$OC" --force > "$STATE_DIR/service-migrate.out" 2>&1
+    [[ -f "$MOCK_SERVICE_LOADED" ]]
+    wait_for_pid_to_exit "$old_pid"
+    [[ "$(wc -l < "$MOCK_OPENCODE_STARTS" | tr -d ' ')" == 2 ]]
+    assert_file_missing "$OC_STATE_DIR/opencode.pid"
+}
+
+test_macos_applies_deferred_configuration_on_force() {
+    local data_home="$TEST_TMPDIR/data & <custom>"
+    local old_pid
+
+    reset_state
+    write_free_serve_status
+    OC_PLATFORM=Darwin "$OC" > /dev/null 2>&1
+    old_pid="$(cat "$MOCK_LISTENER_PID_FILE")"
+    : > "$MOCK_LAUNCHCTL_LOG"
+
+    OC_PLATFORM=Darwin XDG_DATA_HOME="$data_home" "$OC" > "$STATE_DIR/service-update.out" 2>&1
+    [[ ! -s "$MOCK_LAUNCHCTL_LOG" ]]
+    [[ "$(cat "$MOCK_LISTENER_PID_FILE")" == "$old_pid" ]]
+    grep -Fq 'Updated service settings apply' "$STATE_DIR/service-update.out"
+
+    OC_PLATFORM=Darwin XDG_DATA_HOME="$data_home" "$OC" --force > "$STATE_DIR/service-reload.out" 2>&1
+    grep -Fxq "bootout gui/$(id -u)/com.rodrigorm.opencode.4096" "$MOCK_LAUNCHCTL_LOG"
+    # shellcheck disable=SC2016
+    "$OC_JQ_BIN" -e --arg data "$data_home" '.EnvironmentVariables.XDG_DATA_HOME == $data' \
+        "$MOCK_LOADED_PLIST" >/dev/null
+    wait_for_pid_to_exit "$old_pid"
+}
+
+test_macos_starts_previously_installed_agent() {
+    reset_state
+    write_free_serve_status
+    OC_PLATFORM=Darwin "$OC" > /dev/null 2>&1
+    stop_mock_opencode
+    rm -f "$MOCK_SERVICE_LOADED"
+    : > "$MOCK_LAUNCHCTL_LOG"
+
+    OC_PLATFORM=Darwin "$OC" > "$STATE_DIR/service-load.out" 2>&1
+    [[ -f "$MOCK_SERVICE_LOADED" && -f "$MOCK_OPENCODE_RUNNING" ]]
+    grep -Fq 'bootstrap' "$MOCK_LAUNCHCTL_LOG"
+}
+
+test_macos_preserves_environment_and_custom_port() {
+    local data_home="$TEST_TMPDIR/data & <custom>"
+    local plist="$OC_LAUNCH_AGENTS_DIR/com.rodrigorm.opencode.4097.plist"
+
+    reset_state
+    write_free_serve_status
+    OC_PLATFORM=Darwin PORT=04097 XDG_DATA_HOME="$data_home" OPENCODE_SERVER_PASSWORD='test & <password>' \
+        "$OC" > "$STATE_DIR/service-custom.out" 2>&1
+    # shellcheck disable=SC2016
+    "$OC_JQ_BIN" -e --arg data "$data_home" '
+        .ProgramArguments[5] == "4097" and
+        .EnvironmentVariables.XDG_DATA_HOME == $data and
+        .EnvironmentVariables.OPENCODE_SERVER_PASSWORD == "test & <password>" and
+        .EnvironmentVariables.MOCK_OPENCODE_RUNNING == null
+    ' "$plist" >/dev/null
+    [[ ! -e "$OC_LAUNCH_AGENTS_DIR/com.rodrigorm.opencode.04097.plist" ]]
+}
+
+test_macos_conflicts_do_not_install_service() {
+    reset_state
+    write_conflicting_serve_status
+    if OC_PLATFORM=Darwin "$OC" --force > "$STATE_DIR/service-conflict.out" 2>&1; then
+        return 1
+    fi
+    [[ ! -d "$OC_LAUNCH_AGENTS_DIR" ]]
+    assert_file_missing "$MOCK_LAUNCHCTL_LOG"
+
+    reset_state
+    write_free_serve_status
+    export MOCK_OTHER_LISTENER=true
+    if OC_PLATFORM=Darwin "$OC" --force > "$STATE_DIR/service-port-conflict.out" 2>&1; then
+        return 1
+    fi
+    [[ ! -d "$OC_LAUNCH_AGENTS_DIR" ]]
+    assert_file_missing "$MOCK_LAUNCHCTL_LOG"
+}
+
+test_macos_native_plist_serialization() {
+    local plist="$OC_LAUNCH_AGENTS_DIR/com.rodrigorm.opencode.4096.plist"
+    local data_home="$TEST_TMPDIR/data & <custom>"
+
+    [[ "$(uname -s)" == Darwin ]] || return 0
+    reset_state
+    write_free_serve_status
+    MOCK_REAL_PLUTIL=/usr/bin/plutil OC_PLUTIL_BIN=/usr/bin/plutil OC_PLATFORM=Darwin \
+        XDG_DATA_HOME="$data_home" OPENCODE_SERVER_PASSWORD='test & <password>' \
+        "$OC" > "$STATE_DIR/service-native.out" 2>&1
+
+    /usr/bin/plutil -lint "$plist" >/dev/null
+    [[ "$(stat -f '%Lp' "$plist")" == 600 ]]
+    # shellcheck disable=SC2016
+    "$OC_JQ_BIN" -e --arg data "$data_home" '
+        .EnvironmentVariables.XDG_DATA_HOME == $data and
+        .EnvironmentVariables.OPENCODE_SERVER_PASSWORD == "test & <password>"
+    ' "$MOCK_LOADED_PLIST" >/dev/null
+}
+
 test_starts_in_home_and_is_idempotent
 test_force_restarts_owned_resources
 test_preserves_other_serve_services
@@ -407,5 +654,13 @@ test_rejects_directory_argument
 test_uses_custom_port_and_data_home
 test_isolates_default_operational_state_by_port
 test_rejects_invalid_port
+test_macos_installs_and_reuses_service
+test_macos_force_restarts_managed_service
+test_macos_defers_unmanaged_server_until_force
+test_macos_applies_deferred_configuration_on_force
+test_macos_starts_previously_installed_agent
+test_macos_preserves_environment_and_custom_port
+test_macos_conflicts_do_not_install_service
+test_macos_native_plist_serialization
 
 printf 'oc tests passed\n'
