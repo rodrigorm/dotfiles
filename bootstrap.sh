@@ -34,9 +34,14 @@ if [[ "$(uname)" == "Linux" ]]; then
     brew unlink util-linux 2>/dev/null || true
 fi
 
+# OpenCode v1 and v2 both install the opencode binary.
+if brew list --formula opencode >/dev/null 2>&1; then
+    brew unlink opencode
+fi
+
 # Install remaining packages (including bash-completion which conflicts with util-linux)
 brew install \
-    anomalyco/tap/opencode \
+    anomalyco/tap/opencode-v2 \
     bash \
     bash-completion \
     frpc \
